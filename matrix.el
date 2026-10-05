@@ -1,53 +1,5 @@
 ;;; matrix.el --- Persistent Matrix accounts in AppKit -*- lexical-binding: t; -*-
 
-;;; Commentary:
-;; Matrix text client using this checkout's AppKit and Matrix Rust SDK 0.19.1.
-;;
-;; Build from appkit-apps/matrix with `make backend' (Rust 1.96+ and native
-;; build tools), or `make release'.  `make check' runs Rust and Emacs checks.
-;; Add appkit-apps/appkit.el and appkit-apps/matrix to `load-path', then
-;; (require 'matrix).  The bundled release/debug executable is discovered
-;; automatically; `matrix-backend-program' can select an installed binary.
-;;
-;; M-x matrix-connect chooses a local profile: existing profiles restore
-;; their device; new profiles prompt for MXID, optional homeserver URL and
-;; password.  Native password login is supported, not OAuth/SSO.  Use
-;; M-x matrix-restore after restarting, not another login under a new name.
-;; Corrupt, incomplete and revoked sessions never silently create a device.
-;;
-;; The account directory lists joined rooms and invitations.  RET opens or
-;; joins a room; j joins by ID/alias, c creates a private encrypted room,
-;; g refreshes, and v opens devices/SAS verification.  C-c C-c sends a room
-;; draft; C-c C-r returns to rooms and C-c C-v opens devices.  SDK queue
-;; acceptance is not delivery: pending/sent/failed state stays in the timeline.
-;; Async results cannot clear intervening edits.  An uncertain send retains
-;; the draft and blocks resubmission until C-c C-u explicitly reviews it.
-;;
-;; Closing any/all Matrix buffers does not disconnect the account.
-;; M-x matrix-disconnect stops sync locally but retains session and keys.
-;; An App owns account lifecycle and a presentation mirror; its Source owns
-;; private framed JSON-RPC transport.  Room/verification Surfaces do not own
-;; sync, SDK send queues or protocol state.  The Rust SDK owns encryption,
-;; device trust, transactions and persistent SQLite stores.
-;;
-;; Compare the displayed SAS on both devices before confirming.  Room key
-;; export/import use an encrypted file and a separately prompted passphrase;
-;; export never overwrites a file and must be outside the account store.
-;; `matrix-keys-recover' uses an existing server recovery setup/key, without
-;; resetting trust.  This client does not create/reset server key backups.
-;;
-;; Profiles live under `matrix-data-directory' (default: matrix/ beneath
-;; `user-emacs-directory').  Keep this directory OUT of version control and
-;; unencrypted backups: tokens, device keys and decrypted history are local
-;; private data, not a separately encrypted vault.  Storage is owner-only and
-;; process-locked; use disk encryption against offline access.
-;; Passwords are not saved; RPC event logging/hooks are disabled.  Do not
-;; delete store markers to retry an interrupted login: first review/revoke
-;; any uncertain device in an existing trusted client.
-;;
-;; The current interface covers text, joined/invited rooms, SAS and key
-;; recovery.  It does not expose media, QR verification or history pagination.
-
 ;;; Code:
 
 (require 'cl-lib)
@@ -248,6 +200,11 @@ Register ROOM-ID's timeline when provided; retain the reading position."
       ('(matrix-history-started)
        (appkit-next :model (plist-put (copy-sequence model) :history-error nil)
                     :render (appkit-projection-change-create :frame-p t)))
+      ('(matrix-history-observer-failed)
+       (appkit-next
+        :model (plist-put (copy-sequence model) :history-error
+                          "Automatic history observation failed; load older manually.")
+        :render (appkit-projection-change-create :frame-p t)))
       ('(matrix-send-reviewed)
        (appkit-next
         :model (plist-put (plist-put (copy-sequence model) :uncertain-send nil)

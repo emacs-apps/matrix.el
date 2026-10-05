@@ -10,6 +10,16 @@
 
 (declare-function turn-off-evil-snipe-mode "evil-snipe" ())
 (declare-function turn-off-evil-snipe-override-mode "evil-snipe" ())
+(declare-function matrix-root-transient "matrix-transient" (scope))
+(declare-function matrix-room-transient "matrix-transient" (scope))
+(declare-function matrix-message-transient "matrix-transient" (scope))
+(declare-function matrix-verify-transient "matrix-transient" (scope))
+(declare-function matrix-root-refresh "matrix-root" ())
+(declare-function matrix-verify-refresh "matrix-verify" ())
+(declare-function matrix-room-refresh "matrix-room" ())
+(declare-function matrix-room-next-message "matrix-room" ())
+(declare-function matrix-room-previous-message "matrix-room" ())
+(declare-function matrix-room-return "matrix-room" ())
 
 (defvar matrix-navigation-map)
 (defvar matrix-room-navigation-map)

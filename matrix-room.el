@@ -241,7 +241,7 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
     :key 'matrix-history-observation :input (appkit-current-surface)
     :start #'matrix-room--defer-observation
     :success (lambda (_input _value) '(matrix-history-observed))
-    :failure (lambda (_input _error) '(matrix-history-observed)))))
+    :failure (lambda (_input _error) '(matrix-history-observer-failed)))))
 
 (defun matrix-room--visible-start (_window position boundary)
   "Page when the actual visible edge approaches BOUNDARY, not on point motion."
