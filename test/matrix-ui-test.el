@@ -21,6 +21,14 @@
                     :membership "join" :encrypted t))
           :timelines timelines :verifications (make-hash-table :test #'equal))))
 
+(defun matrix-ui-test--items-state (items)
+  "Return an account snapshot whose authoritative timeline contains ITEMS."
+  (let* ((state (matrix-ui-test--state ""))
+         (timelines (plist-get state :timelines))
+         (timeline (gethash "!room:test" timelines)))
+    (puthash "!room:test" (plist-put timeline :items items) timelines)
+    state))
+
 (defun matrix-ui-test--open (app &optional buffer)
   "Open the actual room Surface on APP, optionally reusing BUFFER."
   (appkit-open-generated-surface
@@ -159,6 +167,51 @@
     (should-not (plist-get (appkit-surface-model surface) :operation))
     (should (equal (appkit-chatbuf-input-string) "Not yet sent"))))
 
+(ert-deftest matrix-ui-send-consent-cannot-authorize-a-reopened-room ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (appkit-chatbuf-input-replace "Captured before consent")
+    (let ((state (matrix-ui-test--state "Unencrypted room"))
+          replacement requested)
+      (setf (plist-get (car (plist-get state :rooms)) :encrypted) :json-false)
+      (appkit-app-send app state)
+      (unwind-protect
+          (cl-letf (((symbol-function 'yes-or-no-p)
+                     (lambda (&rest _)
+                       (appkit-surface-stop surface)
+                       (setq replacement (matrix-ui-test--open app buffer))
+                       (setq-local matrix--registered-surface replacement)
+                       (appkit-chatbuf-input-replace "Replacement draft")
+                       t))
+                    ((symbol-function 'matrix--request)
+                     (lambda (&rest _) (setq requested t))))
+            (should-error (matrix-room-send) :type 'user-error)
+            (should-not requested)
+            (should (equal (appkit-chatbuf-input-string) "Replacement draft")))
+        (when replacement (appkit-surface-stop replacement))))))
+
+(ert-deftest matrix-ui-send-acceptance-retains-edits-made-during-consent ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (appkit-chatbuf-input-replace "Original draft")
+    (let ((state (matrix-ui-test--state "Unencrypted room"))
+          context)
+      (setf (plist-get (car (plist-get state :rooms)) :encrypted) :json-false)
+      (appkit-app-send app state)
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (&rest _)
+                   (appkit-chatbuf-input-replace "Intervening edit")
+                   (appkit-chatbuf-input-replace "Original draft")
+                   t))
+                ((symbol-function 'matrix-runtime-request)
+                 (lambda (_app _method _params owned)
+                   (setq context owned)
+                   1)))
+        (matrix-room-send))
+      (matrix-ui-test--settle surface context)
+      (should (equal (appkit-chatbuf-input-string) "Original draft"))
+      (should-not (plist-get (appkit-surface-model surface) :operation)))))
+
 (ert-deftest matrix-ui-reopening-room-preserves-reading-position ()
   (save-window-excursion
     (matrix-ui-test--with-room
@@ -168,6 +221,69 @@
       (let ((reading-point (point)))
         (matrix-room-open app "!room:test" t)
         (should (= (point) reading-point))))))
+
+(ert-deftest matrix-ui-wrapped-heading-keeps-avatar-on-the-first-line ()
+  (save-window-excursion
+    (matrix-ui-test--with-room
+      (switch-to-buffer buffer)
+      (delete-other-windows)
+      (split-window-right 28)
+      (appkit-surface-enable-responsive-geometry surface #'matrix--geometry)
+      (let ((name "Long display name 中文名称 with a heading wider than the viewport"))
+        (appkit-app-send
+         app (matrix-ui-test--items-state
+              (list (list :id "wrapped" :kind "message" :sender "@other:test"
+                          :sender_name name :timestamp 1700000000000 :body "Message payload"))))
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (goto-char (point-min))
+        (search-forward name)
+        (let ((heading-prefix (get-text-property (line-beginning-position) 'line-prefix))
+              (heading-wrap (get-text-property (line-beginning-position) 'wrap-prefix)))
+          (re-search-forward "[0-9][0-9]:[0-9][0-9]")
+          (let ((clock-prefix (get-text-property (line-beginning-position) 'line-prefix)))
+            (search-forward "Message payload")
+            (let ((body-prefix (get-text-property (line-beginning-position) 'line-prefix)))
+              (should-not (equal heading-prefix body-prefix))
+              (should (equal heading-wrap body-prefix))
+              (should (equal clock-prefix body-prefix)))))))))
+
+(ert-deftest matrix-ui-compact-multiline-clock-stays-with-the-first-content-line ()
+  (matrix-ui-test--with-room
+    (appkit-app-send
+     app (matrix-ui-test--items-state
+          '((:id "first" :kind "message" :sender "@other:test"
+             :timestamp 1700000000000 :body "Earlier body")
+            (:id "second" :kind "message" :sender "@other:test"
+             :timestamp 1700000060000 :body "第一行正文\n第二行正文\n"))))
+    (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+    (goto-char (appkit-chat-timeline-key-position "second"))
+    (search-forward "第一行正文")
+    (let ((first-line (line-number-at-pos)))
+      (re-search-forward "[0-9][0-9]:[0-9][0-9]")
+      (should (= first-line (line-number-at-pos)))
+      (search-forward "第二行正文")
+      (should (> (line-number-at-pos) first-line)))))
+
+(ert-deftest matrix-ui-delivery-and-display-identity-changes-break-compaction ()
+  (matrix-ui-test--with-room
+    (let* ((first '(:id "first" :kind "message" :sender "@other:test"
+                   :sender_name "Original identity" :timestamp 1700000000000
+                   :body "Earlier body"))
+           (second '(:id "second" :kind "message" :sender "@other:test"
+                    :sender_name "Original identity" :timestamp 1700000060000
+                    :body "Later body")))
+      (appkit-app-send app (matrix-ui-test--items-state (list first second)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (goto-char (appkit-chat-timeline-key-position "second"))
+      (should-not (search-forward "Original identity"
+                                 (appkit-chat-timeline-footer-start-position) t))
+      (dolist (change '((:send_state . "failed") (:sender_name . "Updated identity")))
+        (let ((updated (plist-put (copy-sequence second) (car change) (cdr change))))
+          (appkit-app-send app (matrix-ui-test--items-state (list first updated)))
+          (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+          (goto-char (appkit-chat-timeline-key-position "second"))
+          (should (search-forward (plist-get updated :sender_name)
+                                  (appkit-chat-timeline-footer-start-position) t)))))))
 
 (ert-deftest matrix-ui-pagination-fences-subscriptions-and-does-not-settle-send ()
   (matrix-ui-test--with-room

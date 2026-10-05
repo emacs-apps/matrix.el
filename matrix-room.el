@@ -51,6 +51,7 @@
     (define-key map (kbd "C-c C-c") #'matrix-room-send)
     (define-key map (kbd "C-c RET") #'matrix-room-send)
     (define-key map (kbd "C-c C-o") #'matrix-composer-transient)
+    (define-key map (kbd "C-c '") #'matrix-room-edit-draft)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
     (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
     (define-key map (kbd "M-g") matrix-room-navigation-map)
@@ -112,6 +113,12 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
    (and (equal (plist-get previous :kind) "message")
         (equal (plist-get item :kind) "message")
         (equal (plist-get previous :sender) (plist-get item :sender))
+        (plist-get item :sender)
+        (equal (plist-get previous :sender_name) (plist-get item :sender_name))
+        (not (member (plist-get previous :send_state) '("pending" "failed")))
+        (not (member (plist-get item :send_state) '("pending" "failed")))
+        (not (plist-get previous :error))
+        (not (plist-get item :error))
         (numberp (plist-get previous :timestamp))
         (numberp (plist-get item :timestamp))
         (<= 0 (- (plist-get item :timestamp) (plist-get previous :timestamp)) 300000))))
@@ -120,12 +127,35 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
   "Present SDK ITEM's delivery state and local time without implying delivery."
   (string-join
    (delq nil
-         (list (when-let* ((state (plist-get item :send_state)))
+         (list (when-let* ((state (plist-get item :send_state))
+                          ((not (equal state "sent"))))
                  (format "[%s]" state))
                (when-let* ((timestamp (plist-get item :timestamp))
                            ((numberp timestamp)))
                  (format-time-string "%H:%M" (seconds-to-time (/ timestamp 1000.0))))))
    " "))
+
+(defun matrix-room--insert-time (item prefix)
+  "Insert ITEM's clock and queue status using shared layout with PREFIX."
+  (let ((label (matrix-room--time-label item)))
+    (unless (string-empty-p label)
+      (let ((span (appkit-chat-ins-insert-right-aligned-text
+                   label matrix-room--width
+                   :face (pcase (plist-get item :send_state)
+                           ("failed" 'error) ("pending" 'warning) (_ 'shadow))
+                   :left-prefix-width (string-width prefix))))
+        (add-text-properties
+         (car span) (cdr span)
+         (list 'help-echo
+               (string-join
+                (delq nil
+                      (list (when-let* ((timestamp (plist-get item :timestamp))
+                                       ((numberp timestamp)))
+                              (format-time-string
+                               "%Y-%m-%d %H:%M:%S"
+                               (seconds-to-time (/ timestamp 1000.0))))
+                            (plist-get item :send_state)))
+                " · ")))))))
 
 (defun matrix-room--print-row (row)
   "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
@@ -151,29 +181,30 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
          (unless compact
            (let ((heading (point)))
              (insert (propertize name 'face face 'help-echo sender))
-             (appkit-chat-ins-insert-right-aligned-text
-              (matrix-room--time-label item) matrix-room--width
-              :face (if (equal (plist-get item :send_state) "failed") 'error 'shadow)
-              :left-prefix-width (string-width (plist-get prefixes :header)))
+             (matrix-room--insert-time item (plist-get prefixes :header))
              (insert "\n")
-             (appkit-ui-apply-line-prefix heading (point) (plist-get prefixes :header))))
+             (appkit-ui-apply-line-prefix
+              heading (point)
+              (appkit-ui-make-prefix-state
+               (plist-get prefixes :header) (plist-get prefixes :rest-body)))))
          (let ((body-start (point)))
            ;; Never interpret formatted_body as HTML or executable markup.
            (insert (if (equal kind "encrypted")
                        (propertize "[Unable to decrypt encrypted event]" 'face 'warning)
                      (substring-no-properties (or (plist-get item :body) ""))))
+           (when (or (= body-start (point)) (not (bolp))) (insert "\n"))
            (when compact
-             (appkit-chat-ins-insert-right-aligned-text
-              (matrix-room--time-label item) matrix-room--width
-              :face (if (equal (plist-get item :send_state) "failed") 'error 'shadow)
-              :left-prefix-width (string-width (plist-get prefixes :rest-body))))
-           (insert "\n")
+             (save-excursion
+               (goto-char body-start)
+               (end-of-line)
+               (matrix-room--insert-time item (plist-get prefixes :rest-body))))
            (when-let* ((error (plist-get item :error)))
              (insert (propertize (format "Error: %s\n" error) 'face 'error)))
            (appkit-ui-apply-line-prefix
             body-start (point)
             (appkit-ui-make-prefix-state
-             (plist-get prefixes :first-body) (plist-get prefixes :rest-body)))))))
+             (if compact (plist-get prefixes :rest-body) (plist-get prefixes :first-body))
+             (plist-get prefixes :rest-body)))))))
     (add-text-properties start (point)
                          (list matrix-room-message-key-property
                                (appkit-chat-timeline-row-key row)
@@ -191,10 +222,13 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
          (timeline (matrix-room--timeline state room-id))
          (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
     (setq matrix-room--width (matrix--width surface))
-    (matrix--frame state (or (plist-get room :name) room-id)
-                   (if (eq (plist-get room :encrypted) t)
-                       "encrypted"
-                     "NOT KNOWN TO BE ENCRYPTED"))
+    (matrix--frame
+     state (or (plist-get room :name) room-id) nil
+     (pcase (plist-get room :encrypted)
+       ('t (propertize "[E2EE]" 'face 'success
+                       'help-echo "Encrypted room; Matrix SDK enforces device trust."))
+       (_ (propertize "[?E2EE]" 'face 'warning
+                       'help-echo "Room is not known encrypted; sending requires consent."))))
     (let ((footer (matrix-room--footer state timeline model)))
       (appkit-chat-timeline-ensure
        :printer #'matrix-room--print-row
@@ -337,11 +371,16 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
   (interactive)
   (matrix-room--move-message t))
 
+(defun matrix-room-edit-draft ()
+  "Focus the canonical input without modifying its text or modal state."
+  (interactive)
+  (matrix--current-surface 'room)
+  (appkit-chatbuf-focus-input))
+
 (defun matrix-room-latest ()
   "Return to the live tail and composer without changing its draft."
   (interactive)
-  (matrix--current-surface 'room)
-  (appkit-chatbuf-focus-input)
+  (matrix-room-edit-draft)
   (when (eq (window-buffer) (current-buffer)) (recenter -1)))
 
 (defun matrix-room--result (model method _result error context)
@@ -397,19 +436,26 @@ Late acceptance cannot clear intervening edits, even edits back to the same
 text.  An uncertain submission is never retried with a new transaction ID."
   (interactive)
   (let* ((surface (matrix--current-surface 'room))
+         (app (appkit-surface-app surface))
+         (session (copy-tree (plist-get (matrix-runtime-state app) :session)))
          (model (appkit-surface-model surface))
          (room-id (cadr (plist-get model :identity))))
     (appkit-chatbuf-input-state-sync)
     (let ((body (substring-no-properties (appkit-chatbuf-input-state)))
-          (room (matrix-runtime-room (appkit-surface-app surface) room-id)))
+          (revision (appkit-chatbuf-composer-revision))
+          (room (matrix-runtime-room app room-id)))
       (when (string-empty-p (string-trim body)) (user-error "The draft is empty"))
       (when (plist-get model :uncertain-send)
         (user-error "Previous submission is uncertain; inspect the timeline, then use C-c C-u"))
       (unless (or (eq (plist-get room :encrypted) t)
                   (yes-or-no-p "Room is not known to be encrypted. Send potentially unencrypted text? "))
         (user-error "Send cancelled; draft retained"))
+      (unless (and (appkit-surface-live-p surface)
+                   (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
+                   (equal session (plist-get (matrix-runtime-state app) :session)))
+        (user-error "The room or account changed during confirmation; draft retained"))
       (matrix--request surface "message.send" (list :room_id room-id :body body)
-                       (list :revision (appkit-chatbuf-composer-revision) :body body)))))
+                       (list :revision revision :body body)))))
 
 (defun matrix-room-review-send ()
   "Acknowledge an uncertain submission without sending or changing the draft."

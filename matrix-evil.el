@@ -10,10 +10,10 @@
 
 (declare-function turn-off-evil-snipe-mode "evil-snipe" ())
 (declare-function turn-off-evil-snipe-override-mode "evil-snipe" ())
-(declare-function matrix-root-transient "matrix-transient" (scope))
-(declare-function matrix-room-transient "matrix-transient" (scope))
-(declare-function matrix-message-transient "matrix-transient" (scope))
-(declare-function matrix-verify-transient "matrix-transient" (scope))
+(declare-function matrix-root-transient "matrix-transient" (&optional scope))
+(declare-function matrix-room-transient "matrix-transient" (&optional scope))
+(declare-function matrix-message-transient "matrix-transient" (&optional scope))
+(declare-function matrix-verify-transient "matrix-transient" (&optional scope))
 (declare-function matrix-root-refresh "matrix-root" ())
 (declare-function matrix-verify-refresh "matrix-verify" ())
 (declare-function matrix-room-refresh "matrix-room" ())
@@ -64,6 +64,7 @@
       :map matrix-room-timeline-mode-map :nm
       "q" #'quit-window
       "o" #'matrix-message-transient
+      "i" #'appkit-evil-chatbuf-enter-input
       "RET" #'matrix-room-return
       "<return>" #'matrix-room-return)
     (when (boundp 'matrix-room-navigation-map)

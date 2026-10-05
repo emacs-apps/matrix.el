@@ -56,11 +56,12 @@
 (defvar-local matrix--header-line nil
   "Presentation-only header from the last committed render pass.")
 
-(defun matrix--frame (state title &optional detail)
-  "Present account STATE, destination TITLE and optional DETAIL as native chrome."
+(defun matrix--frame (state title &optional detail badge)
+  "Present STATE and TITLE, with optional DETAIL and leading safety BADGE."
   (setq-local
    matrix--header-line
-   (concat " Matrix · " (matrix--one-line (plist-get state :account))
+   (concat " Matrix" (when badge (concat " " badge))
+           " · " (matrix--one-line (plist-get state :account))
            " · " (matrix--one-line title)
            (when (and detail (not (string-empty-p detail)))
              (concat "  " (matrix--one-line detail)))))
@@ -258,6 +259,10 @@ RENDER receives Surface, account read view's model, Surface model and change."
 (defun matrix--request (surface method params &optional context)
   "Issue METHOD with PARAMS for SURFACE using an owned non-secret CONTEXT.
 Only the exact Surface generation and operation token may accept the result."
+  (unless (and (appkit-surface-live-p surface)
+               (eq surface (appkit-app-surface
+                            (appkit-surface-app surface) (appkit-surface-identity surface))))
+    (user-error "The Matrix view that initiated this request is no longer live"))
   (let* ((model (appkit-surface-model surface))
          (owned (append (list :target (plist-get model :address)
                               :token (cl-incf matrix--request-token)

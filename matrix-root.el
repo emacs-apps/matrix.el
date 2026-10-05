@@ -79,8 +79,12 @@
                       (let ((at (or (plist-get a :timestamp) 0))
                             (bt (or (plist-get b :timestamp) 0)))
                         (if (= at bt)
-                            (string-lessp (or (plist-get a :name) (plist-get a :room_id))
-                                          (or (plist-get b :name) (plist-get b :room_id)))
+                            (let ((an (or (plist-get a :name) (plist-get a :room_id)))
+                                  (bn (or (plist-get b :name) (plist-get b :room_id))))
+                              (if (equal an bn)
+                                  (string-lessp (plist-get a :room_id)
+                                                (plist-get b :room_id))
+                                (string-lessp an bn)))
                           (> at bt))))))
              (section-key (list 'section (car section)))
              (rows
@@ -95,44 +99,104 @@
                    :label (matrix--one-line (or (plist-get room :name) id))
                    :item-p t :unread-p (> (or (plist-get room :unread) 0) 0)
                    :payload (list 'room id (plist-get room :membership))
-                   :stamp room :help-echo id)
+                   :stamp (list room (plist-get (plist-get state :session) :user_id))
+                   :help-echo (matrix-root--room-help room))
                   rows)))
         (setq entries (append entries (nreverse rows)))))
     entries))
 
+(defun matrix-root--room-help (room)
+  "Return ROOM's exact destination and available activity identity."
+  (string-join
+   (delq nil
+         (list (plist-get room :room_id)
+               (if (eq (plist-get room :encrypted) t)
+                   "Encrypted" "Encryption not known")
+               (when-let* ((sender (plist-get room :preview_sender)))
+                 (concat "Sender: " (appkit-ui-one-line-text sender)))))
+   " · "))
+
+(defun matrix-root--preview (room user-id)
+  "Project actual ROOM activity, preserving exact sender identity."
+  (let* ((body (appkit-ui-one-line-text (plist-get room :preview)))
+         (sender (plist-get room :preview_sender))
+         (self-p (and (stringp user-id)
+                      (equal user-id sender))))
+    (appkit-ui-one-line-preview-create
+     :text (if (or (string-empty-p body) self-p (not sender))
+               body
+             (concat body " — " (appkit-ui-one-line-text sender)))
+     :label (when (and self-p (not (string-empty-p body))) "You")
+     :separator ":" :label-face 'shadow)))
+
+(defun matrix-root--insert-compact-context (title trail width)
+  "Insert TITLE and unread TRAIL within WIDTH without optional activity slots."
+  (let* ((inner (max 0 (- width 2)))
+         (trail-width (min inner (string-width (or trail ""))))
+         (title-width (max 0 (- inner trail-width (if trail 1 0)))))
+    (when (> width 0) (insert "["))
+    (when (> title-width 0)
+      (insert (appkit-presentation-elide-string-for-columns title title-width)))
+    (when (> trail-width 0)
+      (when (> title-width 0) (insert " "))
+      (insert (propertize
+               (appkit-presentation-elide-string-for-columns trail trail-width 'bold)
+               'face 'bold)))
+    (when (> width 1) (insert "]"))))
+
 (defun matrix-root--insert-item (_directory entry)
   "Insert one bounded activity row from ENTRY's actual SDK summary."
-  (let ((room (appkit-directory-entry-stamp entry)))
+  (let* ((stamp (appkit-directory-entry-stamp entry))
+         (room (and (listp (car-safe stamp)) (car stamp)))
+         (user-id (cadr stamp)))
     (if (not (plist-get room :room_id))
-        (insert (appkit-directory-entry-label entry) "\n")
-      (let ((timestamp (plist-get room :timestamp))
-            (unread (or (plist-get room :unread) 0)))
-        (appkit-presentation-insert-one-line-row
-         (appkit-presentation-one-line-row-create
-          :context (appkit-directory-entry-label entry)
-          :context-trail (when (> unread 0) (format "%d" unread))
-          :context-trail-face 'bold
-          :preview (appkit-ui-one-line-preview-create
-                    :text (or (plist-get room :preview) "")
-                    :label (plist-get room :preview_sender)
-                    :separator ": " :label-face 'shadow)
-          :time (when (numberp timestamp)
-                  (format-time-string "%m-%d %H:%M" (seconds-to-time (/ timestamp 1000.0))))
-          :time-face 'shadow)
-         :width (matrix--width (appkit-current-surface))
-         :context-width-spec '(0.32 12 36) :time-slot-width 12)))))
+        (insert (appkit-ui-one-line-text (appkit-directory-entry-label entry)) "\n")
+      (let* ((width (matrix--width (appkit-current-surface)))
+             (timestamp (plist-get room :timestamp))
+             (unread (or (plist-get room :unread) 0))
+             (trail (when (> unread 0) (number-to-string unread)))
+             (icon (if (eq (plist-get room :encrypted) t) "+" "?"))
+             (title (appkit-directory-entry-label entry))
+             (help (matrix-root--room-help room))
+             (start (point)))
+        ;; The shared activity inserter reserves at least twenty content columns.
+        (if (< width 36)
+            (progn
+              (when (>= width 8) (insert (propertize icon 'face 'shadow) " "))
+              (matrix-root--insert-compact-context
+               title trail (- width (if (>= width 8) 2 0)))
+              (insert "\n")
+              (add-text-properties start (point) (list 'help-echo help)))
+          (appkit-presentation-insert-one-line-row
+           (appkit-presentation-one-line-row-create
+            :icon-inserter (lambda () (insert (propertize icon 'face 'shadow)))
+            :context title :context-trail trail :context-trail-face 'bold
+            :preview (matrix-root--preview room user-id)
+            :time (when (and (>= width 60) (numberp timestamp) (> timestamp 0))
+                    (format-time-string "%m-%d %H:%M"
+                                        (seconds-to-time (/ timestamp 1000.0))))
+            :time-face 'shadow :help-echo help)
+           :width width :icon-slot-width 2 :context-width-spec '(0.55 16 36)))))))
 
 (defun matrix-root--activate (_directory entry)
-  "Activate a directory ENTRY, keeping invitation consent on its exact account."
-  (let ((surface (matrix--current-surface 'root)))
+  "Activate ENTRY; invitation consent authorizes only its originating Surface."
+  (let* ((surface (matrix--current-surface 'root))
+         (app (appkit-surface-app surface))
+         (session (copy-tree (plist-get (matrix-runtime-state app) :session))))
     (pcase (appkit-directory-entry-payload entry)
       (`(command ,command) (call-interactively command))
       (`(room ,room-id "invite")
        (when (yes-or-no-p (format "Join invited room %s? " room-id))
+         (unless (and (appkit-surface-live-p surface)
+                      (eq surface (matrix--current-surface 'root))
+                      (eq surface (appkit-app-surface app '(root)))
+                      (equal session (plist-get (matrix-runtime-state app) :session))
+                      (equal "invite" (plist-get (matrix-runtime-room app room-id) :membership)))
+           (user-error "Invitation origin changed; activate the invitation again"))
          (matrix--request surface "room.join" (list :room_id room-id))))
       (`(room ,room-id ,_membership)
        (require 'matrix-room)
-       (matrix-room-open (appkit-surface-app surface) room-id t)))))
+       (matrix-room-open app room-id t)))))
 
 (defun matrix-root--mount (_surface _app-view _model)
   "Install native account directory activation."
