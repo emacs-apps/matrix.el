@@ -116,6 +116,7 @@ Closing this buffer does not stop account sync."
         (equal (plist-get previous :sender) (plist-get item :sender))
         (plist-get item :sender)
         (equal (plist-get previous :sender_name) (plist-get item :sender_name))
+        (equal (plist-get previous :avatar_url) (plist-get item :avatar_url))
         (not (member (plist-get previous :send_state) '("pending" "failed")))
         (not (member (plist-get item :send_state) '("pending" "failed")))
         (not (plist-get previous :error))
@@ -177,7 +178,15 @@ Closing this buffer does not stop account sync."
               (name (matrix--one-line (or (plist-get item :sender_name) sender)))
               (face (delq nil (list (and (plist-get context :self) 'bold)
                                     (appkit-name-color-face sender))))
-              (prefixes (appkit-chat-avatar-prefixes nil (propertize "@" 'face face)))
+              (app (appkit-surface-app (appkit-current-surface)))
+              (uri (plist-get item :avatar_url))
+              (pixel-size (when (and (matrix-avatar-resource-key app uri)
+                                     (appkit-media-inline-image-rendering-available-p))
+                            (appkit-chat-avatar-two-line-pixel-size)))
+              (prefixes
+               (appkit-chat-avatar-prefixes
+                (and pixel-size (matrix-avatar-cached-image app uri pixel-size))
+                (propertize "@" 'face face) :pixel-size pixel-size))
               (compact (plist-get context :compact)))
          (unless compact
            (let ((heading (point)))
@@ -218,39 +227,64 @@ Closing this buffer does not stop account sync."
 
 (defun matrix-room--render (surface state model request)
   "Project a pass-scoped SDK snapshot without changing the canonical draft."
-  (let* ((room-id (cadr (plist-get model :identity)))
-         (room (matrix-room--metadata state room-id))
-         (timeline (matrix-room--timeline state room-id))
-         (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
-    (setq matrix-room--width (matrix--width surface))
-    (matrix--frame
-     state (or (plist-get room :name) room-id) nil
-     (pcase (plist-get room :encrypted)
-       ('t (propertize "[E2EE]" 'face 'success
-                       'help-echo "Encrypted room; Matrix SDK enforces device trust."))
-       (_ (propertize "[?E2EE]" 'face 'warning
-                       'help-echo "Room is not known encrypted; sending requires consent."))))
-    (let ((footer (matrix-room--footer state timeline model)))
-      (appkit-chat-timeline-ensure
-       :printer #'matrix-room--print-row
-       :anchor-property matrix-room-message-key-property
-       :header header :footer footer
-       :after-mutation-function #'appkit-chatbuf-update-context-mode)
-      (appkit-chat-timeline-sync
-       (appkit-chat-timeline-project
-        ;; Bounds refer to raw SDK rows, including protocol-only entries.
-        (seq-remove
-         (lambda (item) (equal (plist-get item :kind) "state"))
-         (plist-get (appkit-chat-history-window-slice
-                     (plist-get timeline :items) (lambda (item) (plist-get item :id)))
-                    :entries))
-        (lambda (item) (plist-get item :id))
-        :context-function #'matrix-room--row-context)
-       :force-keys (when (appkit-projection-change-geometry-p request)
-                     (appkit-chat-timeline-keys)))
-      (appkit-chat-timeline-set-frame
-       header footer :bind-input-function #'matrix-room--bind-composer
-       :composer-visible-p t))))
+  (if (and (appkit-projection-change-resources request)
+           (not (or (appkit-projection-change-full-p request)
+                    (appkit-projection-change-keys request)
+                    (appkit-projection-change-rekeys request)
+                    (appkit-projection-change-geometry-p request)
+                    (appkit-projection-change-frame-p request)
+                    (appkit-projection-change-position request))))
+      (progn
+        (appkit-chat-timeline-invalidate
+         (appkit-chat-timeline-dependent-keys
+          (appkit-projection-change-resources request)))
+        (appkit-render-result-create
+         :resource-interest-update
+         (appkit-resource-interest-update-create :mode 'unchanged)))
+    (let* ((room-id (cadr (plist-get model :identity)))
+           (room (matrix-room--metadata state room-id))
+           (timeline (matrix-room--timeline state room-id))
+           (app (appkit-surface-app surface))
+           (items
+            ;; Bounds refer to raw SDK rows, including protocol-only entries.
+            (seq-remove
+             (lambda (item) (equal (plist-get item :kind) "state"))
+             (plist-get (appkit-chat-history-window-slice
+                         (plist-get timeline :items) (lambda (item) (plist-get item :id)))
+                        :entries)))
+           (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
+      (setq matrix-room--width (matrix--width surface))
+      (matrix--frame
+       state (or (plist-get room :name) room-id) nil
+       (pcase (plist-get room :encrypted)
+         ('t (propertize "[E2EE]" 'face 'success
+                         'help-echo "Encrypted room; Matrix SDK enforces device trust."))
+         (_ (propertize "[?E2EE]" 'face 'warning
+                         'help-echo "Room is not known encrypted; sending requires consent."))))
+      (let ((footer (matrix-room--footer state timeline model)))
+        (appkit-chat-timeline-ensure
+         :printer #'matrix-room--print-row
+         :anchor-property matrix-room-message-key-property
+         :header header :footer footer
+         :after-mutation-function #'appkit-chatbuf-update-context-mode)
+        (appkit-chat-timeline-sync
+         (appkit-chat-timeline-project
+          items (lambda (item) (plist-get item :id))
+          :context-function #'matrix-room--row-context
+          :dependencies-function
+          (lambda (item)
+            (when-let* ((key (matrix-avatar-resource-key app (plist-get item :avatar_url))))
+              (list key))))
+         :changed-resources (appkit-projection-change-resources request)
+         :force-keys (when (appkit-projection-change-geometry-p request)
+                       (appkit-chat-timeline-keys)))
+        (appkit-chat-timeline-set-frame
+         header footer :bind-input-function #'matrix-room--bind-composer
+         :composer-visible-p t))
+      (matrix--avatar-resource-result
+       surface (mapcar (lambda (item)
+                         (cons (plist-get item :id) (plist-get item :avatar_url)))
+                       items)))))
 
 (defun matrix-room--defer-observation (_context surface _observe resolve reject)
   "Check committed geometry at idle, with cancellation owned by the Surface."

@@ -341,6 +341,9 @@ fn item(item: &TimelineItem) -> Value {
             if let Some(name) = &profile.display_name {
                 value["sender_name"] = json!(name);
             }
+            if let Some(uri) = &profile.avatar_url {
+                value["avatar_url"] = json!(uri);
+            }
         }
         value["timestamp"] = json!(event.timestamp());
         value["own"] = json!(event.is_own());

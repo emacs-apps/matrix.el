@@ -9,6 +9,7 @@
 (require 'matrix)
 (require 'appkit-directory)
 (require 'appkit-presentation)
+(require 'appkit-chat-avatar)
 
 (declare-function matrix-room-open "matrix-room" (app room-id &optional select))
 
@@ -151,32 +152,42 @@
          (user-id (cadr stamp)))
     (if (not (plist-get room :room_id))
         (insert (appkit-ui-one-line-text (appkit-directory-entry-label entry)) "\n")
-      (let* ((width (matrix--width (appkit-current-surface)))
+      (let* ((surface (appkit-current-surface))
+             (width (matrix--width surface))
              (timestamp (plist-get room :timestamp))
              (unread (or (plist-get room :unread) 0))
              (trail (when (> unread 0) (number-to-string unread)))
-             (icon (if (eq (plist-get room :encrypted) t) "+" "?"))
+             (image (when (appkit-media-inline-image-rendering-available-p)
+                      (matrix-avatar-cached-image
+                       (appkit-surface-app surface) (plist-get room :avatar_url)
+                       (appkit-chat-avatar-line-pixel-height))))
+             (icon (concat
+                    (when image
+                      (concat (appkit-chat-avatar-one-line-string image "@") " "))
+                    (propertize (if (eq (plist-get room :encrypted) t) "+" "?")
+                                'face 'shadow)))
+             (icon-width (max 2 (1+ (string-width icon))))
              (title (appkit-directory-entry-label entry))
              (help (matrix-root--room-help room))
              (start (point)))
         ;; The shared activity inserter reserves at least twenty content columns.
         (if (< width 36)
             (progn
-              (when (>= width 8) (insert (propertize icon 'face 'shadow) " "))
+              (when (>= width 8) (insert icon " "))
               (matrix-root--insert-compact-context
-               title trail (- width (if (>= width 8) 2 0)))
+               title trail (max 0 (- width (if (>= width 8) icon-width 0))))
               (insert "\n")
               (add-text-properties start (point) (list 'help-echo help)))
           (appkit-presentation-insert-one-line-row
            (appkit-presentation-one-line-row-create
-            :icon-inserter (lambda () (insert (propertize icon 'face 'shadow)))
+            :icon-inserter (lambda () (insert icon))
             :context title :context-trail trail :context-trail-face 'bold
             :preview (matrix-root--preview room user-id)
             :time (when (and (>= width 60) (numberp timestamp) (> timestamp 0))
                     (format-time-string "%m-%d %H:%M"
                                         (seconds-to-time (/ timestamp 1000.0))))
             :time-face 'shadow :help-echo help)
-           :width width :icon-slot-width 2 :context-width-spec '(0.55 16 36)))))))
+           :width width :icon-slot-width icon-width :context-width-spec '(0.55 16 36)))))))
 
 (defun matrix-root--activate (_directory entry)
   "Activate ENTRY; invitation consent authorizes only its originating Surface."
@@ -205,18 +216,25 @@
                               :item-inserter #'matrix-root--insert-item
                               :action-rows-p t))
 
-(defun matrix-root--render (_surface state model request)
+(defun matrix-root--render (surface state model request)
   "Render pass-scoped STATE with compact room rows and native chrome."
   (matrix--frame state "Rooms"
                  (when-let* ((filter (plist-get model :filter))
                              ((not (string-empty-p filter))))
                    (format "filter: %s" filter)))
-  (let ((entries (matrix-root--entries state model)))
+  (let* ((entries (matrix-root--entries state model))
+         (avatars (cl-loop for entry in entries
+                           for room = (car-safe (appkit-directory-entry-stamp entry))
+                           when (and (listp room) (plist-get room :room_id))
+                           collect (cons (appkit-directory-entry-key entry)
+                                         (plist-get room :avatar_url)))))
     (appkit-directory-reconcile
      (appkit-directory-surface) entries
-     :force-keys (when (appkit-projection-change-geometry-p request)
-                   (mapcar #'appkit-directory-entry-key entries))
-     :preserve-position-p t)))
+     :force-keys (if (appkit-projection-change-geometry-p request)
+                     (mapcar #'appkit-directory-entry-key entries)
+                   (matrix--avatar-changed-rows surface avatars request))
+     :preserve-position-p t)
+    (matrix--avatar-resource-result surface avatars)))
 
 (defun matrix-root--result (model method result error _context)
   "Accept directed METHOD RESULT or ERROR into presentation MODEL."

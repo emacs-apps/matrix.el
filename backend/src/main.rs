@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod account;
+mod media;
 mod protocol;
 mod storage;
 mod timeline;
@@ -69,6 +70,9 @@ async fn run(store: Store) {
     ));
     let backend = Backend::new(store, output.clone(), closed.clone());
     let semaphore = Arc::new(Semaphore::new(16));
+    // Media can fill the Resource broker without rejecting control requests.
+    // Network concurrency is bounded separately at the SDK acquisition boundary.
+    let media_requests = Arc::new(Semaphore::new(64));
     let mut requests = JoinSet::new();
     let (frames_tx, mut frames) = mpsc::channel(1);
     // Framing owns its input task: read_exact/read_until must never be cancelled
@@ -125,7 +129,12 @@ async fn run(store: Store) {
                 continue;
             }
         };
-        let permit = match semaphore.clone().try_acquire_owned() {
+        let admission = if request.method == "media.avatar" {
+            &media_requests
+        } else {
+            &semaphore
+        };
+        let permit = match admission.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 output

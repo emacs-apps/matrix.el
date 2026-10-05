@@ -14,6 +14,7 @@
 (require 'appkit-projection)
 (require 'appkit-directory)
 (require 'matrix-runtime)
+(require 'matrix-avatar)
 
 (declare-function matrix-root-open "matrix-root" (app &optional select))
 (declare-function matrix-root--result "matrix-root" (model method result error context))
@@ -76,6 +77,44 @@
 (defun matrix--width (surface)
   "Return SURFACE's canonical usable presentation width."
   (or (appkit-surface-responsive-width surface 1) (max 1 fill-column)))
+
+(defun matrix--avatar-changed-rows (surface rows request)
+  "Return ROWS' keys whose avatar resources changed in REQUEST."
+  (let ((resources (appkit-projection-change-resources request))
+        (app (appkit-surface-app surface))
+        changed)
+    (when resources
+      (dolist (row rows)
+        (when (member (matrix-avatar-resource-key app (cdr row)) resources)
+          (push (car row) changed))))
+    (nreverse changed)))
+
+(defun matrix--avatar-resource-result (surface rows)
+  "Retain private avatars for the currently projected (ROW-KEY . URI) ROWS."
+  (let ((app (appkit-surface-app surface))
+        (demands (make-hash-table :test #'equal))
+        (interests (make-hash-table :test #'equal))
+        order)
+    (when (appkit-media-inline-image-rendering-available-p)
+      (dolist (row rows)
+        (when-let* ((demand (matrix-avatar-demand app (cdr row))))
+          (let ((key (appkit-resource-demand-key demand)))
+            (unless (gethash key demands)
+              (puthash key demand demands)
+              (push key order))
+            (puthash key (cons (car row) (gethash key interests)) interests)))))
+    (appkit-render-result-create
+     :resource-demands (mapcar (lambda (key) (gethash key demands)) (nreverse order))
+     :resource-interest-update
+     (appkit-resource-interest-update-create
+      :mode 'replace
+      :entries (let (entries)
+                 (maphash (lambda (key keys)
+                            (push (appkit-resource-interest-create
+                                   :key key :row-keys keys)
+                                  entries))
+                          interests)
+                 entries)))))
 
 (defun matrix--geometry (surface _width)
   "Request a coalesced geometry pass for exact SURFACE."
@@ -255,9 +294,13 @@ RENDER receives Surface, account read view's model, Surface model and change."
       :mount (or mount #'ignore)
       :unmount #'ignore
       :merge #'appkit-projection-change-merge
+      :resource-request (lambda (keys)
+                          (appkit-projection-change-create :resources keys))
       :render (lambda (surface app-view model request)
-                (funcall render surface (appkit-app-read-view-model app-view) model request)
-                nil)))))
+                (let ((result (funcall render surface
+                                       (appkit-app-read-view-model app-view)
+                                       model request)))
+                  (when (appkit-render-result-p result) result)))))))
 
 (defun matrix--request (surface method params &optional context)
   "Issue METHOD with PARAMS for SURFACE using an owned non-secret CONTEXT.

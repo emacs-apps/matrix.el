@@ -277,7 +277,8 @@
       (goto-char (appkit-chat-timeline-key-position "second"))
       (should-not (search-forward "Original identity"
                                  (appkit-chat-timeline-footer-start-position) t))
-      (dolist (change '((:send_state . "failed") (:sender_name . "Updated identity")))
+      (dolist (change '((:send_state . "failed") (:sender_name . "Updated identity")
+                        (:avatar_url . "mxc://test/new-avatar")))
         (let ((updated (plist-put (copy-sequence second) (car change) (cdr change))))
           (appkit-app-send app (matrix-ui-test--items-state (list first updated)))
           (appkit-surface-send surface '(matrix-update timeline "!room:test"))

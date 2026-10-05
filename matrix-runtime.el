@@ -20,6 +20,13 @@
 (require 'matrix-rpc)
 (require 'matrix-state)
 
+(declare-function matrix-avatar-clear-cache "matrix-avatar" (app))
+
+(cl-defstruct (matrix-runtime-resource-call
+               (:constructor matrix-runtime-resource-call-create))
+  "A cancellable presentation read, never authority for a durable operation."
+  app resolve reject active timer)
+
 (defcustom matrix-data-directory (expand-file-name "matrix/" user-emacs-directory)
   "Private directory containing local Matrix account profiles.
 Sessions and SDK databases contain credentials and decrypted data.  This
@@ -176,6 +183,25 @@ CONTEXT is local correlation only.  CALL may supply the external return handle."
      (plist-get model :watches))
     commands))
 
+(defun matrix-runtime--finish-resource (call result error)
+  "Settle CALL's live Resource gate after response commit."
+  (when (and (matrix-runtime-resource-call-active call)
+             (appkit-app-live-p (matrix-runtime-resource-call-app call)))
+    (let ((callback (if error
+                        (matrix-runtime-resource-call-reject call)
+                      (matrix-runtime-resource-call-resolve call))))
+      (setf (matrix-runtime-resource-call-active call) nil
+            (matrix-runtime-resource-call-resolve call) nil
+            (matrix-runtime-resource-call-reject call) nil)
+      (funcall callback (or error result)))))
+
+(defun matrix-runtime--settle-resource (_context input _observe resolve _reject)
+  "Deliver a committed presentation response INPUT outside the reducer."
+  (pcase-let ((`(,call ,result ,error) input))
+    (matrix-runtime--finish-resource call result error))
+  (funcall resolve nil)
+  nil)
+
 (defun matrix-runtime--complete (model id result error &optional terminal)
   "Commit RESULT/ERROR for request ID in MODEL and return follow-on commands.
 TERMINAL suppresses per-request refreshes while closing the whole account."
@@ -184,7 +210,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
     (let* ((method (plist-get operation :method))
            (context (plist-get operation :context))
            commands)
-      (when (and error (not terminal))
+      (when (and error (not terminal) (not (plist-get context :resource)))
         (setf (plist-get model :last-error)
               (or (plist-get error :message) "Matrix operation failed")))
       (pcase (unless terminal method)
@@ -234,13 +260,22 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
            (clrhash (plist-get model :timelines))
            (setf (plist-get model :rooms) nil)
            (setq commands (nconc commands (matrix-runtime--broadcast model 'session))))))
+      (when-let* ((resource (plist-get context :resource)))
+        (push
+         (appkit-command-start-effect
+          (appkit-effect-create
+           :key (list 'matrix-resource-result id) :input (list resource result error)
+           :start #'matrix-runtime--settle-resource
+           :success (lambda (_input _value) '(matrix-resource-delivered))
+           :failure (lambda (_input _error) '(matrix-resource-delivered))))
+         commands))
       (when-let* ((target (plist-get context :target)))
         (push (appkit-command-post-message
                :target target
                :message (list 'matrix-result id method result error context)
                :delivery 'report)
               commands))
-      (when (and error (not terminal))
+      (when (and error (not terminal) (not (plist-get context :resource)))
         (setq commands (nconc commands (matrix-runtime--broadcast model 'error))))
       commands)))
 
@@ -398,6 +433,8 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
     (when (eq app (gethash store matrix-runtime--accounts))
       (remhash store matrix-runtime--accounts))
     (puthash store transport matrix-runtime--retiring)
+    (when (fboundp 'matrix-avatar-clear-cache)
+      (matrix-avatar-clear-cache app))
     (clrhash (plist-get model :pending))
     (clrhash (plist-get model :watches))))
 
@@ -475,6 +512,32 @@ A request is account-owned; killing the initiating Surface does not undo it."
     (appkit-app-send app (list 'matrix-request call context))
     (or (matrix-rpc-call-id call)
         (user-error "Matrix request was not admitted; try again when the account is idle"))))
+
+(defun matrix-runtime-resource-request (app method params resolve reject)
+  "Read a Resource through APP's gated METHOD/PARAMS transport.
+Defer admission outside the declaring render pass; completion follows commit.
+Cancellation revokes publication, not an already accepted backend read."
+  (let ((call (matrix-runtime-resource-call-create
+               :app app :resolve resolve :reject reject :active t)))
+    (setf
+     (matrix-runtime-resource-call-timer call)
+     (run-at-time
+      0 nil
+      (lambda ()
+        (setf (matrix-runtime-resource-call-timer call) nil)
+        (when (matrix-runtime-resource-call-active call)
+          (condition-case nil
+              (matrix-runtime-request app method params (list :resource call))
+            (error (matrix-runtime--finish-resource call nil 'request-not-sent)))))))
+    (appkit-cancellation-create
+     :kind 'logical
+     :cancel (lambda ()
+               (when-let* ((timer (matrix-runtime-resource-call-timer call)))
+                 (cancel-timer timer))
+               (setf (matrix-runtime-resource-call-active call) nil
+                     (matrix-runtime-resource-call-timer call) nil
+                     (matrix-runtime-resource-call-resolve call) nil
+                     (matrix-runtime-resource-call-reject call) nil)))))
 
 (defun matrix-runtime-register-surface (app surface &optional room-id)
   "Register exact SURFACE in APP and subscribe to ROOM-ID if supplied."

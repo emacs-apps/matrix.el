@@ -13,7 +13,7 @@ use matrix_sdk::{
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     latest_events::LatestEventValue,
     ruma::{
-        OwnedDeviceId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
+        OwnedDeviceId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
         api::{
             client::{room::create_room, session::get_login_types::v3::LoginType},
             error::ErrorKind,
@@ -27,12 +27,13 @@ use matrix_sdk::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
+    media,
     protocol::{INVALID, NETWORK, Output, Result, RpcError, params},
     storage::{SavedSession, Store},
     timeline::Timelines,
@@ -52,11 +53,13 @@ pub struct Backend {
     store: Arc<Store>,
     output: Output,
     timeline_cancel: CancellationToken,
+    avatar_slots: Semaphore,
     account: RwLock<Option<Account>>,
 }
 
 struct Account {
     client: Client,
+    generation: String,
     timelines: Arc<Timelines>,
     verifications: Arc<Verifications>,
     status: Arc<RwLock<&'static str>>,
@@ -98,6 +101,12 @@ struct PaginateParam {
     room_id: OwnedRoomId,
     subscription_id: String,
     limit: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AvatarParam {
+    uri: OwnedMxcUri,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +151,7 @@ impl Backend {
             store: Arc::new(store),
             output,
             timeline_cancel,
+            avatar_slots: Semaphore::new(4),
             account: RwLock::new(None),
         })
     }
@@ -251,6 +261,28 @@ impl Backend {
                         .await?;
                     return Ok(json!({"hit_start":hit_start}));
                 }
+                if method == "media.avatar" {
+                    let args: AvatarParam = params(value)?;
+                    if args.uri.as_str().len() > 4096 || !args.uri.is_valid() {
+                        return Err(INVALID);
+                    }
+                    let client = account.client.clone();
+                    let generation = account.generation.clone();
+                    let cancel = account.cancel.clone();
+                    let _operation = account.tasks.token();
+                    drop(slot);
+                    let path = media::avatar(
+                        self.store.clone(),
+                        client,
+                        generation,
+                        args.uri,
+                        cancel,
+                        self.timeline_cancel.clone(),
+                        &self.avatar_slots,
+                    )
+                    .await?;
+                    return Ok(json!({"path":path}));
+                }
                 account.dispatch(&self.store, method, value).await
             }
         }
@@ -342,12 +374,13 @@ impl Backend {
         self.store.save(&SavedSession {
             version: 1,
             homeserver: client.homeserver().to_string(),
-            generation,
+            generation: generation.clone(),
             fingerprint,
             session,
         })?;
         Account::start(
             client,
+            generation,
             self.output.clone(),
             self.timeline_cancel.child_token(),
         )
@@ -395,12 +428,13 @@ impl Backend {
         self.store.save(&SavedSession {
             version: 1,
             homeserver: saved.homeserver,
-            generation: saved.generation,
+            generation: saved.generation.clone(),
             fingerprint: saved.fingerprint,
             session: client.matrix_auth().session().ok_or(CORRUPT)?,
         })?;
         Account::start(
             client,
+            saved.generation,
             self.output.clone(),
             self.timeline_cancel.child_token(),
         )
@@ -418,6 +452,7 @@ impl Backend {
 impl Account {
     async fn start(
         client: Client,
+        generation: String,
         output: Output,
         timeline_cancel: CancellationToken,
     ) -> Result<Self> {
@@ -477,6 +512,7 @@ impl Account {
         });
         Ok(Self {
             client,
+            generation,
             timelines: Arc::new(Timelines::new(timeline_cancel)),
             verifications,
             status,
@@ -757,6 +793,21 @@ async fn room_summaries(client: &Client) -> Value {
             "membership":membership, "encrypted":room.encryption_state().is_encrypted(),
             "unread":room.num_unread_notifications()
         });
+        // The SDK room avatar wins. For a direct room with one other hero,
+        // use that member's SDK profile without fetching membership or media.
+        let mut avatar_url = room.avatar_url();
+        if avatar_url.is_none() && room.is_direct().await.unwrap_or(false) {
+            let heroes = room.heroes().await;
+            let mut others = heroes.iter().filter(|hero| hero.user_id != room.own_user_id());
+            if let Some(hero) = others.next()
+                && others.next().is_none()
+            {
+                avatar_url = hero.avatar_url.clone();
+            }
+        }
+        if let Some(uri) = avatar_url {
+            summary["avatar_url"] = json!(uri);
+        }
         // The SDK computes these lazily from its event cache/send queue. Automatic
         // backfill stays disabled: an absent/unavailable preview is simply omitted.
         // Initial computation can complete after this snapshot; normal room-summary
