@@ -7,38 +7,75 @@ use matrix_sdk::{
     ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent},
 };
 use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt, Timeline, TimelineItem, VirtualTimelineItem,
+    EventSendState, RoomExt, Timeline, TimelineDetails, TimelineItem, VirtualTimelineItem,
 };
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Mutex, OnceCell};
+use tokio_util::{
+    sync::CancellationToken,
+    task::{TaskTracker, task_tracker::TaskTrackerToken},
+};
 
-use crate::protocol::{NETWORK, Output, Result, RpcError};
+use crate::protocol::{INVALID, NETWORK, Output, Result, RpcError};
 
 const MAX_SUBSCRIPTIONS: usize = 32;
+const STALE_SUBSCRIPTION: RpcError = RpcError::new(
+    "stale_subscription",
+    "This timeline subscription is no longer active",
+);
+const PAGINATION_CANCELLED: RpcError = RpcError::new(
+    "pagination_cancelled",
+    "Timeline pagination was cancelled because its subscription closed",
+);
+
 struct Subscription {
     id: String,
-    timeline: Arc<Timeline>,
+    timeline: OnceCell<Result<Arc<Timeline>>>,
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    tasks: TaskTracker,
 }
 
-#[derive(Default)]
+impl Subscription {
+    fn cancel(&self) {
+        self.cancel.cancel();
+        self.tasks.close();
+    }
+}
+
 pub struct Timelines {
-    rooms: Mutex<HashMap<OwnedRoomId, Subscription>>,
+    rooms: Mutex<HashMap<OwnedRoomId, Arc<Subscription>>>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl Timelines {
-    pub async fn subscribe(
+    pub fn new(cancel: CancellationToken) -> Self {
+        Self {
+            rooms: Mutex::new(HashMap::new()),
+            cancel,
+            tasks: TaskTracker::new(),
+        }
+    }
+
+    // Reserve the identity before any SDK or output await. Only this short critical
+    // section is shared across rooms, and in-flight initializations count toward the cap.
+    async fn reserve(
         &self,
-        client: &Client,
-        output: Output,
         room_id: OwnedRoomId,
         id: String,
-    ) -> Result<()> {
+    ) -> Result<(
+        Arc<Subscription>,
+        Option<Arc<Subscription>>,
+        TaskTrackerToken,
+    )> {
         let mut rooms = self.rooms.lock().await;
-        if rooms.get(&room_id).is_some_and(|s| s.id == id) {
-            return Ok(());
+        if self.cancel.is_cancelled() {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        if let Some(current) = rooms.get(&room_id) {
+            if current.id == id && !current.cancel.is_cancelled() {
+                return Ok((current.clone(), None, current.tasks.token()));
+            }
         }
         if !rooms.contains_key(&room_id) && rooms.len() >= MAX_SUBSCRIPTIONS {
             return Err(RpcError::new(
@@ -46,84 +83,197 @@ impl Timelines {
                 "At most 32 room timelines may be open",
             ));
         }
-        let timeline = if let Some(old) = rooms.remove(&room_id) {
-            old.cancel.cancel();
-            let _ = old.task.await;
-            old.timeline
-        } else {
-            Arc::new(
-                joined_room(client, &room_id)?
-                    .timeline()
-                    .await
-                    .map_err(|_| NETWORK)?,
-            )
-        };
-        let (items, stream) = timeline.subscribe().await;
-        if !output
-            .event(
-                json!({"type":"timeline_reset", "room_id":room_id, "subscription_id":id,
-            "revision":0, "items":items.iter().map(|i| item(i)).collect::<Vec<_>>()}),
-            )
-            .await
-        {
-            return Err(RpcError::new("transport_closed", "Protocol output closed"));
-        }
-        let cancel = CancellationToken::new();
-        let task_cancel = cancel.clone();
-        let task_room = room_id.clone();
-        let task_id = id.clone();
-        let task = tokio::spawn(async move {
-            futures_util::pin_mut!(stream);
-            let mut revision = 0u64;
-            loop {
-                tokio::select! {
-                    _ = task_cancel.cancelled() => break,
-                    diffs = stream.next() => {
-                        let Some(diffs) = diffs else {
-                            output.event(json!({"type":"status", "state":"error", "message":"Timeline stream ended; close and reopen the room"})).await;
-                            break;
-                        };
-                        if diffs.is_empty() { continue; }
-                        revision += 1;
-                        let event = json!({"type":"timeline_diff", "room_id":task_room, "subscription_id":task_id,
-                            "revision":revision, "changes":diffs.into_iter().map(change).collect::<Vec<_>>()});
-                        tokio::select! {
-                            _ = task_cancel.cancelled() => break,
-                            sent = output.event(event) => if !sent { break; },
-                        }
-                    }
-                }
-            }
+        let subscription = Arc::new(Subscription {
+            id,
+            timeline: OnceCell::new(),
+            cancel: self.cancel.child_token(),
+            tasks: TaskTracker::new(),
         });
-        rooms.insert(
-            room_id,
-            Subscription {
-                id,
-                timeline,
-                cancel,
-                task,
-            },
-        );
-        Ok(())
+        let operation = subscription.tasks.token();
+        let old = rooms.insert(room_id, subscription.clone());
+        if let Some(old) = &old {
+            old.cancel();
+        }
+        Ok((subscription, old, operation))
+    }
+
+    async fn is_current(&self, room_id: &OwnedRoomId, subscription: &Arc<Subscription>) -> bool {
+        let rooms = self.rooms.lock().await;
+        !subscription.cancel.is_cancelled()
+            && rooms
+                .get(room_id)
+                .is_some_and(|current| Arc::ptr_eq(current, subscription))
+    }
+
+    pub async fn subscribe(
+        &self,
+        client: &Client,
+        output: Output,
+        room_id: OwnedRoomId,
+        id: String,
+    ) -> Result<()> {
+        let _operation = self.tasks.token();
+        let (subscription, old, _subscription_operation) =
+            self.reserve(room_id.clone(), id).await?;
+        let initialize = async {
+            let reusable = if let Some(old) = old {
+                old.tasks.wait().await;
+                old.timeline
+                    .get()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+            } else {
+                None
+            };
+            subscription
+                .timeline
+                .get_or_init(|| async {
+                    let timeline = match reusable {
+                        Some(timeline) => timeline,
+                        None => Arc::new(
+                            joined_room(client, &room_id)?
+                                .timeline()
+                                .await
+                                .map_err(|_| NETWORK)?,
+                        ),
+                    };
+                    let (items, stream) = timeline.subscribe().await;
+                    if !output
+                        .event(json!({
+                            "type":"timeline_reset", "room_id":room_id,
+                            "subscription_id":subscription.id, "revision":0,
+                            "items":items.iter().map(|i| item(i)).collect::<Vec<_>>()
+                        }))
+                        .await
+                    {
+                        return Err(RpcError::new("transport_closed", "Protocol output closed"));
+                    }
+                    let task_cancel = subscription.cancel.clone();
+                    let task_room = room_id.clone();
+                    let task_id = subscription.id.clone();
+                    self.tasks.spawn(subscription.tasks.track_future(async move {
+                        futures_util::pin_mut!(stream);
+                        let mut revision = 0u64;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = task_cancel.cancelled() => break,
+                                diffs = stream.next() => {
+                                    let Some(diffs) = diffs else {
+                                        tokio::select! {
+                                            biased;
+                                            _ = task_cancel.cancelled() => {},
+                                            _ = output.event(json!({"type":"status", "state":"error", "message":"Timeline stream ended; close and reopen the room"})) => {},
+                                        }
+                                        break;
+                                    };
+                                    if diffs.is_empty() { continue; }
+                                    revision += 1;
+                                    let event = json!({
+                                        "type":"timeline_diff", "room_id":task_room,
+                                        "subscription_id":task_id, "revision":revision,
+                                        "changes":diffs.into_iter().map(change).collect::<Vec<_>>()
+                                    });
+                                    tokio::select! {
+                                        biased;
+                                        _ = task_cancel.cancelled() => break,
+                                        sent = output.event(event) => if !sent { break; },
+                                    }
+                                }
+                            }
+                        }
+                        task_cancel.cancel();
+                    }));
+                    Ok(timeline)
+                })
+                .await
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| *error)
+        };
+        let result = tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
+            result = initialize => result,
+        };
+        if result.is_err() {
+            // A failed old initializer must never remove its replacement.
+            let mut rooms = self.rooms.lock().await;
+            if rooms
+                .get(&room_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &subscription))
+            {
+                rooms.remove(&room_id);
+            }
+            subscription.cancel();
+        }
+        if result.is_ok() && !self.is_current(&room_id, &subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        result
     }
 
     pub async fn unsubscribe(&self, room_id: &OwnedRoomId, id: &str) {
-        let mut rooms = self.rooms.lock().await;
-        if rooms.get(room_id).is_some_and(|s| s.id == id) {
-            let old = rooms.remove(room_id).expect("checked subscription");
-            old.cancel.cancel();
-            let _ = old.task.await;
+        let _operation = self.tasks.token();
+        let old = {
+            let mut rooms = self.rooms.lock().await;
+            if rooms.get(room_id).is_some_and(|s| s.id == id) {
+                let old = rooms.remove(room_id).expect("checked subscription");
+                old.cancel();
+                Some(old)
+            } else {
+                None
+            }
+        };
+        if let Some(old) = old {
+            old.tasks.wait().await;
         }
+    }
+
+    pub async fn paginate(&self, room_id: &OwnedRoomId, id: &str, limit: u16) -> Result<bool> {
+        if id.is_empty() || id.len() > 128 || !(1..=100).contains(&limit) {
+            return Err(INVALID);
+        }
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = {
+            let rooms = self.rooms.lock().await;
+            let subscription = rooms
+                .get(room_id)
+                .filter(|s| s.id == id && !s.cancel.is_cancelled())
+                .ok_or(STALE_SUBSCRIPTION)?;
+            (subscription.clone(), subscription.tasks.token())
+        };
+        let timeline = subscription.timeline.get().ok_or(RpcError::new(
+            "subscription_not_ready",
+            "Wait for timeline subscription to complete before requesting history",
+        ))?;
+        let timeline = timeline.as_ref().map_err(|error| *error)?;
+        // SDK 0.19.1 coalesces reads in an account-owned event-cache task. Dropping
+        // this future revokes our waiter, not that task's HTTP/cache work. Its
+        // authoritative updates may still reach a successor through the SDK stream;
+        // this RPC must never settle the successor's loading/exhaustion state.
+        let result = tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(PAGINATION_CANCELLED),
+            result = timeline.paginate_backwards(limit) => result.map_err(|_| RpcError::new(
+                "pagination_failed",
+                "Cannot load older room history; check connection and room access",
+            )),
+        };
+        if !self.is_current(room_id, &subscription).await {
+            return Err(PAGINATION_CANCELLED);
+        }
+        result
     }
 
     pub async fn send(&self, client: &Client, room_id: &OwnedRoomId, body: String) -> Result<()> {
         let room = joined_room(client, room_id)?;
-        let timeline = self
-            .rooms
-            .lock()
-            .await
-            .get(room_id)
-            .map(|s| s.timeline.clone());
+        let timeline = self.rooms.lock().await.get(room_id).and_then(|s| {
+            s.timeline
+                .get()
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+        });
         let timeline = match timeline {
             Some(timeline) => timeline,
             None => Arc::new(room.timeline().await.map_err(|_| NETWORK)?),
@@ -142,7 +292,12 @@ impl Timelines {
             .lock()
             .await
             .values()
-            .map(|s| s.timeline.clone())
+            .filter_map(|s| {
+                s.timeline
+                    .get()
+                    .and_then(|result| result.as_ref().ok())
+                    .cloned()
+            })
             .collect();
         for timeline in timelines {
             timeline
@@ -152,13 +307,13 @@ impl Timelines {
     }
 
     pub async fn shutdown(&self) {
+        self.cancel.cancel();
         let rooms = std::mem::take(&mut *self.rooms.lock().await);
         for subscription in rooms.values() {
-            subscription.cancel.cancel();
+            subscription.cancel();
         }
-        for (_, subscription) in rooms {
-            let _ = subscription.task.await;
-        }
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 }
 
@@ -182,6 +337,11 @@ fn item(item: &TimelineItem) -> Value {
         value["event_id"] = json!(event.event_id());
         value["transaction_id"] = json!(event.transaction_id());
         value["sender"] = json!(event.sender());
+        if let TimelineDetails::Ready(profile) = event.sender_profile() {
+            if let Some(name) = &profile.display_name {
+                value["sender_name"] = json!(name);
+            }
+        }
         value["timestamp"] = json!(event.timestamp());
         value["own"] = json!(event.is_own());
         let content = event.content();
@@ -251,5 +411,117 @@ fn change(diff: VectorDiff<Arc<TimelineItem>>) -> Value {
         VectorDiff::Reset { values } => {
             json!({"op":"reset", "items":values.iter().map(|i| item(i)).collect::<Vec<_>>()})
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use matrix_sdk::ruma::owned_room_id;
+
+    #[tokio::test]
+    async fn replacement_revokes_pending_initializer_without_blocking_other_rooms() {
+        let timelines = Timelines::new(CancellationToken::new());
+        let room = owned_room_id!("!room:example.org");
+        let (old, _, old_operation) = timelines.reserve(room.clone(), "old".into()).await.unwrap();
+        let (current, replaced, current_operation) = timelines
+            .reserve(room.clone(), "current".into())
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&old, &replaced.unwrap()));
+        assert!(old.cancel.is_cancelled());
+        assert!(!timelines.is_current(&room, &old).await);
+        assert!(timelines.is_current(&room, &current).await);
+
+        // The old initializer is deliberately still alive. It neither holds the
+        // room map nor gives a stale close request authority over the replacement.
+        timelines.unsubscribe(&room, "old").await;
+        assert!(timelines.is_current(&room, &current).await);
+        assert_eq!(
+            timelines.paginate(&room, "old", 30).await.unwrap_err().code,
+            "stale_subscription"
+        );
+        let (_, _, unrelated_operation) = timelines
+            .reserve(owned_room_id!("!other:example.org"), "other".into())
+            .await
+            .unwrap();
+        drop(unrelated_operation);
+        drop(old_operation);
+        old.tasks.wait().await;
+        drop(current_operation);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn closed_generation_cannot_settle_a_reopened_subscription() {
+        let transport = CancellationToken::new();
+        let timelines = Timelines::new(transport.clone());
+        let room = owned_room_id!("!room:example.org");
+        let (old, _, operation) = timelines
+            .reserve(room.clone(), "same-id".into())
+            .await
+            .unwrap();
+        drop(operation);
+        timelines.unsubscribe(&room, "same-id").await;
+        let (current, _, operation) = timelines
+            .reserve(room.clone(), "same-id".into())
+            .await
+            .unwrap();
+        assert!(!timelines.is_current(&room, &old).await);
+        assert!(timelines.is_current(&room, &current).await);
+
+        transport.cancel();
+        assert!(!timelines.is_current(&room, &current).await);
+        assert_eq!(
+            timelines
+                .paginate(&room, "same-id", 30)
+                .await
+                .unwrap_err()
+                .code,
+            "stale_subscription"
+        );
+        assert_eq!(
+            timelines
+                .reserve(room, "after-close".into())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "stale_subscription"
+        );
+        drop(operation);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pagination_rejects_invalid_limits_before_touching_a_subscription() {
+        let timelines = Timelines::new(CancellationToken::new());
+        let room = owned_room_id!("!room:example.org");
+        let (_, _, operation) = timelines
+            .reserve(room.clone(), "active".into())
+            .await
+            .unwrap();
+        for limit in [0, 101, u16::MAX] {
+            assert_eq!(
+                timelines
+                    .paginate(&room, "active", limit)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "invalid_params"
+            );
+        }
+        for limit in [1, 100] {
+            assert_eq!(
+                timelines
+                    .paginate(&room, "active", limit)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "subscription_not_ready"
+            );
+        }
+        drop(operation);
+        timelines.shutdown().await;
     }
 }

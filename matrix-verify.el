@@ -8,7 +8,6 @@
 ;;; Code:
 
 (require 'matrix)
-(require 'matrix-root)
 (require 'appkit-directory)
 
 (defvar-local matrix-verify--sas-shown nil
@@ -19,6 +18,8 @@
     (set-keymap-parent map appkit-directory-mode-map)
     (define-key map (kbd "g") #'matrix-verify-refresh)
     (define-key map (kbd "v") #'matrix-verification-request)
+    (define-key map (kbd "?") #'matrix-verify-transient)
+    (define-key map (kbd "M-g") matrix-navigation-map)
     map)
   "Keymap for the device and SAS directory.")
 
@@ -58,30 +59,24 @@
           (list
            (appkit-directory-entry-create
             :key '(account) :role 'section :label "Device trust and key recovery" :face 'bold)
-           (matrix-root--note '(identity)
+           (matrix--directory-note '(identity)
                               (format "%s / %s — %s"
                                       (or user-id "Not authenticated")
                                       (or (plist-get session :device_id) "—")
                                       (plist-get state :connection)))
-           (matrix-root--note '(security)
+           (matrix--directory-note '(security)
                               "Compare SAS on both devices. Confirm only an exact match; otherwise cancel."
-                              'warning)
-           (matrix-root--action '(refresh) "Refresh devices [g]" '(command matrix-verify-refresh))
-           (matrix-root--action '(request) "Request verification of a specific device [v]"
-                                '(command matrix-verification-request))
-           (matrix-root--action '(export) "Export encrypted room keys" '(command matrix-keys-export))
-           (matrix-root--action '(import) "Import encrypted room keys" '(command matrix-keys-import))
-           (matrix-root--action '(recover) "Recover keys with a recovery key" '(command matrix-keys-recover)))))
+                              'warning))))
     (when-let* ((error (plist-get state :last-error)))
-      (setq entries (append entries (list (matrix-root--note '(error) error 'error)))))
+      (setq entries (append entries (list (matrix--directory-note '(error) error 'error)))))
     (when-let* ((notice (plist-get model :notice)))
-      (setq entries (append entries (list (matrix-root--note '(operation) notice)))))
+      (setq entries (append entries (list (matrix--directory-note '(operation) notice)))))
     (setq entries
           (append entries
                   (list (appkit-directory-entry-create
                          :key '(devices) :role 'section :label "Your devices" :face 'bold))))
     (unless (plist-get model :devices-loaded)
-      (setq entries (append entries (list (matrix-root--note '(devices-loading)
+      (setq entries (append entries (list (matrix--directory-note '(devices-loading)
                                                              "Devices not yet loaded; press g." nil '(devices))))))
     (dolist (device (plist-get model :devices))
       (let* ((id (plist-get device :device_id))
@@ -93,8 +88,8 @@
         (setq entries
               (append entries
                       (list (if self
-                                (matrix-root--note (list 'device id) label nil '(devices))
-                              (matrix-root--action (list 'device id) label
+                                (matrix--directory-note (list 'device id) label nil '(devices))
+                              (matrix--directory-action (list 'device id) label
                                                    (list 'request user-id id) '(devices))))))))
     (setq entries
           (append entries
@@ -115,18 +110,18 @@
                  (sas (and (equal status "sas") (matrix-verify--sas flow))))
             (setq entries
                   (append entries
-                          (list (matrix-root--note
+                          (list (matrix--directory-note
                                  (list 'flow user id)
                                  (format "%s / %s   Device: %s   [%s]"
                                          user id (or (plist-get flow :device_id) "unknown") status)
                                  nil '(flows)))))
             (when-let* ((message (plist-get flow :message)))
               (setq entries (append entries
-                                    (list (matrix-root--note (list 'flow-message user id) message nil '(flows))))))
+                                    (list (matrix--directory-note (list 'flow-message user id) message nil '(flows))))))
             (when (equal status "requested")
               (setq entries
                     (append entries
-                            (list (matrix-root--action
+                            (list (matrix--directory-action
                                    (list 'accept user id) "  Accept SAS verification request"
                                    (list 'accept user id) '(flows))))))
             (when sas
@@ -134,26 +129,27 @@
               (setq entries
                     (append entries
                             (list
-                             (matrix-root--note (list 'sas user id) (matrix-verify--sas-text sas) 'bold '(flows))
-                             (matrix-root--action
+                             (matrix--directory-note (list 'sas user id) (matrix-verify--sas-text sas) 'bold '(flows))
+                             (matrix--directory-action
                               (list 'confirm user id) "  Compare both devices and confirm exact match"
                               (list 'confirm user id) '(flows))))))
             (when (and (equal status "sas") (not sas))
               (setq entries
                     (append entries
-                            (list (matrix-root--note
+                            (list (matrix--directory-note
                                    (list 'invalid-sas user id)
                                    "No complete SAS available — confirmation is disabled." 'error '(flows))))))
             (unless (member status '("done" "cancelled"))
               (setq entries
                     (append entries
-                            (list (matrix-root--action
+                            (list (matrix--directory-action
                                    (list 'cancel user id) "  Cancel / SAS does not match"
                                    (list 'cancel user id) '(flows))))))))))
     (cons entries shown)))
 
-(defun matrix-verify--render (_surface state model)
+(defun matrix-verify--render (_surface state model _request)
   "Present STATE and MODEL, recording only SAS successfully rendered here."
+  (matrix--frame state "Devices and trust")
   (let ((projection (matrix-verify--projection state model)))
     (appkit-directory-reconcile (appkit-directory-surface) (car projection)
                                 :preserve-position-p t)
@@ -240,14 +236,11 @@
   "Open APP's trust directory, optionally SELECT it.
 NO-REFRESH leaves the initial operation slot free for a user key/SAS command."
   (let* ((existing (appkit-app-surface app '(verify)))
-         (surface
-          (or existing
-              (matrix--register
-               app (appkit-open-generated-surface
-                    matrix-verify--type :app app :identity '(verify) :input '(verify)
-                    :buffer-name (format "*Matrix:%s:devices*"
-                                         (plist-get (matrix-runtime-state app) :account)))))))
-    (when select (pop-to-buffer (appkit-surface-buffer surface)))
+         (surface (matrix--open
+                   app matrix-verify--type '(verify)
+                   (format "*Matrix:%s:devices*"
+                           (plist-get (matrix-runtime-state app) :account))
+                   select)))
     (unless (or existing no-refresh) (matrix--request surface "devices.list" nil))
     surface))
 

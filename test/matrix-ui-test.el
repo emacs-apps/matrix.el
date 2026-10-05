@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'matrix-room)
 (require 'matrix-verify)
+(require 'matrix-transient)
 
 (defun matrix-ui-test--state (body)
   "Build a small account snapshot with a real SDK-shaped timeline BODY."
@@ -157,6 +158,120 @@
     (should-not (plist-get (appkit-surface-model surface) :uncertain-send))
     (should-not (plist-get (appkit-surface-model surface) :operation))
     (should (equal (appkit-chatbuf-input-string) "Not yet sent"))))
+
+(ert-deftest matrix-ui-reopening-room-preserves-reading-position ()
+  (save-window-excursion
+    (matrix-ui-test--with-room
+      (switch-to-buffer buffer)
+      (goto-char (point-min))
+      (search-forward "Initial")
+      (let ((reading-point (point)))
+        (matrix-room-open app "!room:test" t)
+        (should (= (point) reading-point))))))
+
+(ert-deftest matrix-ui-pagination-fences-subscriptions-and-does-not-settle-send ()
+  (matrix-ui-test--with-room
+    (appkit-chatbuf-input-replace "Concurrent send")
+    (let* ((send (matrix-ui-test--capture surface 1))
+           (address (plist-get (appkit-surface-model surface) :address))
+           (old (list :target address :subscription "subscription"
+                      :history-owner (appkit-chat-history-request-start surface 'older)))
+           (state (matrix-ui-test--state "Initial message"))
+           (timeline (gethash "!room:test" (plist-get state :timelines))))
+      (puthash "!room:test" (plist-put timeline :subscription_id "replacement")
+               (plist-get state :timelines))
+      (appkit-app-send app state)
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (let ((current (list :target address :subscription "replacement"
+                           :history-owner (appkit-chat-history-request-start surface 'older))))
+        (appkit-surface-send surface
+                             (list 'matrix-result 1 "timeline.paginate" '(:hit_start t) nil old))
+        (should (appkit-chat-history-loading-p))
+        (should-not (appkit-chat-history-older-loaded-p))
+        (appkit-surface-send surface
+                             (list 'matrix-result 2 "timeline.paginate" nil
+                                   '(:message "History unavailable") current))
+        (should-not (appkit-chat-history-loading-p))
+        (should (plist-get (appkit-surface-model surface) :history-error))
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (should (plist-get (appkit-surface-model surface) :history-error))
+        (setq current
+              (plist-put current :history-owner
+                         (appkit-chat-history-request-start surface 'older)))
+        (appkit-surface-send surface '(matrix-history-started))
+        (appkit-surface-send surface
+                             (list 'matrix-result 3 "timeline.paginate" '(:hit_start t) nil current))
+        (should (appkit-chat-history-older-loaded-p))
+        (should-not (appkit-chat-history-loading-p))
+        (should-not (plist-get (appkit-surface-model surface) :history-error))
+        (should (equal (plist-get (appkit-surface-model surface) :operation) send))
+        (should (equal (appkit-chatbuf-input-string) "Concurrent send"))))))
+
+(ert-deftest matrix-ui-pagination-preserves-anchor-behind-hidden-sdk-boundary ()
+  (matrix-ui-test--with-room
+    (appkit-chatbuf-input-replace "Unsubmitted draft")
+    (goto-char (point-min))
+    (search-forward "Initial")
+    (let* ((offset (- (point) (appkit-chat-timeline-key-position "stable-row")))
+           (state (matrix-ui-test--state "Initial message"))
+           (timeline (gethash "!room:test" (plist-get state :timelines))))
+      (puthash "!room:test"
+               (plist-put timeline :items
+                          (cons '(:id "hidden-edge" :kind "state" :body "m.room.member")
+                                (cons '(:id "older" :kind "message" :body "Earlier message"
+                                        :sender "@older:test")
+                                      (plist-get timeline :items))))
+               (plist-get state :timelines))
+      (appkit-app-send app state)
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (equal (appkit-chat-history-window-first-key) "hidden-edge"))
+      (should-not (member "hidden-edge" (appkit-chat-timeline-keys)))
+      (should (equal (get-text-property (point) matrix-room-message-key-property) "stable-row"))
+      (should (= offset (- (point) (appkit-chat-timeline-key-position "stable-row"))))
+      (should (equal (appkit-chatbuf-input-string) "Unsubmitted draft")))))
+
+(ert-deftest matrix-ui-empty-sdk-snapshot-is-not-history-exhaustion ()
+  (matrix-ui-test--with-room
+    (let* ((state (matrix-ui-test--state "Initial message"))
+           (timelines (plist-get state :timelines)))
+      (puthash "!room:test" (plist-put (gethash "!room:test" timelines) :items nil) timelines)
+      (appkit-app-send app state)
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (appkit-chat-history-window-known-p))
+      (should-not (appkit-chat-history-older-loaded-p))
+      (should-not (appkit-chat-history-window-empty-p)))))
+
+(ert-deftest matrix-ui-message-menu-resolves-captured-key-not-current-point ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (goto-char (appkit-chat-timeline-key-position "stable-row"))
+    (let ((scope (matrix-menu--capture 'room t))
+          (kill-ring nil))
+      (appkit-chatbuf-input-replace "Private unsent draft")
+      (appkit-chatbuf-focus-input)
+      (appkit-app-send app (matrix-ui-test--state "Edited message"))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (matrix-message-copy-text scope)
+      (should (equal (car kill-ring) "Edited message"))
+      (let* ((state (matrix-ui-test--state "Different message"))
+             (timeline (gethash "!room:test" (plist-get state :timelines))))
+        (setf (plist-get (car (plist-get timeline :items)) :id) "different-row")
+        (appkit-app-send app state)
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (goto-char (appkit-chat-timeline-key-position "different-row"))
+        (should-error (matrix-message-copy-text scope) :type 'user-error)
+        (should (equal (car kill-ring) "Edited message"))))))
+
+(ert-deftest matrix-ui-message-menu-rejects-reopened-host-with-same-key ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (goto-char (appkit-chat-timeline-key-position "stable-row"))
+    (let ((scope (matrix-menu--capture 'room t))
+          (kill-ring nil))
+      (appkit-surface-stop surface)
+      (setq surface (matrix-ui-test--open app buffer))
+      (should-error (matrix-message-copy-text scope) :type 'user-error)
+      (should-not kill-ring))))
 
 (ert-deftest matrix-ui-directories-retire-completed-sas-actions ()
   (matrix-ui-test--with-room

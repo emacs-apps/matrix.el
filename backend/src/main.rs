@@ -67,7 +67,7 @@ async fn run(store: Store) {
         rx,
         closed.clone(),
     ));
-    let backend = Backend::new(store, output.clone());
+    let backend = Backend::new(store, output.clone(), closed.clone());
     let semaphore = Arc::new(Semaphore::new(16));
     let mut requests = JoinSet::new();
     let (frames_tx, mut frames) = mpsc::channel(1);
@@ -150,6 +150,8 @@ async fn run(store: Store) {
     }
     // Closing input ends the transport, not the durable operations already accepted.
     // Release output backpressure before draining those operations.
+    // The same token revokes view initialization/pagination before request draining;
+    // durable sends and session/key operations are deliberately not cancelled.
     closed.cancel();
     reader.abort();
     let _ = reader.await;

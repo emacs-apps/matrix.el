@@ -10,6 +10,22 @@
 (require 'matrix)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-timeline)
+(require 'appkit-chat-history)
+(require 'appkit-chat-ins)
+(require 'appkit-chat-avatar)
+(require 'appkit-name-color)
+(require 'appkit-ui)
+
+(defvar-local matrix-room--width 80
+  "Width of the last committed room presentation.")
+
+(defvar matrix-room-navigation-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map matrix-navigation-map)
+    (define-key map (kbd "<") #'matrix-room-load-older)
+    (define-key map (kbd ">") #'matrix-room-latest)
+    map)
+  "Native navigation prefix, also reused by optional Evil integration.")
 
 (defconst matrix-room-message-key-property 'matrix-message-id
   "Stable SDK timeline identity attached to generated rows.")
@@ -18,7 +34,10 @@
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
     (define-key map (kbd "g") #'matrix-room-refresh)
-    (define-key map (kbd "v") #'matrix-devices)
+    (define-key map (kbd "n") #'matrix-room-next-message)
+    (define-key map (kbd "p") #'matrix-room-previous-message)
+    (define-key map (kbd "o") #'matrix-message-transient)
+    (define-key map (kbd "?") #'matrix-room-transient)
     map)
   "Keymap active over generated Matrix timeline rows.")
 
@@ -30,9 +49,12 @@
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-c") #'matrix-room-send)
+    (define-key map (kbd "C-c RET") #'matrix-room-send)
+    (define-key map (kbd "C-c C-o") #'matrix-composer-transient)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
     (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
-    (define-key map (kbd "C-c C-v") #'matrix-devices)
+    (define-key map (kbd "M-g") matrix-room-navigation-map)
+    (define-key map (kbd "RET") #'matrix-room-return)
     map)
   "Keymap for `matrix-room-mode'.")
 
@@ -47,63 +69,111 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
   (seq-find (lambda (room) (equal room-id (plist-get room :room_id)))
             (plist-get state :rooms)))
 
-(defun matrix-room--header (state room-id)
-  "Return the generated header from account STATE and ROOM-ID."
-  (let ((room (matrix-room--metadata state room-id)))
-    (format "%s\n%s   [%s]   %s\n\n"
-            (matrix--one-line (or (plist-get room :name) room-id))
-            (matrix--one-line room-id)
-            (plist-get state :connection)
-            (if (eq (plist-get room :encrypted) t)
-                "Encrypted room — device trust enforced by Matrix SDK"
-              "WARNING: room is not known to be encrypted"))))
+(defun matrix-room--timeline (state room-id)
+  "Read ROOM-ID's authoritative timeline from account STATE."
+  (when-let* ((timelines (plist-get state :timelines)))
+    (gethash room-id timelines)))
+
+(defun matrix-room--sync-history (model state)
+  "Derive exact history bounds from committed SDK STATE, fencing old requests."
+  (let* ((timeline (matrix-room--timeline state (cadr (plist-get model :identity))))
+         (subscription (plist-get timeline :subscription_id)))
+    (unless (equal subscription (plist-get model :history-subscription))
+      (appkit-chat-history-reset-state)
+      (setq model (plist-put (copy-sequence model) :history-subscription subscription))
+      (setq model (plist-put model :history-error nil)))
+    (when (numberp (plist-get timeline :revision))
+      ;; An empty reset is a valid live window, not proof of exhaustion.
+      (appkit-chat-history-window-set
+       (plist-get (car (plist-get timeline :items)) :id) nil))
+    model))
 
 (defun matrix-room--footer (state timeline model)
-  "Return sync and compose status from STATE, TIMELINE and MODEL."
+  "Return passive history, transport and submission status."
   (concat
+   (appkit-chat-history-delimiter-string
+    matrix-room--width :loading-text "Loading older messages")
    "\n"
-   (when (plist-get timeline :loading) "Loading encrypted timeline…\n")
+   (when (plist-get timeline :loading) "Opening timeline…\n")
    (when-let* ((error (plist-get timeline :error)))
-     (concat (propertize (format "Timeline error: %s" error) 'face 'error) "\n"))
+     (concat (propertize (format "Timeline: %s" error) 'face 'error) "\n"))
+   (when-let* ((error (plist-get model :history-error)))
+     (concat (propertize (format "History: %s" error) 'face 'error) "\n"))
    (when-let* ((error (plist-get state :last-error)))
-     (concat (propertize (format "Account error: %s" error) 'face 'error) "\n"))
-   (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))
-   "C-c C-c: send    C-c C-r: rooms    C-c C-v: devices    C-c C-u: review uncertain send\n"))
+     (concat (propertize (format "Account: %s" error) 'face 'error) "\n"))
+   (when (plist-get model :operation) "Waiting for account operation…\n")
+   (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))))
+
+(defun matrix-room--row-context (previous item)
+  "Group adjacent messages by stable sender and a five-minute interval."
+  (list
+   :self (eq (plist-get item :own) t)
+   :compact
+   (and (equal (plist-get previous :kind) "message")
+        (equal (plist-get item :kind) "message")
+        (equal (plist-get previous :sender) (plist-get item :sender))
+        (numberp (plist-get previous :timestamp))
+        (numberp (plist-get item :timestamp))
+        (<= 0 (- (plist-get item :timestamp) (plist-get previous :timestamp)) 300000))))
+
+(defun matrix-room--time-label (item)
+  "Present SDK ITEM's delivery state and local time without implying delivery."
+  (string-join
+   (delq nil
+         (list (when-let* ((state (plist-get item :send_state)))
+                 (format "[%s]" state))
+               (when-let* ((timestamp (plist-get item :timestamp))
+                           ((numberp timestamp)))
+                 (format-time-string "%H:%M" (seconds-to-time (/ timestamp 1000.0))))))
+   " "))
 
 (defun matrix-room--print-row (row)
-  "Insert plain-text ROW, with honest encryption and SDK delivery status."
+  "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
   (let* ((item (appkit-chat-timeline-row-payload row))
          (kind (plist-get item :kind))
-         (send-state (plist-get item :send_state))
+         (context (appkit-chat-timeline-row-context row))
          (timestamp (plist-get item :timestamp))
          (start (point)))
     (pcase kind
-      ((or "day" "read_marker" "state")
-       (insert (propertize
-                (if (and (equal kind "day") (numberp timestamp))
-                    (format-time-string "%Y-%m-%d" (seconds-to-time (/ timestamp 1000.0)))
-                  (or (plist-get item :body) ""))
-                'face 'shadow)
-               "\n"))
+      ((or "day" "read_marker")
+       (appkit-chat-ins-insert-divider-row
+        (if (and (equal kind "day") (numberp timestamp))
+            (format-time-string "%Y-%m-%d" (seconds-to-time (/ timestamp 1000.0)))
+          (matrix--one-line (or (plist-get item :body) "Read up to here")))
+        'shadow matrix-room--width))
       (_
-       (insert (propertize (matrix--one-line (or (plist-get item :sender) "Unknown sender"))
-                           'face 'font-lock-keyword-face))
-       (when (numberp timestamp)
-         (insert (propertize
-                  (concat "  " (format-time-string "%H:%M" (seconds-to-time (/ timestamp 1000.0))))
-                  'face 'shadow)))
-       (when send-state
-         (insert (propertize (format "  [%s]" send-state)
-                             'face (if (equal send-state "failed") 'error 'shadow))))
-       (insert "\n")
-       (if (equal kind "encrypted")
-           (insert (propertize "[Unable to decrypt encrypted event]" 'face 'warning))
-         ;; Never interpret Matrix formatted_body as HTML or executable markup.
-         (insert (substring-no-properties (or (plist-get item :body) ""))))
-       (insert "\n")
-       (when-let* ((error (plist-get item :error)))
-         (insert (propertize (format "  Error: %s\n" error) 'face 'error)))))
-    (insert "\n")
+       (let* ((sender (or (plist-get item :sender) "Unknown sender"))
+              (name (matrix--one-line (or (plist-get item :sender_name) sender)))
+              (face (delq nil (list (and (plist-get context :self) 'bold)
+                                    (appkit-name-color-face sender))))
+              (prefixes (appkit-chat-avatar-prefixes nil (propertize "@" 'face face)))
+              (compact (plist-get context :compact)))
+         (unless compact
+           (let ((heading (point)))
+             (insert (propertize name 'face face 'help-echo sender))
+             (appkit-chat-ins-insert-right-aligned-text
+              (matrix-room--time-label item) matrix-room--width
+              :face (if (equal (plist-get item :send_state) "failed") 'error 'shadow)
+              :left-prefix-width (string-width (plist-get prefixes :header)))
+             (insert "\n")
+             (appkit-ui-apply-line-prefix heading (point) (plist-get prefixes :header))))
+         (let ((body-start (point)))
+           ;; Never interpret formatted_body as HTML or executable markup.
+           (insert (if (equal kind "encrypted")
+                       (propertize "[Unable to decrypt encrypted event]" 'face 'warning)
+                     (substring-no-properties (or (plist-get item :body) ""))))
+           (when compact
+             (appkit-chat-ins-insert-right-aligned-text
+              (matrix-room--time-label item) matrix-room--width
+              :face (if (equal (plist-get item :send_state) "failed") 'error 'shadow)
+              :left-prefix-width (string-width (plist-get prefixes :rest-body))))
+           (insert "\n")
+           (when-let* ((error (plist-get item :error)))
+             (insert (propertize (format "Error: %s\n" error) 'face 'error)))
+           (appkit-ui-apply-line-prefix
+            body-start (point)
+            (appkit-ui-make-prefix-state
+             (plist-get prefixes :first-body) (plist-get prefixes :rest-body)))))))
     (add-text-properties start (point)
                          (list matrix-room-message-key-property
                                (appkit-chat-timeline-row-key row)
@@ -112,26 +182,167 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
 (defun matrix-room--bind-composer ()
   "Bind a new composer once, using AppKit's canonical draft."
   (appkit-chatbuf-bind-input-region
-   :visible-p t :prompt "Message: " :input-text (appkit-chatbuf-input-state)))
+   :visible-p t :prompt ">>> " :input-text (appkit-chatbuf-input-state)))
 
-(defun matrix-room--render (_surface state model)
-  "Render pass-scoped account STATE and room presentation MODEL."
+(defun matrix-room--render (surface state model request)
+  "Project a pass-scoped SDK snapshot without changing the canonical draft."
   (let* ((room-id (cadr (plist-get model :identity)))
-         (timelines (plist-get state :timelines))
-         (timeline (and (hash-table-p timelines) (gethash room-id timelines)))
-         (header (matrix-room--header state room-id))
-         (footer (matrix-room--footer state timeline model)))
-    (appkit-chat-timeline-ensure
-     :printer #'matrix-room--print-row
-     :anchor-property matrix-room-message-key-property
-     :header header :footer footer
-     :after-mutation-function #'appkit-chatbuf-update-context-mode)
-    (appkit-chat-timeline-sync
-     (appkit-chat-timeline-project
-      (plist-get timeline :items) (lambda (item) (plist-get item :id))))
-    (appkit-chat-timeline-set-frame
-     header footer :bind-input-function #'matrix-room--bind-composer
-     :composer-visible-p t)))
+         (room (matrix-room--metadata state room-id))
+         (timeline (matrix-room--timeline state room-id))
+         (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
+    (setq matrix-room--width (matrix--width surface))
+    (matrix--frame state (or (plist-get room :name) room-id)
+                   (if (eq (plist-get room :encrypted) t)
+                       "encrypted"
+                     "NOT KNOWN TO BE ENCRYPTED"))
+    (let ((footer (matrix-room--footer state timeline model)))
+      (appkit-chat-timeline-ensure
+       :printer #'matrix-room--print-row
+       :anchor-property matrix-room-message-key-property
+       :header header :footer footer
+       :after-mutation-function #'appkit-chatbuf-update-context-mode)
+      (appkit-chat-timeline-sync
+       (appkit-chat-timeline-project
+        ;; Bounds refer to raw SDK rows, including protocol-only entries.
+        (seq-remove
+         (lambda (item) (equal (plist-get item :kind) "state"))
+         (plist-get (appkit-chat-history-window-slice
+                     (plist-get timeline :items) (lambda (item) (plist-get item :id)))
+                    :entries))
+        (lambda (item) (plist-get item :id))
+        :context-function #'matrix-room--row-context)
+       :force-keys (when (appkit-projection-change-geometry-p request)
+                     (appkit-chat-timeline-keys)))
+      (appkit-chat-timeline-set-frame
+       header footer :bind-input-function #'matrix-room--bind-composer
+       :composer-visible-p t))))
+
+(defun matrix-room--defer-observation (_context surface _observe resolve reject)
+  "Check committed geometry at idle, with cancellation owned by the Surface."
+  (let ((timer
+         (run-with-idle-timer
+          0 nil
+          (lambda ()
+            (condition-case nil
+                (progn
+                  (when (appkit-surface-live-p surface)
+                    (with-current-buffer (appkit-surface-buffer surface)
+                      (when-let* ((observer (appkit-chat-timeline-scroll-observer)))
+                        (appkit-scroll-observer-check observer))))
+                  (funcall resolve nil))
+              (error (funcall reject nil)))))))
+    (appkit-cancellation-create :kind 'transport
+                                :cancel (lambda () (cancel-timer timer)))))
+
+(defun matrix-room--observe-command ()
+  "Return a bounded post-commit recheck; never start requests inside a renderer."
+  (appkit-command-start-effect
+   (appkit-effect-create
+    :key 'matrix-history-observation :input (appkit-current-surface)
+    :start #'matrix-room--defer-observation
+    :success (lambda (_input _value) '(matrix-history-observed))
+    :failure (lambda (_input _error) '(matrix-history-observed)))))
+
+(defun matrix-room--visible-start (_window position boundary)
+  "Page when the actual visible edge approaches BOUNDARY, not on point motion."
+  (let* ((surface (matrix--current-surface 'room))
+         (model (appkit-surface-model surface))
+         (state (matrix-runtime-state (appkit-surface-app surface)))
+         (timeline (matrix-room--timeline state (cadr (plist-get model :identity)))))
+    (when (and (plist-get state :backend-active)
+               (not (plist-get timeline :loading))
+               (not (plist-get timeline :error))
+               (not (plist-get model :history-error))
+               (appkit-chat-history-autoload-older-p position boundary 200))
+      (matrix-room-load-older))))
+
+(defun matrix-room-load-older ()
+  "Load an older SDK page without blocking sends or moving the reading anchor."
+  (interactive)
+  (let* ((surface (matrix--current-surface 'room))
+         (model (appkit-surface-model surface))
+         (app (appkit-surface-app surface))
+         (room-id (cadr (plist-get model :identity)))
+         (timeline (matrix-room--timeline (matrix-runtime-state app) room-id)))
+    (when (or (plist-get timeline :loading)
+              (not (appkit-chat-history-window-known-p)))
+      (user-error "Wait for the timeline snapshot"))
+    (when (appkit-chat-history-older-loaded-p) (user-error "Already at the beginning"))
+    (unless (appkit-chat-history-loading-p)
+      (let* ((owner (appkit-chat-history-request-start surface 'older))
+             (owned (list :target (plist-get model :address) :history-owner owner
+                          :subscription (plist-get timeline :subscription_id))))
+        (appkit-surface-send surface '(matrix-history-started))
+        (condition-case nil
+            (matrix-runtime-request
+             app "timeline.paginate"
+             (list :room_id room-id :subscription_id (plist-get owned :subscription) :limit 50)
+             owned)
+          (error
+           (appkit-surface-send
+            surface
+            (list 'matrix-result nil "timeline.paginate" nil
+                  '(:message "History request failed; use Load older to retry.") owned))))))))
+
+(defun matrix-room--history-complete (model state result error context)
+  "Settle only CONTEXT's exact owner and still-current SDK subscription."
+  (let ((subscription
+         (plist-get (matrix-room--timeline state (cadr (plist-get model :identity)))
+                    :subscription_id)))
+    (when (and (equal (plist-get model :address) (plist-get context :target))
+               (equal subscription (plist-get context :subscription))
+               (equal subscription (plist-get model :history-subscription))
+               (appkit-chat-history-request-end (plist-get context :history-owner)))
+      (unless error
+        (appkit-chat-history-older-loaded-set (eq (plist-get result :hit_start) t)))
+      (plist-put (copy-sequence model) :history-error
+                 (when error (matrix--error-text error))))))
+
+(defun matrix-room-return ()
+  "Insert a newline in input; activate only an exact timeline action otherwise."
+  (interactive)
+  (cond
+   ((appkit-chatbuf-point-in-input-p) (newline))
+   ((get-text-property (point) appkit-ui-action-property)
+    (appkit-ui-activate-at (point)))
+   ((button-at (point)) (push-button (point)))
+   (t (appkit-chatbuf-focus-input))))
+
+(defun matrix-room--move-message (backward)
+  "Move to the next semantic message, or previous when BACKWARD."
+  (matrix--current-surface 'room)
+  (let* ((key (get-text-property (point) matrix-room-message-key-property))
+         (position (or (and key (appkit-chat-timeline-key-position key)) (point)))
+         (keys (appkit-chat-timeline-keys))
+         (target
+          (seq-find
+           (lambda (candidate)
+             (and (not (member (plist-get (appkit-chat-timeline-row-payload
+                                          (appkit-chat-timeline-row candidate)) :kind)
+                               '("day" "read_marker")))
+                  (funcall (if backward #'< #'>)
+                           (appkit-chat-timeline-key-position candidate) position)))
+           (if backward (reverse keys) keys))))
+    (unless target (user-error "No %s message" (if backward "previous" "next")))
+    (goto-char (appkit-chat-timeline-key-position target))
+    (appkit-chatbuf-update-context-mode)))
+
+(defun matrix-room-next-message ()
+  "Move to the next rendered message."
+  (interactive)
+  (matrix-room--move-message nil))
+
+(defun matrix-room-previous-message ()
+  "Move to the previous rendered message, skipping date/read separators."
+  (interactive)
+  (matrix-room--move-message t))
+
+(defun matrix-room-latest ()
+  "Return to the live tail and composer without changing its draft."
+  (interactive)
+  (matrix--current-surface 'room)
+  (appkit-chatbuf-focus-input)
+  (when (eq (window-buffer) (current-buffer)) (recenter -1)))
 
 (defun matrix-room--result (model method _result error context)
   "Settle METHOD without clearing a draft newer than captured CONTEXT."
@@ -164,20 +375,20 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
   "Generated Matrix room Surface type.")
 
 (defun matrix-room-open (app room-id &optional select)
-  "Open APP's ROOM-ID, optionally SELECT it, without replacing a live draft."
+  "Open APP's ROOM-ID, retaining existing reading position and live draft."
   (let* ((identity (list 'room room-id))
+         (existing (appkit-app-surface app identity))
          (surface
-          (or (appkit-app-surface app identity)
-              (matrix--register
-               app (appkit-open-generated-surface
-                    matrix-room--type :app app :identity identity :input identity
-                    :buffer-name (format "*Matrix:%s:%s*"
-                                         (plist-get (matrix-runtime-state app) :account)
-                                         room-id))
-               room-id))))
-    (when select
-      (pop-to-buffer (appkit-surface-buffer surface))
-      (goto-char (point-max)))
+          (matrix--open
+           app matrix-room--type identity
+           (format "*Matrix:%s:%s*" (plist-get (matrix-runtime-state app) :account) room-id)
+           select room-id)))
+    (unless existing
+      (appkit-chat-timeline-install-history-observer
+       surface :start-function #'matrix-room--visible-start)
+      (when select
+        (with-current-buffer (appkit-surface-buffer surface)
+          (appkit-chatbuf-focus-input))))
     surface))
 
 (defun matrix-room-send ()

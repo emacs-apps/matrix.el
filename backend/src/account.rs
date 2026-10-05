@@ -11,13 +11,18 @@ use matrix_sdk::{
     Client, RoomState,
     config::{RequestConfig, SyncSettings},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
+    latest_events::LatestEventValue,
     ruma::{
         OwnedDeviceId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
         api::{
             client::{room::create_room, session::get_login_types::v3::LoginType},
             error::ErrorKind,
         },
-        events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent},
+        events::{
+            AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
+            InitialStateEvent, SyncMessageLikeEvent,
+            room::{encryption::RoomEncryptionEventContent, message::Relation},
+        },
     },
 };
 use serde::Deserialize;
@@ -46,12 +51,13 @@ const CORRUPT: RpcError = RpcError::new(
 pub struct Backend {
     store: Arc<Store>,
     output: Output,
+    timeline_cancel: CancellationToken,
     account: RwLock<Option<Account>>,
 }
 
 struct Account {
     client: Client,
-    timelines: Timelines,
+    timelines: Arc<Timelines>,
     verifications: Arc<Verifications>,
     status: Arc<RwLock<&'static str>>,
     expired: Arc<AtomicBool>,
@@ -85,6 +91,13 @@ struct JoinRoomParam {
 struct SubscriptionParam {
     room_id: OwnedRoomId,
     subscription_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PaginateParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    limit: u16,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,10 +137,11 @@ struct RecoverParam {
 }
 
 impl Backend {
-    pub fn new(store: Store, output: Output) -> Arc<Self> {
+    pub fn new(store: Store, output: Output, timeline_cancel: CancellationToken) -> Arc<Self> {
         Arc::new(Self {
             store: Arc::new(store),
             output,
+            timeline_cancel,
             account: RwLock::new(None),
         })
     }
@@ -193,8 +207,8 @@ impl Backend {
                 Ok(json!({}))
             }
             _ => {
-                // Read lease lives for the whole request. Login/logout cannot swap identity
-                // underneath any in-flight send, import or verification operation.
+                // Durable sends/key operations keep an identity lease. View reads
+                // have subscription lifetimes, so logout can revoke them.
                 let slot = self.account.read().await;
                 let account = slot.as_ref().ok_or(no_session())?;
                 if method == "session.info" {
@@ -204,9 +218,40 @@ impl Backend {
                 if account.expired.load(Ordering::Acquire) {
                     return Err(EXPIRED);
                 }
-                account
-                    .dispatch(&self.store, &self.output, method, value)
-                    .await
+                if matches!(method, "timeline.subscribe" | "timeline.unsubscribe") {
+                    let args: SubscriptionParam = params(value)?;
+                    if args.subscription_id.is_empty() || args.subscription_id.len() > 128 {
+                        return Err(INVALID);
+                    }
+                    let client = (method == "timeline.subscribe").then(|| account.client.clone());
+                    let timelines = account.timelines.clone();
+                    drop(slot);
+                    if let Some(client) = client {
+                        timelines
+                            .subscribe(
+                                &client,
+                                self.output.clone(),
+                                args.room_id,
+                                args.subscription_id,
+                            )
+                            .await?;
+                    } else {
+                        timelines
+                            .unsubscribe(&args.room_id, &args.subscription_id)
+                            .await;
+                    }
+                    return Ok(json!({}));
+                }
+                if method == "timeline.paginate" {
+                    let args: PaginateParam = params(value)?;
+                    let timelines = account.timelines.clone();
+                    drop(slot);
+                    let hit_start = timelines
+                        .paginate(&args.room_id, &args.subscription_id, args.limit)
+                        .await?;
+                    return Ok(json!({"hit_start":hit_start}));
+                }
+                account.dispatch(&self.store, method, value).await
             }
         }
     }
@@ -301,7 +346,12 @@ impl Backend {
             fingerprint,
             session,
         })?;
-        Account::start(client, self.output.clone()).await
+        Account::start(
+            client,
+            self.output.clone(),
+            self.timeline_cancel.child_token(),
+        )
+        .await
     }
 
     async fn restore(&self) -> Result<Account> {
@@ -349,7 +399,12 @@ impl Backend {
             fingerprint: saved.fingerprint,
             session: client.matrix_auth().session().ok_or(CORRUPT)?,
         })?;
-        Account::start(client, self.output.clone()).await
+        Account::start(
+            client,
+            self.output.clone(),
+            self.timeline_cancel.child_token(),
+        )
+        .await
     }
 
     pub async fn shutdown(&self) {
@@ -361,7 +416,11 @@ impl Backend {
 }
 
 impl Account {
-    async fn start(client: Client, output: Output) -> Result<Self> {
+    async fn start(
+        client: Client,
+        output: Output,
+        timeline_cancel: CancellationToken,
+    ) -> Result<Self> {
         client.event_cache().subscribe().map_err(|_| CORRUPT)?;
         client
             .send_queue()
@@ -395,7 +454,7 @@ impl Account {
                             output.event(json!({"type":"status", "state":"online"})).await;
                         }
                         drop(state);
-                        let rooms = room_summaries(&sync_client);
+                        let rooms = room_summaries(&sync_client).await;
                         if rooms != previous_rooms {
                             output.event(json!({"type":"rooms", "rooms":rooms})).await;
                             previous_rooms = rooms;
@@ -418,7 +477,7 @@ impl Account {
         });
         Ok(Self {
             client,
-            timelines: Timelines::default(),
+            timelines: Arc::new(Timelines::new(timeline_cancel)),
             verifications,
             status,
             expired,
@@ -433,17 +492,11 @@ impl Account {
             "homeserver":self.client.homeserver().as_str(), "connected":*self.status.read().await})
     }
 
-    async fn dispatch(
-        &self,
-        store: &Store,
-        output: &Output,
-        method: &str,
-        value: Value,
-    ) -> Result<Value> {
+    async fn dispatch(&self, store: &Store, method: &str, value: Value) -> Result<Value> {
         match method {
             "rooms.list" => {
                 empty(value)?;
-                Ok(json!({"rooms":room_summaries(&self.client)}))
+                Ok(json!({"rooms":room_summaries(&self.client).await}))
             }
             "room.create" => {
                 let args: CreateParam = params(value)?;
@@ -483,27 +536,6 @@ impl Account {
                     .get_room(&args.room_id)
                     .ok_or(RpcError::new("room_missing", "Room is not known"))?;
                 room.leave().await.map_err(|_| NETWORK)?;
-                Ok(json!({}))
-            }
-            "timeline.subscribe" | "timeline.unsubscribe" => {
-                let args: SubscriptionParam = params(value)?;
-                if args.subscription_id.is_empty() || args.subscription_id.len() > 128 {
-                    return Err(INVALID);
-                }
-                if method == "timeline.subscribe" {
-                    self.timelines
-                        .subscribe(
-                            &self.client,
-                            output.clone(),
-                            args.room_id,
-                            args.subscription_id,
-                        )
-                        .await?;
-                } else {
-                    self.timelines
-                        .unsubscribe(&args.room_id, &args.subscription_id)
-                        .await;
-                }
                 Ok(json!({}))
             }
             "message.send" => {
@@ -698,17 +730,82 @@ async fn snapshot_key_import(root: PathBuf, source: PathBuf) -> Result<tempfile:
     .map_err(|_| error)?
 }
 
-fn room_summaries(client: &Client) -> Value {
-    let mut rooms: Vec<_> = client.rooms().into_iter().filter_map(|room| {
+fn summary_text(text: &str) -> &str {
+    &text[..text
+        .char_indices()
+        .nth(512)
+        .map_or(text.len(), |(index, _)| index)]
+}
+
+async fn room_summaries(client: &Client) -> Value {
+    let latest_events = client.latest_events().await;
+    let known_rooms = client.rooms();
+    let mut rooms = Vec::with_capacity(known_rooms.len());
+    for room in known_rooms {
         let membership = match room.state() {
-            RoomState::Joined => "join", RoomState::Invited => "invite", RoomState::Left => "leave", _ => return None,
+            RoomState::Joined => "join",
+            RoomState::Invited => "invite",
+            RoomState::Left => "leave",
+            _ => continue,
         };
-        let name = room.name().or_else(|| room.cached_display_name().map(|n| n.to_string())).unwrap_or_else(|| room.room_id().to_string());
-        Some(json!({"room_id":room.room_id(), "name":name.chars().take(512).collect::<String>(), "membership":membership,
-            "encrypted":room.encryption_state().is_encrypted(), "unread":room.num_unread_notifications()}))
-    }).collect();
+        let name = room
+            .name()
+            .or_else(|| room.cached_display_name().map(|n| n.to_string()))
+            .unwrap_or_else(|| room.room_id().to_string());
+        let mut summary = json!({
+            "room_id":room.room_id(), "name":summary_text(&name),
+            "membership":membership, "encrypted":room.encryption_state().is_encrypted(),
+            "unread":room.num_unread_notifications()
+        });
+        // The SDK computes these lazily from its event cache/send queue. Automatic
+        // backfill stays disabled: an absent/unavailable preview is simply omitted.
+        // Initial computation can complete after this snapshot; normal room-summary
+        // updates will pick it up, without maintaining another history cache.
+        if latest_events.listen_to_room(room.room_id()).await.is_ok() {
+            let latest = room.latest_event();
+            if let Some(timestamp) = latest.timestamp() {
+                summary["timestamp"] = json!(timestamp);
+            }
+            let message = match latest {
+                LatestEventValue::Remote(event) => {
+                    if let Ok(AnySyncTimelineEvent::MessageLike(
+                        AnySyncMessageLikeEvent::RoomMessage(SyncMessageLikeEvent::Original(event)),
+                    )) = event.raw().deserialize()
+                    {
+                        summary["preview_sender"] = json!(event.sender);
+                        Some(event.content)
+                    } else {
+                        None
+                    }
+                }
+                LatestEventValue::LocalIsSending(value)
+                | LatestEventValue::LocalCannotBeSent(value)
+                | LatestEventValue::LocalHasBeenSent { value, .. } => {
+                    if let Ok(AnyMessageLikeEventContent::RoomMessage(content)) =
+                        value.content.deserialize()
+                    {
+                        summary["preview_sender"] = json!(room.own_user_id());
+                        Some(content)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(content) = message {
+                let body = match &content.relates_to {
+                    Some(Relation::Replacement(replacement)) => {
+                        replacement.new_content.msgtype.body()
+                    }
+                    _ => content.msgtype.body(),
+                };
+                summary["preview"] = json!(summary_text(body));
+            }
+        }
+        rooms.push(summary);
+    }
     rooms.sort_by(|a, b| a["room_id"].as_str().cmp(&b["room_id"].as_str()));
-    json!(rooms)
+    Value::Array(rooms)
 }
 
 fn client_builder() -> Result<matrix_sdk::ClientBuilder> {
@@ -723,6 +820,7 @@ fn client_builder() -> Result<matrix_sdk::ClientBuilder> {
     Ok(Client::builder()
         .http_client(http)
         .respect_login_well_known(false)
+        .with_enable_automatic_back_pagination(false)
         .request_config(
             RequestConfig::default()
                 .retry_limit(2)
