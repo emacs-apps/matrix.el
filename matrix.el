@@ -1,5 +1,8 @@
 ;;; matrix.el --- Persistent Matrix accounts in AppKit -*- lexical-binding: t; -*-
 
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "32.0") (appkit "0.3.0") (transient "0.7.0"))
+
 ;;; Code:
 
 (require 'cl-lib)
