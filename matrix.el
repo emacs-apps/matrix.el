@@ -111,6 +111,11 @@
                       (equal room-id (cadr (plist-get model :identity))))
                   (appkit-projection-change-create :full-p t :frame-p t)
                 appkit-render-none)))
+    ('(matrix-send-reviewed)
+     (appkit-next
+      :model (plist-put (plist-put (copy-sequence model) :uncertain-send nil)
+                        :notice "Previous submission reviewed; no message was resent.")
+      :render (appkit-projection-change-create :frame-p t)))
     (`(matrix-operation ,operation)
      (appkit-next
       :model (plist-put (plist-put (copy-sequence model) :operation operation)

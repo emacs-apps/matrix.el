@@ -25,16 +25,18 @@
 (define-derived-mode matrix-root-mode appkit-directory-mode "Matrix"
   "Matrix room directory.  RET opens a room; j joins and c creates a room.")
 
-(defun matrix-root--note (key label &optional face)
-  "Make a stable KEY directory note with LABEL and optional FACE."
+(defun matrix-root--note (key label &optional face section)
+  "Make a stable KEY note with LABEL, FACE and owning SECTION (default account)."
   (appkit-directory-entry-create
-   :key key :role 'note :label (matrix--one-line label)
+   :key key :role 'note :section-key (or section '(account))
+   :label (matrix--one-line label)
    :face face :stamp (list label face)))
 
-(defun matrix-root--action (key label payload)
-  "Make a native action row with stable KEY, LABEL and PAYLOAD."
+(defun matrix-root--action (key label payload &optional section)
+  "Make a KEY action with LABEL, PAYLOAD and owning SECTION (default account)."
   (appkit-directory-entry-create
-   :key key :role 'item :label (matrix--one-line label)
+   :key key :role 'item :section-key (or section '(account))
+   :label (matrix--one-line label)
    :item-p t :payload payload :stamp (list label payload)
    :help-echo "RET or mouse-2 activates this action"))
 
@@ -103,7 +105,7 @@
           (let ((id (plist-get room :room_id)))
             (push
              (appkit-directory-entry-create
-              :key (list 'room id) :role 'item :section-key (car section)
+              :key (list 'room id) :role 'item :section-key (list 'section (car section))
               :label (format "%s  %s"
                              (if (eq (plist-get room :encrypted) t)
                                  "[encrypted]" "[NOT encrypted]")

@@ -31,6 +31,7 @@
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-c") #'matrix-room-send)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
+    (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
     (define-key map (kbd "C-c C-v") #'matrix-devices)
     map)
   "Keymap for `matrix-room-mode'.")
@@ -67,7 +68,7 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
    (when-let* ((error (plist-get state :last-error)))
      (concat (propertize (format "Account error: %s" error) 'face 'error) "\n"))
    (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))
-   "C-c C-c: send text    C-c C-r: rooms    C-c C-v: devices / verification\n"))
+   "C-c C-c: send    C-c C-r: rooms    C-c C-v: devices    C-c C-u: review uncertain send\n"))
 
 (defun matrix-room--print-row (row)
   "Insert plain-text ROW, with honest encryption and SDK delivery status."
@@ -135,9 +136,7 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
         (progn
           (when (equal (plist-get (plist-get error :data) :code) "transport_uncertain")
             (setq model
-                  (plist-put model :uncertain-bodies
-                             (cons (plist-get context :body)
-                                   (plist-get model :uncertain-bodies)))))
+                  (plist-put model :uncertain-send t)))
           (plist-put model :notice
                      (concat "Send not confirmed: " (matrix--error-text error)
                              " Draft retained; inspect the timeline before any further action.")))
@@ -188,13 +187,23 @@ text.  An uncertain submission is never retried with a new transaction ID."
     (let ((body (substring-no-properties (appkit-chatbuf-input-state)))
           (room (matrix-runtime-room (appkit-surface-app surface) room-id)))
       (when (string-empty-p (string-trim body)) (user-error "The draft is empty"))
-      (when (member body (plist-get model :uncertain-bodies))
-        (user-error "This draft may already be queued; do not resend it with a new transaction ID"))
+      (when (plist-get model :uncertain-send)
+        (user-error "Previous submission is uncertain; inspect the timeline, then use C-c C-u"))
       (unless (or (eq (plist-get room :encrypted) t)
                   (yes-or-no-p "Room is not known to be encrypted. Send potentially unencrypted text? "))
         (user-error "Send cancelled; draft retained"))
       (matrix--request surface "message.send" (list :room_id room-id :body body)
                        (list :revision (appkit-chatbuf-composer-revision) :body body)))))
+
+(defun matrix-room-review-send ()
+  "Acknowledge an uncertain submission without sending or changing the draft."
+  (interactive)
+  (let ((surface (matrix--current-surface 'room)))
+    (unless (plist-get (appkit-surface-model surface) :uncertain-send)
+      (user-error "There is no uncertain submission to review"))
+    (when (yes-or-no-p
+           "The previous send may have succeeded. Have you checked the timeline? ")
+      (appkit-surface-send surface '(matrix-send-reviewed)))))
 
 (defun matrix-room-refresh ()
   "Refresh account room summaries without replacing the live SDK timeline."

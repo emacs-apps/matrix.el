@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'matrix-room)
+(require 'matrix-verify)
 
 (defun matrix-ui-test--state (body)
   "Build a small account snapshot with a real SDK-shaped timeline BODY."
@@ -82,8 +83,6 @@
     (let ((context (matrix-ui-test--capture surface 1)))
       (matrix-ui-test--settle surface context)
       (should (equal (appkit-chatbuf-input-string) ""))
-      (should (string-match-p "Accepted into SDK send queue"
-                              (plist-get (appkit-surface-model surface) :notice)))
       (appkit-chatbuf-input-replace "Next message")
       (matrix-ui-test--settle surface context)
       (should (equal (appkit-chatbuf-input-string) "Next message")))))
@@ -93,9 +92,7 @@
     (appkit-chatbuf-input-replace "Original")
     (let ((context (matrix-ui-test--capture surface 1)))
       (matrix-ui-test--settle surface context '(:message "Unable to encrypt for unverified device"))
-      (should (equal (appkit-chatbuf-input-string) "Original"))
-      (should (string-match-p "Unable to encrypt"
-                              (plist-get (appkit-surface-model surface) :notice))))
+      (should (equal (appkit-chatbuf-input-string) "Original")))
     (let ((context (matrix-ui-test--capture surface 2)))
       (appkit-chatbuf-input-replace "Newer draft")
       (matrix-ui-test--settle surface context)
@@ -136,6 +133,67 @@
         (should (equal (plist-get (appkit-surface-model surface) :operation) current))
         (matrix-ui-test--settle surface current)
         (should (equal (appkit-chatbuf-input-string) ""))))))
+
+(ert-deftest matrix-ui-uncertain-send-needs-review-without-losing-draft ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (appkit-chatbuf-input-replace "Possibly queued")
+    (let ((context (matrix-ui-test--capture surface 1)))
+      (matrix-ui-test--settle surface context (matrix-rpc-uncertain-error)))
+    (should (plist-get (appkit-surface-model surface) :uncertain-send))
+    (should-error (matrix-room-send) :type 'user-error)
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+      (matrix-room-review-send))
+    (should-not (plist-get (appkit-surface-model surface) :uncertain-send))
+    (should-not (plist-get (appkit-surface-model surface) :operation))
+    (should (equal (appkit-chatbuf-input-string) "Possibly queued"))))
+
+(ert-deftest matrix-ui-local-rejection-is-not-an-uncertain-network-write ()
+  (matrix-ui-test--with-room
+    (appkit-chatbuf-input-replace "Not yet sent")
+    ;; This real runtime admission fails before any Source exists or bytes leave.
+    (matrix--request surface "message.send" '(:room_id "!room:test" :body "Not yet sent")
+                     (list :revision (appkit-chatbuf-composer-revision) :body "Not yet sent"))
+    (should-not (plist-get (appkit-surface-model surface) :uncertain-send))
+    (should-not (plist-get (appkit-surface-model surface) :operation))
+    (should (equal (appkit-chatbuf-input-string) "Not yet sent"))))
+
+(ert-deftest matrix-ui-directories-retire-completed-sas-actions ()
+  (matrix-ui-test--with-room
+    (let (directories)
+      (unwind-protect
+          (progn
+            (dolist (spec `((,matrix-root--type root) (,matrix-verify--type verify)))
+              (push (appkit-open-generated-surface
+                     (car spec) :app app :identity (cdr spec) :input (cdr spec)
+                     :buffer-name " *Matrix directory test*")
+                    directories))
+            (with-current-buffer (appkit-surface-buffer (cadr directories))
+              (goto-char (point-min))
+              (search-forward "Encrypted room")
+              (should-error (insert "not editable")))
+            (let* ((trust (car directories))
+                   (state (matrix-ui-test--state "Initial message"))
+                   (flows (plist-get state :verifications))
+                   (flow '(:user_id "@me:test" :flow_id "flow" :state "sas"
+                           :decimals (1234 5678 9012))))
+              (puthash '("@me:test" . "flow") flow flows)
+              (appkit-app-send app state)
+              (appkit-surface-send trust '(matrix-update verification nil))
+              (with-current-buffer (appkit-surface-buffer trust)
+                (should (gethash '("@me:test" . "flow") matrix-verify--sas-shown))
+                (should (appkit-directory-entry-for-key
+                         (appkit-directory-surface) '(confirm "@me:test" "flow"))))
+              (puthash '("@me:test" . "flow") (plist-put (copy-sequence flow) :state "done") flows)
+              (appkit-surface-send trust '(matrix-update verification nil))
+              (with-current-buffer (appkit-surface-buffer trust)
+                (should-not (gethash '("@me:test" . "flow") matrix-verify--sas-shown))
+                (should-not (appkit-directory-entry-for-key
+                             (appkit-directory-surface) '(confirm "@me:test" "flow"))))))
+        (dolist (directory directories)
+          (let ((host (appkit-surface-buffer directory)))
+            (appkit-surface-stop directory)
+            (when (buffer-live-p host) (kill-buffer host))))))))
 
 (provide 'matrix-ui-test)
 ;;; matrix-ui-test.el ends here

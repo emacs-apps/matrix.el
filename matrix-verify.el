@@ -57,7 +57,7 @@
          (entries
           (list
            (appkit-directory-entry-create
-            :key '(title) :role 'section :label "Device trust and key recovery" :face 'bold)
+            :key '(account) :role 'section :label "Device trust and key recovery" :face 'bold)
            (matrix-root--note '(identity)
                               (format "%s / %s — %s"
                                       (or user-id "Not authenticated")
@@ -82,7 +82,7 @@
                          :key '(devices) :role 'section :label "Your devices" :face 'bold))))
     (unless (plist-get model :devices-loaded)
       (setq entries (append entries (list (matrix-root--note '(devices-loading)
-                                                             "Devices not yet loaded; press g.")))))
+                                                             "Devices not yet loaded; press g." nil '(devices))))))
     (dolist (device (plist-get model :devices))
       (let* ((id (plist-get device :device_id))
              (self (eq (plist-get device :is_self) t))
@@ -93,9 +93,9 @@
         (setq entries
               (append entries
                       (list (if self
-                                (matrix-root--note (list 'device id) label)
+                                (matrix-root--note (list 'device id) label nil '(devices))
                               (matrix-root--action (list 'device id) label
-                                                   (list 'request user-id id))))))))
+                                                   (list 'request user-id id) '(devices))))))))
     (setq entries
           (append entries
                   (list (appkit-directory-entry-create
@@ -118,37 +118,38 @@
                           (list (matrix-root--note
                                  (list 'flow user id)
                                  (format "%s / %s   Device: %s   [%s]"
-                                         user id (or (plist-get flow :device_id) "unknown") status)))))
+                                         user id (or (plist-get flow :device_id) "unknown") status)
+                                 nil '(flows)))))
             (when-let* ((message (plist-get flow :message)))
               (setq entries (append entries
-                                    (list (matrix-root--note (list 'flow-message user id) message)))))
+                                    (list (matrix-root--note (list 'flow-message user id) message nil '(flows))))))
             (when (equal status "requested")
               (setq entries
                     (append entries
                             (list (matrix-root--action
                                    (list 'accept user id) "  Accept SAS verification request"
-                                   (list 'accept user id))))))
+                                   (list 'accept user id) '(flows))))))
             (when sas
               (puthash key sas shown)
               (setq entries
                     (append entries
                             (list
-                             (matrix-root--note (list 'sas user id) (matrix-verify--sas-text sas) 'bold)
+                             (matrix-root--note (list 'sas user id) (matrix-verify--sas-text sas) 'bold '(flows))
                              (matrix-root--action
                               (list 'confirm user id) "  Compare both devices and confirm exact match"
-                              (list 'confirm user id))))))
+                              (list 'confirm user id) '(flows))))))
             (when (and (equal status "sas") (not sas))
               (setq entries
                     (append entries
                             (list (matrix-root--note
                                    (list 'invalid-sas user id)
-                                   "No complete SAS available — confirmation is disabled." 'error)))))
+                                   "No complete SAS available — confirmation is disabled." 'error '(flows))))))
             (unless (member status '("done" "cancelled"))
               (setq entries
                     (append entries
                             (list (matrix-root--action
                                    (list 'cancel user id) "  Cancel / SAS does not match"
-                                   (list 'cancel user id))))))))))
+                                   (list 'cancel user id) '(flows))))))))))
     (cons entries shown)))
 
 (defun matrix-verify--render (_surface state model)
