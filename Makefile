@@ -19,4 +19,4 @@ check-backend:
 
 check-elisp:
 	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L . --eval '(setq load-prefer-newer t byte-compile-error-on-warn t)' -f batch-byte-compile $(ELISP)
-	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L . -L test --eval '(setq load-prefer-newer t)' -l matrix-state-test -l matrix-ui-test -f ert-run-tests-batch-and-exit
+	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L . -L test --eval '(setq load-prefer-newer t)' -l matrix-state-test -l matrix-ui-test -l matrix-directory-test -l matrix-menu-test -f ert-run-tests-batch-and-exit

@@ -61,7 +61,8 @@
 
 (define-derived-mode matrix-room-mode appkit-chatbuf-mode "Matrix-Room"
   "Matrix room with read-only timeline and editable plain-text composer.
-C-c C-c submits the current draft.  Closing this buffer does not stop sync."
+C-c ' focuses the existing draft; C-c C-c submits it.
+Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (appkit-chatbuf-use-timeline-mode #'matrix-room-timeline-mode))
 

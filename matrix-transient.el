@@ -13,20 +13,39 @@
 (require 'matrix-verify)
 
 (cl-defstruct (matrix-menu-scope (:constructor matrix-menu-scope-create))
-  surface item-key)
+  surface item-key input-p)
 
 (defconst matrix-menu--prefixes
   '(matrix-root-transient matrix-account-transient matrix-room-transient
     matrix-message-transient matrix-composer-transient matrix-verify-transient))
 
-(defun matrix-menu--capture (&optional kind message-p)
-  "Capture the exact current Surface of KIND and optionally its message key."
-  (let* ((surface (matrix--current-surface kind))
-         (key (when message-p
-                (unless (appkit-chatbuf-point-in-input-p)
-                  (get-text-property (point) matrix-room-message-key-property)))))
-    (when (and message-p (not key)) (user-error "No message at point"))
-    (matrix-menu-scope-create :surface surface :item-key key)))
+(defun matrix-menu--scope (&optional prefixes)
+  "Return the Matrix scope of an active prefix, without initializing another."
+  (when (or transient-current-prefix transient--prefix)
+    (let ((scope (transient-scope prefixes)))
+      (and (matrix-menu-scope-p scope) scope))))
+
+(defun matrix-menu--capture (&optional kind message-p inherited)
+  "Use INHERITED or the active menu target, otherwise capture this exact view."
+  (let* ((scope
+          (or inherited (matrix-menu--scope matrix-menu--prefixes)
+              (let* ((surface (matrix--current-surface kind))
+                     (identity (appkit-surface-identity surface))
+                     (key
+                      (pcase (car identity)
+                        ('root (appkit-directory-key-at-point))
+                        ('room
+                         (unless (appkit-chatbuf-point-in-input-p)
+                           (get-text-property (point) matrix-room-message-key-property))))))
+                (matrix-menu-scope-create
+                 :surface surface :item-key (copy-tree key)
+                 :input-p (and (eq (car identity) 'room)
+                               (appkit-chatbuf-point-in-input-p))))))
+         (surface (matrix-menu--surface scope)))
+    (when (and kind (not (eq kind (car (appkit-surface-identity surface)))))
+      (user-error "This menu requires a Matrix %s view" kind))
+    (when message-p (matrix-menu--message scope))
+    scope))
 
 (defun matrix-menu--surface (scope)
   "Require SCOPE's still-live exact registered Surface, never its replacement."
@@ -41,7 +60,7 @@
 
 (defun matrix-menu--command (function &rest arguments)
   "Invoke FUNCTION in the captured view, including its interactive arguments."
-  (let ((surface (matrix-menu--surface (transient-scope matrix-menu--prefixes))))
+  (let ((surface (matrix-menu--surface (matrix-menu--scope matrix-menu--prefixes))))
     (with-current-buffer (appkit-surface-buffer surface)
       (apply function arguments))))
 
@@ -61,7 +80,7 @@
   "Copy the current plaintext of the message captured by SCOPE."
   (interactive (list (transient-scope 'matrix-message-transient)))
   (let ((item (matrix-menu--message scope)))
-    (unless (equal (plist-get item :kind) "message")
+    (unless (matrix-menu--plaintext-p item)
       (user-error "This event has no available message plaintext"))
     (kill-new (substring-no-properties (plist-get item :body)))
     (message "Message text copied")))
@@ -69,8 +88,10 @@
 (defun matrix-message-copy-id (scope)
   "Copy SCOPE's actual server event ID, never a local queue identifier."
   (interactive (list (transient-scope 'matrix-message-transient)))
-  (let ((event-id (plist-get (matrix-menu--message scope) :event_id)))
-    (unless event-id (user-error "This message has no server event ID yet"))
+  (let* ((item (matrix-menu--message scope))
+         (event-id (plist-get item :event_id)))
+    (unless (matrix-menu--server-id-p item)
+      (user-error "This message has no server event ID yet"))
     (kill-new event-id)
     (message "Event ID copied")))
 
@@ -78,94 +99,278 @@
   "Copy a Matrix permalink to SCOPE's exact server event."
   (interactive (list (transient-scope 'matrix-message-transient)))
   (let* ((surface (matrix-menu--surface scope))
-         (event-id (plist-get (matrix-menu--message scope) :event_id)))
-    (unless event-id (user-error "This message has no server event ID yet"))
+         (item (matrix-menu--message scope))
+         (event-id (plist-get item :event_id)))
+    (unless (matrix-menu--server-id-p item)
+      (user-error "This message has no server event ID yet"))
     (kill-new (format "https://matrix.to/#/%s/%s"
                       (url-hexify-string (cadr (appkit-surface-identity surface)))
                       (url-hexify-string event-id)))
     (message "Message link copied")))
 
-(transient-define-prefix matrix-root-transient (scope)
+(defun matrix-menu--plaintext-p (item)
+  "Return non-nil when ITEM has decrypted message text."
+  (and (equal (plist-get item :kind) "message")
+       (stringp (plist-get item :body))))
+
+(defun matrix-menu--server-id-p (item)
+  "Return non-nil when ITEM has an actual server event ID."
+  (let ((id (plist-get item :event_id)))
+    (and (stringp id) (not (string-empty-p id)))))
+
+(defun matrix-menu--root-entry (scope)
+  "Resolve SCOPE's captured actionable directory entry by its public key."
+  (let ((surface (matrix-menu--surface scope)))
+    (unless (eq (car (appkit-surface-identity surface)) 'root)
+      (user-error "This action requires the captured room directory"))
+    (with-current-buffer (appkit-surface-buffer surface)
+      (let ((entry (appkit-directory-entry-for-key
+                    (appkit-directory-surface) (matrix-menu-scope-item-key scope))))
+        (unless (and entry
+                     (pcase (appkit-directory-entry-payload entry)
+                       (`(command ,command) (commandp command))
+                       (`(room ,id ,membership)
+                        (and (stringp id) (not (string-empty-p id))
+                             (member membership '("join" "invite"))))))
+          (user-error "The captured directory item is no longer actionable"))
+        entry))))
+
+(defun matrix-menu-root-open (scope)
+  "Open or accept the current entry for SCOPE's exact captured directory key."
+  (interactive (list (matrix-menu--scope matrix-menu--prefixes)))
+  (let ((entry (matrix-menu--root-entry scope))
+        (surface (matrix-menu--surface scope)))
+    (with-current-buffer (appkit-surface-buffer surface)
+      (matrix-root--activate (appkit-directory-surface) entry))))
+
+(defun matrix-menu--focus-command (function &rest arguments)
+  "Select the captured view before invoking a focus or latest command."
+  (let* ((surface (matrix-menu--surface (matrix-menu--scope matrix-menu--prefixes)))
+         (buffer (appkit-surface-buffer surface))
+         (window (get-buffer-window buffer t)))
+    (if (window-live-p window)
+        (select-window window)
+      (pop-to-buffer buffer))
+    (with-current-buffer buffer (apply function arguments))))
+
+(defun matrix-menu--view-inapt-p ()
+  "Return non-nil when the originating exact view is no longer live."
+  (condition-case nil
+      (progn (matrix-menu--surface (matrix-menu--scope)) nil)
+    (user-error t)))
+
+(defun matrix-menu--ready-p (surface)
+  "Return whether SURFACE's account can admit an ordinary runtime request."
+  (let* ((app (appkit-surface-app surface))
+         (state (matrix-runtime-state app)))
+    (and (appkit-app-live-p app) (plist-get state :backend-active)
+         (plist-get state :session))))
+
+(defun matrix-menu--request-inapt-p ()
+  "Return non-nil when a captured-view operation cannot be started."
+  (condition-case nil
+      (let ((surface (matrix-menu--surface (matrix-menu--scope))))
+        (or (not (matrix-menu--ready-p surface))
+            (plist-get (appkit-surface-model surface) :operation)))
+    (user-error t)))
+
+(defun matrix-menu--refresh-inapt-p ()
+  "Return non-nil when the captured account cannot refresh."
+  (condition-case nil
+      (not (matrix-menu--ready-p (matrix-menu--surface (matrix-menu--scope))))
+    (user-error t)))
+
+(defun matrix-menu--root-entry-inapt-p ()
+  "Return non-nil when the captured item cannot be opened or accepted."
+  (condition-case nil
+      (let ((entry (matrix-menu--root-entry (matrix-menu--scope))))
+        (and (equal (nth 2 (appkit-directory-entry-payload entry)) "invite")
+             (matrix-menu--request-inapt-p)))
+    (user-error t)))
+
+(defun matrix-menu--message-inapt-p ()
+  "Return non-nil when the captured SDK row is no longer a message."
+  (condition-case nil
+      (progn (matrix-menu--message (matrix-menu--scope)) nil)
+    (user-error t)))
+
+(defun matrix-menu--text-inapt-p ()
+  "Return non-nil when the captured message has no decrypted text."
+  (condition-case nil
+      (not (matrix-menu--plaintext-p (matrix-menu--message (matrix-menu--scope))))
+    (user-error t)))
+
+(defun matrix-menu--id-inapt-p ()
+  "Return non-nil when the captured message has no server ID or permalink."
+  (condition-case nil
+      (not (matrix-menu--server-id-p (matrix-menu--message (matrix-menu--scope))))
+    (user-error t)))
+
+(defun matrix-menu--history-inapt-p ()
+  "Return non-nil when older history is loading, exhausted or not ready."
+  (condition-case nil
+      (let* ((surface (matrix-menu--surface (matrix-menu--scope)))
+             (identity (appkit-surface-identity surface))
+             (timeline (matrix-room--timeline
+                        (matrix-runtime-state (appkit-surface-app surface))
+                        (cadr identity))))
+        (or (not (eq (car identity) 'room))
+            (not (matrix-menu--ready-p surface))
+            (plist-get timeline :loading)
+            (with-current-buffer (appkit-surface-buffer surface)
+              (or (not (appkit-chat-history-window-known-p))
+                  (appkit-chat-history-loading-p)
+                  (appkit-chat-history-older-loaded-p)))))
+    (user-error t)))
+
+(defun matrix-menu--send-inapt-p ()
+  "Return non-nil when the captured room's current draft cannot be sent."
+  (condition-case nil
+      (let* ((surface (matrix-menu--surface (matrix-menu--scope)))
+             (model (appkit-surface-model surface)))
+        (or (not (eq (car (appkit-surface-identity surface)) 'room))
+            (matrix-menu--request-inapt-p)
+            (plist-get model :uncertain-send)
+            (with-current-buffer (appkit-surface-buffer surface)
+              (string-empty-p (string-trim (appkit-chatbuf-input-string))))))
+    (user-error t)))
+
+(defun matrix-menu--review-inapt-p ()
+  "Return non-nil unless the captured room has an uncertain submission."
+  (condition-case nil
+      (let ((surface (matrix-menu--surface (matrix-menu--scope))))
+        (or (not (eq (car (appkit-surface-identity surface)) 'room))
+            (not (plist-get (appkit-surface-model surface) :uncertain-send))))
+    (user-error t)))
+
+(defun matrix-menu--label (text)
+  "Return bounded, plain, single-line contextual TEXT."
+  (truncate-string-to-width
+   (replace-regexp-in-string "[[:cntrl:]]" " " (matrix--one-line text))
+   72 nil nil t))
+
+(defun matrix-menu--description ()
+  "Describe the current canonical account and room."
+  (condition-case nil
+      (let* ((scope (matrix-menu--scope))
+             (surface (matrix-menu--surface scope))
+             (app (appkit-surface-app surface))
+             (state (matrix-runtime-state app))
+             (identity (appkit-surface-identity surface))
+             (account (matrix-menu--label (plist-get state :account)))
+             (room (and (eq (car identity) 'room)
+                        (matrix-runtime-room app (cadr identity)))))
+        (format "Matrix %s%s" account
+                (if (eq (car identity) 'room)
+                    (format " / %s" (matrix-menu--label
+                                    (or (plist-get room :name) (cadr identity))))
+                  "")))
+    (user-error "Matrix / unavailable view")))
+
+(defun matrix-menu--message-description ()
+  "Describe the captured message without exposing any composer draft."
+  (condition-case nil
+      (let* ((item (matrix-menu--message (matrix-menu--scope)))
+             (sender (matrix-menu--label (plist-get item :sender))))
+        (format "%s / %s (%s)" (matrix-menu--description) sender
+                (if (matrix-menu--server-id-p item) "server event" "not server accepted")))
+    (user-error "Matrix / unavailable message")))
+
+(transient-define-prefix matrix-root-transient (&optional scope)
   "Room directory commands for the captured account."
-  [["Rooms" :advice* matrix-menu--command
+  [:description matrix-menu--description
+   ["Captured item"
+    ("RET" "Open / accept item" matrix-menu-root-open
+     :inapt-if matrix-menu--root-entry-inapt-p)]
+   ["Rooms" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("s" "Switch room" matrix-switch-room)
     ("/" "Filter directory" matrix-root-filter)
-    ("g" "Refresh summaries" matrix-root-refresh)
-    ("j" "Join room / alias" matrix-join-room)
-    ("c" "Create encrypted room" matrix-create-room)]
-   ["Account" :advice* matrix-menu--command
+    ("g" "Refresh summaries" matrix-root-refresh :inapt-if matrix-menu--refresh-inapt-p)
+    ("j" "Join room / alias" matrix-join-room :inapt-if matrix-menu--request-inapt-p)
+    ("c" "Create encrypted room" matrix-create-room :inapt-if matrix-menu--request-inapt-p)]
+   ["Account" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("v" "Devices and trust" matrix-devices)
     ("a" "Account / keys" matrix-account-transient)]]
-  (interactive (list (matrix-menu--capture 'root)))
-  (matrix-menu--surface scope)
+  (interactive)
+  (setq scope (matrix-menu--capture 'root nil scope))
   (transient-setup 'matrix-root-transient nil nil :scope scope))
 
-(transient-define-prefix matrix-account-transient (scope)
+(transient-define-prefix matrix-account-transient (&optional scope)
   "Device, key and connection operations for one exact account view."
-  [["Trust" :advice* matrix-menu--command
+  [:description matrix-menu--description
+   ["Trust" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("v" "Devices and SAS" matrix-devices)
-    ("r" "Request device verification" matrix-verification-request)]
-   ["Room keys" :advice* matrix-menu--command
+    ("r" "Request device verification" matrix-verification-request
+     :inapt-if matrix-menu--request-inapt-p)]
+   ["Room keys" :advice* matrix-menu--command :inapt-if matrix-menu--request-inapt-p
     ("e" "Export encrypted keys" matrix-keys-export)
     ("i" "Import encrypted keys" matrix-keys-import)
     ("k" "Recover with recovery key" matrix-keys-recover)]
-   ["Account" :advice* matrix-menu--command
+   ["Account" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("h" "Room directory" matrix-accounts)
     ("D" "Disconnect locally; retain device" matrix-disconnect)]]
-  (interactive (list (matrix-menu--capture)))
-  (matrix-menu--surface scope)
+  (interactive)
+  (setq scope (matrix-menu--capture nil nil scope))
   (transient-setup 'matrix-account-transient nil nil :scope scope))
 
-(transient-define-prefix matrix-room-transient (scope)
+(transient-define-prefix matrix-room-transient (&optional scope)
   "Room navigation, or the composer menu when invoked from editable input."
-  [["History" :advice* matrix-menu--command
-    ("<" "Load older" matrix-room-load-older)
-    (">" "Latest / input" matrix-room-latest)
-    ("g" "Refresh room summary" matrix-room-refresh)]
-   ["Navigate" :advice* matrix-menu--command
+  [:description matrix-menu--description
+   ["Message"
+    ("m" "Captured message" matrix-message-transient :inapt-if matrix-menu--message-inapt-p)]
+   ["History" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
+    ("<" "Load older" matrix-room-load-older :inapt-if matrix-menu--history-inapt-p)
+    (">" "Latest / input" matrix-room-latest :advice* matrix-menu--focus-command)
+    ("g" "Refresh room summary" matrix-room-refresh :inapt-if matrix-menu--refresh-inapt-p)]
+   ["Navigate" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("r" "Room directory" matrix-accounts)
     ("s" "Switch room" matrix-switch-room)
     ("c" "Composer" matrix-composer-transient)
     ("a" "Account / keys" matrix-account-transient)]]
-  (interactive (list (matrix-menu--capture 'room)))
-  (let ((surface (matrix-menu--surface scope)))
-    (if (with-current-buffer (appkit-surface-buffer surface) (appkit-chatbuf-point-in-input-p))
-        (matrix-composer-transient scope)
-      (transient-setup 'matrix-room-transient nil nil :scope scope))))
+  (interactive)
+  (setq scope (matrix-menu--capture 'room nil scope))
+  (if (matrix-menu-scope-input-p scope)
+      (matrix-composer-transient scope)
+    (transient-setup 'matrix-room-transient nil nil :scope scope)))
 
-(transient-define-prefix matrix-message-transient (scope)
+(transient-define-prefix matrix-message-transient (&optional scope)
   "Actions on the captured SDK message, independent of subsequent point motion."
-  [["Message"
-    ("w" "Copy text" matrix-message-copy-text)
-    ("i" "Copy event ID" matrix-message-copy-id)
-    ("l" "Copy link" matrix-message-copy-link)]]
-  (interactive (list (matrix-menu--capture 'room t)))
-  (matrix-menu--message scope)
+  [:description matrix-menu--message-description
+   ["Message"
+    ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
+    ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
+    ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]
+  (interactive)
+  (setq scope (matrix-menu--capture 'room t scope))
   (transient-setup 'matrix-message-transient nil nil :scope scope))
 
-(transient-define-prefix matrix-composer-transient (scope)
+(transient-define-prefix matrix-composer-transient (&optional scope)
   "Commands for the canonical composer of one exact room Surface."
-  [["Composer" :advice* matrix-menu--command
-    ("c" "Send captured draft" matrix-room-send)
-    ("i" "Focus input" matrix-room-latest)
-    ("u" "Review uncertain submission" matrix-room-review-send)]
-   ["Navigate" :advice* matrix-menu--command
+  [:description matrix-menu--description
+   ["Composer" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
+    ("c" "Send current draft" matrix-room-send :inapt-if matrix-menu--send-inapt-p)
+    ("i" "Focus input" matrix-room-edit-draft :advice* matrix-menu--focus-command)
+    ("u" "Review uncertain submission" matrix-room-review-send
+     :inapt-if matrix-menu--review-inapt-p)]
+   ["Navigate" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("r" "Room directory" matrix-accounts)
     ("s" "Switch room" matrix-switch-room)
     ("a" "Account / keys" matrix-account-transient)]]
-  (interactive (list (matrix-menu--capture 'room)))
-  (matrix-menu--surface scope)
+  (interactive)
+  (setq scope (matrix-menu--capture 'room nil scope))
   (transient-setup 'matrix-composer-transient nil nil :scope scope))
 
-(transient-define-prefix matrix-verify-transient (scope)
+(transient-define-prefix matrix-verify-transient (&optional scope)
   "Trust-directory commands; SAS confirmation remains an explicit per-flow action."
-  [["Devices" :advice* matrix-menu--command
-    ("g" "Refresh devices" matrix-verify-refresh)
-    ("v" "Request verification" matrix-verification-request)
+  [:description matrix-menu--description
+   ["Devices" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
+    ("g" "Refresh devices" matrix-verify-refresh :inapt-if matrix-menu--request-inapt-p)
+    ("v" "Request verification" matrix-verification-request
+     :inapt-if matrix-menu--request-inapt-p)
     ("a" "Account / keys" matrix-account-transient)
     ("r" "Room directory" matrix-accounts)]]
-  (interactive (list (matrix-menu--capture 'verify)))
-  (matrix-menu--surface scope)
+  (interactive)
+  (setq scope (matrix-menu--capture 'verify nil scope))
   (transient-setup 'matrix-verify-transient nil nil :scope scope))
 
 (provide 'matrix-transient)
