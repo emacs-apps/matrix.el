@@ -188,7 +188,10 @@ impl Store {
         private_cache_directory(&avatars)?;
         let directory = avatars.join(generation);
         private_cache_directory(&directory)?;
-        Ok(directory.join(format!("96-crop-{:x}.image", Sha256::digest(uri.as_bytes()))))
+        Ok(directory.join(format!(
+            "96-crop-{:x}.image",
+            Sha256::digest(uri.as_bytes())
+        )))
     }
 
     pub fn cached_avatar(&self, generation: &str, uri: &str) -> Result<Option<PathBuf>> {
@@ -209,7 +212,8 @@ impl Store {
         }
         let mut header = [0u8; 24];
         let length = (metadata.len() as usize).min(header.len());
-        file.read_exact(&mut header[..length]).map_err(|_| STORAGE)?;
+        file.read_exact(&mut header[..length])
+            .map_err(|_| STORAGE)?;
         Ok(valid_avatar(&header[..length]).then_some(path))
     }
 
@@ -225,7 +229,9 @@ impl Store {
         let path = self.avatar_path(generation, uri)?;
         self.atomic_write_at(
             path.parent().ok_or(STORAGE)?,
-            path.file_name().and_then(|name| name.to_str()).ok_or(STORAGE)?,
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .ok_or(STORAGE)?,
             bytes,
         )?;
         Ok(path)
@@ -289,12 +295,9 @@ pub fn valid_avatar(bytes: &[u8]) -> bool {
     }
     // The presentation layer owns decoding. Accept only conventional raster
     // signatures here, never an HTML/error body or executable SVG content.
-    (bytes.len() >= 24
-        && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        && &bytes[12..16] == b"IHDR")
+    (bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR")
         || (bytes.len() >= 4 && bytes.starts_with(b"\xff\xd8\xff"))
-        || (bytes.len() >= 13
-            && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")))
+        || (bytes.len() >= 13 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")))
         || (bytes.len() >= 20
             && bytes.starts_with(b"RIFF")
             && &bytes[8..12] == b"WEBP"
@@ -356,25 +359,48 @@ mod tests {
             assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
         }
         let inode = fs::metadata(&path).unwrap().ino();
-        assert_eq!(store.cached_avatar(&generation, uri).unwrap(), Some(path.clone()));
-        assert_eq!(store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap(), path);
+        assert_eq!(
+            store.cached_avatar(&generation, uri).unwrap(),
+            Some(path.clone())
+        );
+        assert_eq!(
+            store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap(),
+            path
+        );
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
 
         let mut oversized = AVATAR_PNG.to_vec();
         oversized.resize(MAX_AVATAR_BYTES + 1, 0);
         for bytes in [b"".as_slice(), b"<html>not an image".as_slice(), &oversized] {
             assert_eq!(
-                store.cache_avatar(&generation, uri, bytes).unwrap_err().code,
+                store
+                    .cache_avatar(&generation, uri, bytes)
+                    .unwrap_err()
+                    .code,
                 "avatar_invalid"
             );
             assert_eq!(fs::read(&path).unwrap(), AVATAR_PNG);
         }
-        assert_ne!(store.avatar_path(&generation, "mxc://example.org/new").unwrap(), path);
+        assert_ne!(
+            store
+                .avatar_path(&generation, "mxc://example.org/new")
+                .unwrap(),
+            path
+        );
         let next_generation = Uuid::new_v4().to_string();
         assert_eq!(store.cached_avatar(&next_generation, uri).unwrap(), None);
-        assert_ne!(store.cache_avatar(&next_generation, uri, AVATAR_PNG).unwrap(), path);
+        assert_ne!(
+            store
+                .cache_avatar(&next_generation, uri, AVATAR_PNG)
+                .unwrap(),
+            path
+        );
         assert!(!fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
-            entry.unwrap().file_name().to_string_lossy().starts_with(".write-")
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".write-")
         }));
     }
 
@@ -387,7 +413,10 @@ mod tests {
         let outside_directory = private_dir();
         let avatars = dir.path().join("avatars");
         std::os::unix::fs::symlink(outside_directory.path(), &avatars).unwrap();
-        assert_eq!(store.cached_avatar(&generation, uri).unwrap_err().code, "store_permissions");
+        assert_eq!(
+            store.cached_avatar(&generation, uri).unwrap_err().code,
+            "store_permissions"
+        );
         fs::remove_file(&avatars).unwrap();
 
         let path = store.avatar_path(&generation, uri).unwrap();
@@ -395,25 +424,41 @@ mod tests {
         fs::write(outside.path(), AVATAR_PNG).unwrap();
         std::os::unix::fs::symlink(outside.path(), &path).unwrap();
         assert_eq!(
-            store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap_err().code,
+            store
+                .cache_avatar(&generation, uri, AVATAR_PNG)
+                .unwrap_err()
+                .code,
             "store_permissions"
         );
         assert_eq!(fs::read(outside.path()).unwrap(), AVATAR_PNG);
         fs::remove_file(&path).unwrap();
 
         fs::hard_link(outside.path(), &path).unwrap();
-        assert_eq!(store.cached_avatar(&generation, uri).unwrap_err().code, "store_permissions");
+        assert_eq!(
+            store.cached_avatar(&generation, uri).unwrap_err().code,
+            "store_permissions"
+        );
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"<html>failed thumbnail").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(store.cached_avatar(&generation, uri).unwrap_err().code, "store_permissions");
+        assert_eq!(
+            store.cached_avatar(&generation, uri).unwrap_err().code,
+            "store_permissions"
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(store.cached_avatar(&generation, uri).unwrap(), None);
-        assert_eq!(store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap(), path);
+        assert_eq!(
+            store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap(),
+            path
+        );
         assert_eq!(fs::read(&path).unwrap(), AVATAR_PNG);
 
-        OpenOptions::new().write(true).open(&path).unwrap()
-            .set_len(MAX_AVATAR_BYTES as u64 + 1).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_AVATAR_BYTES as u64 + 1)
+            .unwrap();
         assert_eq!(store.cached_avatar(&generation, uri).unwrap(), None);
         store.cache_avatar(&generation, uri, AVATAR_PNG).unwrap();
         assert_eq!(fs::read(&path).unwrap(), AVATAR_PNG);

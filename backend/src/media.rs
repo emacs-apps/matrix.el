@@ -4,14 +4,12 @@ use matrix_sdk::{
     Client,
     media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings},
     ruma::{
-        OwnedMxcUri,
-        api::client::media::get_content_thumbnail::v3::Method,
-        events::room::MediaSource,
-        uint,
+        OwnedMxcUri, api::client::media::get_content_thumbnail::v3::Method,
+        events::room::MediaSource, uint,
     },
 };
-use tokio_util::sync::CancellationToken;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     protocol::{NETWORK, Result, RpcError},
@@ -22,7 +20,8 @@ const CANCELLED: RpcError = RpcError::new(
     "avatar_cancelled",
     "Avatar request was cancelled because its account or transport closed",
 );
-const CACHE_WORKER: RpcError = RpcError::new("store_io", "Unable to access private account storage");
+const CACHE_WORKER: RpcError =
+    RpcError::new("store_io", "Unable to access private account storage");
 const TIMEOUT: RpcError = RpcError::new("avatar_timeout", "Avatar thumbnail request timed out");
 
 fn check_live(cancel: &CancellationToken, transport: &CancellationToken) -> Result<()> {

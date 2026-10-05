@@ -157,13 +157,24 @@
              (timestamp (plist-get room :timestamp))
              (unread (or (plist-get room :unread) 0))
              (trail (when (> unread 0) (number-to-string unread)))
-             (image (when (appkit-media-inline-image-rendering-available-p)
+             (pixel-size (when (appkit-media-inline-image-rendering-available-p)
+                           (appkit-chat-avatar-line-pixel-height)))
+             (avatar-width
+              (when pixel-size
+                (ceiling (/ (float pixel-size)
+                            (appkit-chat-avatar-column-pixel-width)))))
+             (image (when pixel-size
                       (matrix-avatar-cached-image
                        (appkit-surface-app surface) (plist-get room :avatar_url)
-                       (appkit-chat-avatar-line-pixel-height))))
+                       pixel-size)))
+             (avatar (when pixel-size
+                       (appkit-chat-avatar-one-line-string image "@")))
              (icon (concat
-                    (when image
-                      (concat (appkit-chat-avatar-one-line-string image "@") " "))
+                    (when avatar
+                      (concat avatar
+                              (make-string
+                               (max 1 (- (1+ avatar-width) (string-width avatar)))
+                               ?\s)))
                     (propertize (if (eq (plist-get room :encrypted) t) "+" "?")
                                 'face 'shadow)))
              (icon-width (max 2 (1+ (string-width icon))))

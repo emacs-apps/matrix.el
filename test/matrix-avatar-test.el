@@ -71,7 +71,7 @@ The runtime bridge is the only substituted boundary; files and resources are rea
                          :cancel (lambda ()
                                    (setf (plist-get request :cancelled) t)))))))
            (cl-labels
-               ((account (name)
+               ((account (name &optional rooms)
                   (let ((store (expand-file-name name root)))
                     (make-directory store t)
                     (set-file-modes store #o700)
@@ -85,7 +85,8 @@ The runtime bridge is the only substituted boundary; files and resources are rea
                                        (appkit-next :model model :render appkit-render-none))
                              :shutdown #'matrix-avatar-clear-cache)
                             :identity (list 'matrix-account store)
-                            :input (list :transport (matrix-rpc-transport-create :store store)))))
+                            :input (list :transport (matrix-rpc-transport-create :store store)
+                                         :rooms rooms :watches (make-hash-table :test #'eq)))))
                       (push app apps)
                       app)))
                 (open-avatar (app uri)
@@ -246,6 +247,40 @@ The runtime bridge is the only substituted boundary; files and resources are rea
               (should-not (eq before-clear after-clear)))))
         (with-current-buffer (appkit-surface-buffer second)
           (should (eq image-two (matrix-avatar-cached-image two uri 24))))))))
+
+(ert-deftest matrix-avatar-real-images-do-not-shift-directory-destinations ()
+  (skip-unless (and (display-graphic-p) (image-type-available-p 'png)))
+  (require 'matrix-root)
+  (matrix-avatar-test--with-accounts
+    (dolist (width '(24 72))
+      (let* ((uri "mxc://example.test/avatar")
+             (app (account (format "directory-%s" width)
+                           (list (list :room_id "!avatar:test" :name "Avatar destination"
+                                       :membership "join" :encrypted t :avatar_url uri))))
+             (store (matrix-rpc-transport-store (plist-get (appkit-app-model app) :transport)))
+             (file (matrix-avatar-test--image-file store))
+             (surface
+              (cl-letf (((symbol-function 'matrix--width) (lambda (_surface) width)))
+                (appkit-open-generated-surface
+                 matrix-root--type :app app :identity '(root) :input '(root))))
+             (request (car requests)))
+        (push surface surfaces)
+        (with-current-buffer (appkit-surface-buffer surface)
+          (goto-char (point-min))
+          (search-forward "Avatar destination")
+          (let ((column (current-column))
+                (key (appkit-directory-key-at-point)))
+            (cl-letf (((symbol-function 'matrix--width) (lambda (_surface) width)))
+              (finish request (list :path file)))
+            (should (equal key (appkit-directory-key-at-point)))
+            (should (= column (current-column)))
+            (should
+             (cl-loop for pos from (line-beginning-position) below (line-end-position)
+                      for display = (get-text-property pos 'display)
+                      thereis (or (appkit-media-image-object-valid-p display)
+                                  (and (listp display)
+                                       (cl-some #'appkit-media-image-object-valid-p
+                                                display)))))))))))
 
 (ert-deftest matrix-avatar-retired-account-cannot-publish-into-reopened-store ()
   (matrix-avatar-test--with-accounts

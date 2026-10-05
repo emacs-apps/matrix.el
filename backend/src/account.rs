@@ -798,7 +798,9 @@ async fn room_summaries(client: &Client) -> Value {
         let mut avatar_url = room.avatar_url();
         if avatar_url.is_none() && room.is_direct().await.unwrap_or(false) {
             let heroes = room.heroes().await;
-            let mut others = heroes.iter().filter(|hero| hero.user_id != room.own_user_id());
+            let mut others = heroes
+                .iter()
+                .filter(|hero| hero.user_id != room.own_user_id());
             if let Some(hero) = others.next()
                 && others.next().is_none()
             {
