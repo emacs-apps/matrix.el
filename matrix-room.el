@@ -79,7 +79,12 @@ C-c C-c submits the current draft.  Closing this buffer does not stop sync."
          (start (point)))
     (pcase kind
       ((or "day" "read_marker" "state")
-       (insert (propertize (or (plist-get item :body) "") 'face 'shadow) "\n"))
+       (insert (propertize
+                (if (and (equal kind "day") (numberp timestamp))
+                    (format-time-string "%Y-%m-%d" (seconds-to-time (/ timestamp 1000.0)))
+                  (or (plist-get item :body) ""))
+                'face 'shadow)
+               "\n"))
       (_
        (insert (propertize (matrix--one-line (or (plist-get item :sender) "Unknown sender"))
                            'face 'font-lock-keyword-face))
