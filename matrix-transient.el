@@ -17,7 +17,8 @@
 
 (defconst matrix-menu--prefixes
   '(matrix-root-transient matrix-account-transient matrix-room-transient
-    matrix-message-transient matrix-composer-transient matrix-verify-transient))
+    matrix-message-transient matrix-composer-transient matrix-attachment-transient
+    matrix-verify-transient))
 
 (defun matrix-menu--scope (&optional prefixes)
   "Return the Matrix scope of an active prefix, without initializing another."
@@ -123,6 +124,11 @@
   (interactive (list (matrix-menu--capture 'room t)))
   (matrix-room-begin-edit (matrix-menu--surface scope) (matrix-menu--message scope)))
 
+(defun matrix-message-reply (scope)
+  "Reply to SCOPE's exact SDK message while preserving the current draft."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (matrix-room-begin-reply (matrix-menu--surface scope) (matrix-menu--message scope)))
+
 (defun matrix-message-delete (scope)
   "Confirm and redact SCOPE's exact server event through the Matrix SDK."
   (interactive (list (matrix-menu--capture 'room t)))
@@ -158,6 +164,14 @@
 (defun matrix-menu--delete-inapt-p ()
   "Return whether redacting the captured message is unavailable."
   (matrix-menu--mutation-inapt-p :can_redact))
+
+(defun matrix-menu--reply-inapt-p ()
+  "Return whether replying to the captured SDK message is unavailable."
+  (or (matrix-menu--mutation-inapt-p :can_reply)
+      (condition-case nil
+          (with-current-buffer (appkit-surface-buffer (matrix-menu--surface (matrix-menu--scope)))
+            (not (null (matrix-room--edit-state))))
+        (user-error t))))
 
 (defun matrix-menu--root-entry (scope)
   "Resolve SCOPE's captured actionable directory entry by its public key."
@@ -273,7 +287,9 @@
             (matrix-menu--request-inapt-p)
             (plist-get model :uncertain-send)
             (with-current-buffer (appkit-surface-buffer surface)
-              (string-empty-p (string-trim (appkit-chatbuf-input-string))))))
+              (let ((capture (matrix-compose-capture surface)))
+                (and (string-empty-p (string-trim (plist-get capture :body)))
+                     (not (plist-get capture :attachments)))))))
     (user-error t)))
 
 (defun matrix-menu--review-inapt-p ()
@@ -282,6 +298,33 @@
       (let ((surface (matrix-menu--surface (matrix-menu--scope))))
         (or (not (eq (car (appkit-surface-identity surface)) 'room))
             (not (plist-get (appkit-surface-model surface) :uncertain-send))))
+    (user-error t)))
+
+(defun matrix-menu--attachment-inapt-p ()
+  "Return whether the captured composer cannot stage attachments."
+  (condition-case nil
+      (let ((surface (matrix-menu--surface (matrix-menu--scope))))
+        (or (not (eq (car (appkit-surface-identity surface)) 'room))
+            (plist-get (appkit-surface-model surface) :operation)
+            (with-current-buffer (appkit-surface-buffer surface)
+              (matrix-room--edit-state))))
+    (user-error t)))
+
+(defun matrix-menu--detach-inapt-p ()
+  "Return whether there is no removable attachment in this composer."
+  (or (matrix-menu--attachment-inapt-p)
+      (condition-case nil
+          (with-current-buffer (appkit-surface-buffer (matrix-menu--surface (matrix-menu--scope)))
+            (not (matrix-compose-attachments)))
+        (user-error t))))
+
+(defun matrix-menu--cancel-inapt-p ()
+  "Return whether this composer has no idle reply or edit context."
+  (condition-case nil
+      (let ((surface (matrix-menu--surface (matrix-menu--scope))))
+        (or (plist-get (appkit-surface-model surface) :operation)
+            (with-current-buffer (appkit-surface-buffer surface)
+              (not (memq (appkit-chatbuf-aux-type) '(reply edit))))))
     (user-error t)))
 
 (defun matrix-menu--label (text)
@@ -378,6 +421,7 @@
   "Actions on the captured SDK message, independent of subsequent point motion."
   [:description matrix-menu--message-description
    ["Message"
+    ("r" "Reply to message" matrix-message-reply :inapt-if matrix-menu--reply-inapt-p)
     ("e" "Edit message" matrix-message-edit :inapt-if matrix-menu--edit-inapt-p)
     ("d" "Delete message" matrix-message-delete :inapt-if matrix-menu--delete-inapt-p)
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
@@ -395,13 +439,11 @@
     ("i" "Focus input" matrix-room-edit-draft :advice* matrix-menu--focus-command)
     ("u" "Review uncertain submission" matrix-room-review-send
      :inapt-if matrix-menu--review-inapt-p)
-    ("k" "Cancel message edit" matrix-room-cancel-edit
-     :inapt-if (lambda ()
-                 (condition-case nil
-                     (with-current-buffer
-                         (appkit-surface-buffer (matrix-menu--surface (matrix-menu--scope)))
-                       (not (matrix-room--edit-state)))
-                   (user-error t))))]
+    ("k" "Cancel reply / edit" matrix-compose-cancel :inapt-if matrix-menu--cancel-inapt-p)]
+   ["Attachments" :advice* matrix-menu--command :inapt-if matrix-menu--attachment-inapt-p
+    ("f" "Local media / file" matrix-compose-attach-file)
+    ("v" "Clipboard files / image" matrix-compose-attach-clipboard)
+    ("d" "Detach attachment" matrix-compose-detach :inapt-if matrix-menu--detach-inapt-p)]
    ["Navigate" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("r" "Room directory" matrix-accounts)
     ("s" "Switch room" matrix-switch-room)
@@ -409,6 +451,17 @@
   (interactive)
   (setq scope (matrix-menu--capture 'room nil scope))
   (transient-setup 'matrix-composer-transient nil nil :scope scope))
+
+(transient-define-prefix matrix-attachment-transient (&optional scope)
+  "Stage local media or clipboard content in the captured room composer."
+  [:description matrix-menu--description
+   ["Attachments" :advice* matrix-menu--command :inapt-if matrix-menu--attachment-inapt-p
+    ("f" "Local media / file" matrix-compose-attach-file)
+    ("v" "Clipboard files / image" matrix-compose-attach-clipboard)
+    ("d" "Detach attachment" matrix-compose-detach :inapt-if matrix-menu--detach-inapt-p)]]
+  (interactive)
+  (setq scope (matrix-menu--capture 'room nil scope))
+  (transient-setup 'matrix-attachment-transient nil nil :scope scope))
 
 (transient-define-prefix matrix-verify-transient (&optional scope)
   "Trust-directory commands; SAS confirmation remains an explicit per-flow action."

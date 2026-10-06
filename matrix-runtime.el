@@ -21,6 +21,8 @@
 (require 'matrix-state)
 
 (declare-function matrix-avatar-clear-cache "matrix-avatar" (app))
+(declare-function matrix-compose-complete-command "matrix-compose" (context &optional id))
+(declare-function matrix-compose-release-capture "matrix-compose" (context))
 
 (cl-defstruct (matrix-runtime-resource-call
                (:constructor matrix-runtime-resource-call-create))
@@ -269,6 +271,11 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
            :success (lambda (_input _value) '(matrix-resource-delivered))
            :failure (lambda (_input _error) '(matrix-resource-delivered))))
          commands))
+      ;; Source ownership is account-owned, not conditional on result delivery
+      ;; to a still-live room.  Actual cleanup runs only after this commit.
+      (when (fboundp 'matrix-compose-complete-command)
+        (when-let* ((command (matrix-compose-complete-command context id)))
+          (push command commands)))
       (when-let* ((target (plist-get context :target)))
         (push (appkit-command-post-message
                :target target
@@ -437,6 +444,11 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
       (matrix-avatar-clear-cache app))
     (when (fboundp 'matrix-media-clear-cache)
       (matrix-media-clear-cache app))
+    (when (fboundp 'matrix-compose-release-capture)
+      (maphash
+       (lambda (_id operation)
+         (matrix-compose-release-capture (plist-get operation :context)))
+       (plist-get model :pending)))
     (clrhash (plist-get model :pending))
     (clrhash (plist-get model :watches))))
 

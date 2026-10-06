@@ -16,6 +16,8 @@
 (require 'appkit-name-color)
 (require 'appkit-ui)
 (require 'matrix-media)
+(require 'matrix-compose)
+(require 'matrix-reply)
 
 (declare-function appkit-media-inline-host-at-point "appkit-media-inline"
                   (&optional position))
@@ -47,6 +49,7 @@
   'next-item #'matrix-room-next-message
   'previous-item #'matrix-room-previous-message
   'message-menu #'matrix-message-transient
+  'reply #'matrix-message-reply
   'edit #'matrix-message-edit
   'delete #'matrix-message-delete
   'history-older #'matrix-room-load-older
@@ -71,7 +74,11 @@
   'newline #'newline
   'submit #'matrix-room-send
   'input-options #'matrix-composer-transient
-  'cancel #'matrix-room-cancel-edit
+  'attach #'matrix-attachment-transient
+  'attach-file #'matrix-compose-attach-file
+  'attach-clipboard #'matrix-compose-attach-clipboard
+  'detach #'matrix-compose-detach
+  'cancel #'matrix-compose-cancel
   'app-menu #'matrix-room-transient
   'navigation matrix-room-navigation-map
   'refresh #'matrix-room-refresh
@@ -79,10 +86,11 @@
   'help #'describe-mode)
 
 (define-derived-mode matrix-room-mode appkit-chatbuf-mode "Matrix-Room"
-  "Matrix room with read-only timeline and editable plain-text composer.
-RET sends the draft; Shift-Return inserts a newline.
+  "Matrix room with a read-only timeline and structured editable composer.
+RET submits text and staged attachments; Shift-Return inserts a newline.
 Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
+  (matrix-compose-setup)
   (appkit-chatbuf-use-timeline-mode #'matrix-room-timeline-mode))
 
 (defun matrix-room--edit-state ()
@@ -128,6 +136,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                                     (matrix-runtime-state (appkit-surface-app surface))
                                     (cadr (appkit-surface-identity surface))) :subscription_id)
            :saved-input (copy-sequence (appkit-chatbuf-input-state))
+           :saved-aux (copy-tree (appkit-chatbuf-aux-state))
            :original-body (substring-no-properties (plist-get item :body))))
     (appkit-chatbuf-input-replace (plist-get item :body))
     (appkit-surface-send surface '(matrix-composer-context))
@@ -135,8 +144,10 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
 
 (defun matrix-room--restore-edit-draft ()
   "Restore the ordinary draft saved by the active message edit."
-  (let ((saved (plist-get (matrix-room--edit-state) :saved-input)))
-    (appkit-chatbuf-aux-reset)
+  (let* ((edit (matrix-room--edit-state))
+         (saved (plist-get edit :saved-input))
+         (aux (plist-get edit :saved-aux)))
+    (appkit-chatbuf-aux-set aux)
     (appkit-chatbuf-input-replace (or saved ""))))
 
 (defun matrix-room-cancel-edit ()
@@ -209,7 +220,8 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
       :preview (appkit-ui-one-line-preview-create :text (plist-get edit :original-body))
       :cancel-action #'matrix-room-cancel-edit
       :cancel-help "Cancel message edit and restore the previous draft"
-      :width matrix-room--width))))
+      :width matrix-room--width))
+   (matrix-reply-composer-text matrix-room--width)))
 
 (defun matrix-room--row-context (previous item)
   "Group adjacent messages by stable sender and a five-minute interval."
@@ -346,7 +358,10 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
               heading (point)
               (appkit-ui-make-prefix-state
                (plist-get prefixes :header) (plist-get prefixes :rest-body)))))
-         (let ((body-start (point)))
+         (let ((body-start (point))
+               body-text-start)
+           (matrix-reply-insert item)
+           (setq body-text-start (point))
            ;; Never interpret formatted_body as HTML or executable markup.
            (insert (if (equal kind "encrypted")
                        (propertize "[Unable to decrypt encrypted event]" 'face 'warning)
@@ -356,7 +371,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
              (matrix-room--insert-image item prefixes))
            (when compact
              (save-excursion
-               (goto-char body-start)
+               (goto-char body-text-start)
                (end-of-line)
                (matrix-room--insert-time item (plist-get prefixes :rest-body))))
            (when-let* ((error (plist-get item :error)))
@@ -578,7 +593,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
   (matrix-room-edit-draft)
   (when (eq (window-buffer) (current-buffer)) (recenter -1)))
 
-(defun matrix-room--result (model method _result error context)
+(defun matrix-room--result (model method result error context)
   "Settle METHOD without clearing a draft newer than captured CONTEXT."
   (cond
    ((equal method "message.edit")
@@ -601,28 +616,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                      "Edit accepted by SDK; newer edits retained.")))))
    ((not (equal method "message.send"))
     model)
-   (t
-    (if error
-        (progn
-          (when (equal (plist-get (plist-get error :data) :code) "transport_uncertain")
-            (setq model
-                  (plist-put model :uncertain-send t)))
-          (plist-put model :notice
-                     (concat "Send not confirmed: " (matrix--error-text error)
-                             " Draft retained; inspect the timeline before any further action.")))
-      ;; Synchronize first: a queued result can arrive between editing and the
-      ;; next command.  Equal text alone does not establish the same revision.
-      (appkit-chatbuf-input-state-sync)
-      (let ((same-draft
-             (and (= (appkit-chatbuf-composer-revision) (plist-get context :revision))
-                  (equal (substring-no-properties (appkit-chatbuf-input-state))
-                         (plist-get context :body)))))
-        (when same-draft
-          (appkit-chatbuf-input-history-push (plist-get context :body))
-          (appkit-chatbuf-input-replace ""))
-        (plist-put model :notice
-                   (concat "Accepted into SDK send queue, not yet necessarily delivered. "
-                           (if same-draft "" "Newer draft retained."))))))))
+   (t (matrix-compose-result model result error context))))
 
 (defvar matrix-room--type
   (matrix--surface-type 'matrix-room #'matrix-room-mode #'matrix-room--render)
@@ -646,39 +640,52 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
     surface))
 
 (defun matrix-room-send ()
-  "Submit the captured plain-text draft once, retaining it until acceptance.
-Late acceptance cannot clear intervening edits, even edits back to the same
-text.  An uncertain submission is never retried with a new transaction ID."
+  "Submit captured text, attachments and reply target through the SDK queue.
+Late acceptance cannot clear an intervening draft or composer context.
+An uncertain submission is never retried with a new transaction ID."
   (interactive)
   (let* ((surface (matrix--current-surface 'room))
          (app (appkit-surface-app surface))
          (session (copy-tree (plist-get (matrix-runtime-state app) :session)))
          (model (appkit-surface-model surface))
-         (room-id (cadr (plist-get model :identity))))
-    (appkit-chatbuf-input-state-sync)
-    (let ((body (substring-no-properties (appkit-chatbuf-input-state)))
-          (revision (appkit-chatbuf-composer-revision))
-          (room (matrix-runtime-room app room-id))
-          (edit (matrix-room--edit-state)))
-      (when (string-empty-p (string-trim body)) (user-error "The draft is empty"))
-      (when (plist-get model :uncertain-send)
-        (user-error "Previous submission is uncertain; inspect the timeline, then use C-c C-u"))
-      (unless (or (eq (plist-get room :encrypted) t)
-                  (yes-or-no-p "Room is not known to be encrypted. Send potentially unencrypted text? "))
-        (user-error "Send cancelled; draft retained"))
-      (unless (and (appkit-surface-live-p surface)
-                   (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
-                   (equal session (plist-get (matrix-runtime-state app) :session)))
-        (user-error "The room or account changed during confirmation; draft retained"))
-      (unless (equal edit (matrix-room--edit-state))
-        (user-error "The message edit context changed during confirmation; draft retained"))
-      (if edit
-          (let ((params (matrix-room--edit-params surface edit)))
-            (matrix--request surface "message.edit" (append params (list :body body))
-                             (list :revision revision :body body
-                                   :edit-event (plist-get edit :event-id))))
-        (matrix--request surface "message.send" (list :room_id room-id :body body)
-                         (list :revision revision :body body))))))
+         (room-id (cadr (plist-get model :identity)))
+         (capture (matrix-compose-capture surface))
+         (body (plist-get capture :body))
+         (revision (plist-get capture :revision))
+         (aux (plist-get capture :aux))
+         (room (matrix-runtime-room app room-id))
+         (edit (matrix-room--edit-state))
+         context submitted)
+    (when (and (string-empty-p (string-trim body))
+               (not (plist-get capture :attachments)))
+      (user-error "The draft is empty"))
+    (when (plist-get model :uncertain-send)
+      (user-error "Previous submission is uncertain; inspect the timeline, then use C-c C-u"))
+    (unless edit
+      (setq context (matrix-compose-retain-capture surface capture)))
+    (unwind-protect
+        (progn
+          (unless (or (eq (plist-get room :encrypted) t)
+                      (yes-or-no-p
+                       "Room is not known encrypted. Send potentially unencrypted text and attachments? "))
+            (user-error "Send cancelled; draft retained"))
+          (unless (and (appkit-surface-live-p surface)
+                       (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
+                       (equal session (plist-get (matrix-runtime-state app) :session)))
+            (user-error "The room or account changed during confirmation; draft retained"))
+          (unless (equal aux (appkit-chatbuf-aux-state))
+            (user-error "The composer context changed during confirmation; draft retained"))
+          (when (eq (plist-get aux :aux-type) 'reply)
+            (matrix-reply-validate surface aux))
+          (if edit
+              (let ((params (matrix-room--edit-params surface edit)))
+                (matrix--request surface "message.edit" (append params (list :body body))
+                                 (list :revision revision :body body
+                                       :edit-event (plist-get edit :event-id))))
+            (matrix--request surface "message.send" (plist-get capture :params) context))
+          (setq submitted t))
+      (unless submitted
+        (matrix-compose-release-capture context)))))
 
 (defun matrix-room-review-send ()
   "Acknowledge an uncertain submission without sending or changing the draft."

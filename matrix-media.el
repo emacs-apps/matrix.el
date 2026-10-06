@@ -12,6 +12,8 @@
 (declare-function appkit-media-resource-poster "appkit-media-resource"
                   (resource width height &rest args))
 (declare-function matrix-runtime-state "matrix-runtime" (app))
+(declare-function matrix-runtime-resource-request "matrix-runtime"
+                  (app method params resolve reject))
 
 (defconst matrix-media--byte-limit (* 32 1024 1024))
 (defvar matrix-media--posters (make-hash-table :test #'eq :weakness 'key)

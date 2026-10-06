@@ -3,7 +3,9 @@ CARGO ?= cargo
 APPKIT_DIR ?= ../appkit.el
 VIDEO_DIR ?= ../video.el
 PLZ_DIR ?= ../../emacs-packages/plz
-ELISP := matrix-rpc.el matrix-state.el matrix-runtime.el matrix-avatar.el matrix.el matrix-root.el matrix-room.el matrix-verify.el matrix-transient.el matrix-evil.el
+EVIL_DIR ?= ../../emacs-packages/evil
+GOTO_CHG_DIR ?= ../../emacs-packages/goto-chg
+ELISP := matrix-rpc.el matrix-state.el matrix-runtime.el matrix-avatar.el matrix-media.el matrix-compose.el matrix-reply.el matrix.el matrix-root.el matrix-room.el matrix-verify.el matrix-transient.el matrix-evil.el
 
 .PHONY: backend release check check-backend check-elisp
 
@@ -19,5 +21,5 @@ check-backend:
 	$(CARGO) test --locked --manifest-path backend/Cargo.toml
 
 check-elisp:
-	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L "$(PLZ_DIR)" -L . --eval '(setq load-prefer-newer t byte-compile-error-on-warn t)' -f batch-byte-compile $(ELISP)
-	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L "$(PLZ_DIR)" -L . -L test --eval '(setq load-prefer-newer t)' -l matrix-state-test -l matrix-ui-test -l matrix-directory-test -l matrix-menu-test -l matrix-avatar-test -f ert-run-tests-batch-and-exit
+	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L "$(PLZ_DIR)" -L "$(EVIL_DIR)" -L "$(GOTO_CHG_DIR)" -L . --eval '(setq load-prefer-newer t byte-compile-error-on-warn t)' -f batch-byte-compile $(ELISP)
+	$(EMACS) -Q --batch -L "$(APPKIT_DIR)" -L "$(VIDEO_DIR)" -L "$(PLZ_DIR)" -L "$(EVIL_DIR)" -L "$(GOTO_CHG_DIR)" -L . -L test --eval '(setq load-prefer-newer t)' -l matrix-state-test -l matrix-ui-test -l matrix-directory-test -l matrix-menu-test -l matrix-avatar-test -l matrix-media-test -l matrix-compose-test -l matrix-reply-test -f ert-run-tests-batch-and-exit

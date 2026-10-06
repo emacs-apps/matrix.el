@@ -990,7 +990,7 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
         value["can_redact"] = json!(permissions.can_redact(event));
         value["can_reply"] = json!(event.can_be_replied_to());
         if let Some(reply) = event.content().in_reply_to() {
-            value["reply"] = reply_metadata(reply);
+            value["reply"] = reply_metadata(&reply);
         }
         let content = event.content();
         if let Some(message) = content.as_message() {
@@ -1783,18 +1783,18 @@ mod tests {
             Some(event_id!("$target").to_owned())).await.unwrap(),
             json!({"accepted":1, "total":1}));
         let content = queued_content(&client).await;
-        assert_eq!(content[2]["msgtype"], "m.text");
-        assert_eq!(content[2]["body"], "text reply");
-        assert_eq!(content[2]["m.relates_to"]["m.in_reply_to"]["event_id"], "$target");
+        let text = content.iter().find(|event| event["msgtype"] == "m.text").unwrap();
+        assert_eq!(text["body"], "text reply");
+        assert_eq!(text["m.relates_to"]["m.in_reply_to"]["event_id"], "$target");
         let source = directory.path().join("only.png");
         std::fs::write(&source, IMAGE_PNG).unwrap();
         assert_eq!(timelines.send(&room, "active", String::new(),
             vec![attachment(&source, "only.png", "application/octet-stream")], None)
             .await.unwrap(), json!({"accepted":1, "total":1}));
         let content = queued_content(&client).await;
-        assert_eq!(content[3]["msgtype"], "m.file");
-        assert_eq!(content[3]["body"], "only.png");
-        assert!(content[3].get("filename").is_none());
+        let file = content.iter().find(|event| event["body"] == "only.png").unwrap();
+        assert_eq!(file["msgtype"], "m.file");
+        assert!(file.get("filename").is_none());
         timelines.shutdown().await;
     }
 
@@ -2051,14 +2051,15 @@ mod tests {
             vec![attachment(source.path(), "secret.png", "image/png")], None).await.unwrap();
         source.close().unwrap();
         let queue = room.send_queue();
-        let disable_after_upload = queue.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/(media/(r0|v3)|client/v1/media)/config$"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(json!({"m.upload.size":32 * 1024 * 1024})))
+            .mount(&server).await;
         Mock::given(method("POST")).and(path_regex(r"^/_matrix/media/(r0|v3)/upload$"))
             .respond_with(move |request: &wiremock::Request| {
                 assert_eq!(request.body.len(), IMAGE_PNG.len());
                 assert_ne!(request.body, IMAGE_PNG);
-                // Stop before the next queued request (the encrypted room event),
-                // so this test exercises real media encryption without key fixtures.
-                disable_after_upload.set_enabled(false);
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"content_uri":"mxc://example.org/sdk-encrypted"}))
             }).expect(1).mount(&server).await;
@@ -2066,17 +2067,21 @@ mod tests {
         client.send_queue().set_enabled(true).await;
         let source = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let matrix_sdk::send_queue::RoomSendQueueUpdate::MediaUpload {
-                    file: Some(source), ..
-                } = updates.recv().await.unwrap() {
-                    break source;
+                match updates.recv().await.unwrap() {
+                    matrix_sdk::send_queue::RoomSendQueueUpdate::MediaUpload {
+                        file: Some(source), ..
+                    } => break source,
+                    matrix_sdk::send_queue::RoomSendQueueUpdate::SendError { error, .. } =>
+                        panic!("SDK attachment upload failed: {error}"),
+                    _ => {}
                 }
             }
         }).await.unwrap();
+        queue.set_enabled(false);
         let matrix_sdk::ruma::events::room::MediaSource::Encrypted(file) = &source
             else { panic!("SDK uploaded plaintext media to an encrypted room") };
         assert_eq!(file.url.as_str(), "mxc://example.org/sdk-encrypted");
-        assert_eq!(file.version, "v2");
+        assert_eq!(file.info.version(), "v2");
         let request = matrix_sdk::media::MediaRequestParameters {
             source, format: matrix_sdk::media::MediaFormat::File,
         };

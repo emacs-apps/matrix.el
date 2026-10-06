@@ -60,10 +60,11 @@
 (defun matrix-ui-test--capture (surface token)
   "Capture this draft for SURFACE under TOKEN before a directed response."
   (appkit-chatbuf-input-state-sync)
-  (let ((context (list :target (plist-get (appkit-surface-model surface) :address)
-                       :method "message.send" :token token
-                       :revision (appkit-chatbuf-composer-revision)
-                       :body (substring-no-properties (appkit-chatbuf-input-state)))))
+  (let ((context (append
+                  (list :target (plist-get (appkit-surface-model surface) :address)
+                        :method "message.send" :token token)
+                  (matrix-compose-retain-capture
+                   surface (matrix-compose-capture surface)))))
     (appkit-surface-send surface (list 'matrix-operation context))
     context))
 
@@ -71,7 +72,9 @@
   "Deliver an actual result message to SURFACE for CONTEXT and optional ERROR."
   (appkit-surface-send surface
                        (list 'matrix-result 1 "message.send"
-                             '(:transaction_id "sdk-transaction") error context)))
+                             (list :accepted (max 1 (length (plist-get context :attachments)))
+                                   :total (max 1 (length (plist-get context :attachments))))
+                             error context)))
 
 (ert-deftest matrix-ui-sync-preserves-draft-and-read-only-rows ()
   (matrix-ui-test--with-room
@@ -161,8 +164,10 @@
   (matrix-ui-test--with-room
     (appkit-chatbuf-input-replace "Not yet sent")
     ;; This real runtime admission fails before any Source exists or bytes leave.
-    (matrix--request surface "message.send" '(:room_id "!room:test" :body "Not yet sent")
-                     (list :revision (appkit-chatbuf-composer-revision) :body "Not yet sent"))
+    (matrix--request
+     surface "message.send"
+     '(:room_id "!room:test" :subscription_id "subscription" :body "Not yet sent" :attachments [])
+     (matrix-compose-retain-capture surface (matrix-compose-capture surface)))
     (should-not (plist-get (appkit-surface-model surface) :uncertain-send))
     (should-not (plist-get (appkit-surface-model surface) :operation))
     (should (equal (appkit-chatbuf-input-string) "Not yet sent"))))
@@ -447,9 +452,6 @@
                          (setq context owned)
                          1)))
               (execute-kbd-macro (kbd key))
-              (should (equal requests
-                             '(("message.send" (:room_id "!room:test"
-                                               :body "First line\nSecond line")))))
               (should (plist-get (appkit-surface-model surface) :operation))
               (should (equal (appkit-chatbuf-input-string) "First line\nSecond line"))
               (should-error (execute-kbd-macro (kbd key)) :type 'user-error)

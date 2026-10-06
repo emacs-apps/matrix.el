@@ -24,6 +24,7 @@
 (declare-function matrix-room--sync-history "matrix-room" (model state))
 (declare-function matrix-room--history-complete "matrix-room" (model state result error context))
 (declare-function matrix-room--observe-command "matrix-room" ())
+(declare-function matrix-compose-complete-command "matrix-compose" (context &optional id))
 
 (autoload 'matrix-join-room "matrix-root" nil t)
 (autoload 'matrix-create-room "matrix-root" nil t)
@@ -37,9 +38,11 @@
 (autoload 'matrix-room-transient "matrix-transient" nil t)
 (autoload 'matrix-message-transient "matrix-transient" nil t)
 (autoload 'matrix-composer-transient "matrix-transient" nil t)
+(autoload 'matrix-attachment-transient "matrix-transient" nil t)
 (autoload 'matrix-verify-transient "matrix-transient" nil t)
 (autoload 'matrix-message-edit "matrix-transient" nil t)
 (autoload 'matrix-message-delete "matrix-transient" nil t)
+(autoload 'matrix-message-reply "matrix-transient" nil t)
 
 (defvar matrix-navigation-map
   (let ((map (make-sparse-keymap)))
@@ -278,7 +281,7 @@ Register ROOM-ID's timeline when provided; retain the reading position."
                         :render (appkit-projection-change-create :frame-p t)
                         :commands (list (matrix-room--observe-command)))
          (appkit-next :model model :render appkit-render-none)))
-      (`(matrix-result ,_id ,method ,result ,error ,owned)
+      (`(matrix-result ,id ,method ,result ,error ,owned)
        (if (not (matrix--matching-result-p model method owned))
            (appkit-next :model model :render appkit-render-none)
          (let ((next (plist-put (copy-sequence model) :operation nil)))
@@ -292,7 +295,9 @@ Register ROOM-ID's timeline when provided; retain the reading position."
                    ('verify (matrix-verify--result next method result error owned))
                    (_ next)))
            (appkit-next :model next
-                        :render (appkit-projection-change-create :full-p t :frame-p t)))))
+                        :render (appkit-projection-change-create :full-p t :frame-p t)
+                        :commands (when (and room-p (equal method "message.send"))
+                                    (list (matrix-compose-complete-command owned id)))))))
       (_ (appkit-next :model model :render appkit-render-none)))))
 
 (defun matrix--surface-type (name mode render &optional mount)
