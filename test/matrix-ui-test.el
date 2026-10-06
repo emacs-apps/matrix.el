@@ -99,6 +99,24 @@
       (matrix-ui-test--settle surface context)
       (should (equal (appkit-chatbuf-input-string) "Next message")))))
 
+(ert-deftest matrix-ui-operation-feedback-does-not-become-composer-content ()
+  (matrix-ui-test--with-room
+    (let ((empty-room (buffer-substring-no-properties (point-min) (point-max))))
+      (appkit-chatbuf-input-replace "Captured message")
+      (matrix-ui-test--settle surface (matrix-ui-test--capture surface 1))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     empty-room)))
+    (appkit-chatbuf-input-replace "Unsent ordinary draft")
+    (let ((room-with-draft (buffer-substring-no-properties (point-min) (point-max))))
+      (dolist (error '(nil (:message "Redaction rejected")))
+        (let ((context (list :target (plist-get (appkit-surface-model surface) :address)
+                             :method "message.redact" :token 2)))
+          (appkit-surface-send surface (list 'matrix-operation context))
+          (appkit-surface-send
+           surface (list 'matrix-result 2 "message.redact" nil error context))
+          (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                         room-with-draft)))))))
+
 (ert-deftest matrix-ui-failure-and-late-acceptance-preserve-edits ()
   (matrix-ui-test--with-room
     (appkit-chatbuf-input-replace "Original")

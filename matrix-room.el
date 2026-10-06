@@ -200,7 +200,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
     model))
 
 (defun matrix-room--footer (state timeline model)
-  "Return passive history, transport and submission status."
+  "Return passive history, transport and active composer context."
   (concat
    (appkit-chat-history-delimiter-string
     matrix-room--width :loading-text "Loading older messages")
@@ -213,7 +213,6 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
    (when-let* ((error (plist-get state :last-error)))
      (concat (propertize (format "Account: %s" error) 'face 'error) "\n"))
    (when (plist-get model :operation) "Waiting for account operation…\n")
-   (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))
    (when-let* ((edit (matrix-room--edit-state)))
      (appkit-chatbuf-aux-render
       :title "Editing message"
@@ -594,15 +593,15 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
   (when (eq (window-buffer) (current-buffer)) (recenter -1)))
 
 (defun matrix-room--result (model method result error context)
-  "Settle METHOD without clearing a draft newer than captured CONTEXT."
+  "Return a settled transition without clearing a draft newer than CONTEXT."
   (cond
    ((equal method "message.edit")
     (if error
         (progn
           (when (equal (plist-get (plist-get error :data) :code) "transport_uncertain")
             (setq model (plist-put model :uncertain-send t)))
-          (plist-put model :notice
-                     (concat "Edit not confirmed: " (matrix--error-text error) " Edits retained.")))
+          (matrix--feedback-next
+           model (concat "Edit not confirmed: " (matrix--error-text error) " Edits retained.")))
       (appkit-chatbuf-input-state-sync)
       (let ((same-edit
              (and (equal (plist-get (matrix-room--edit-state) :event-id)
@@ -611,11 +610,14 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                   (equal (substring-no-properties (appkit-chatbuf-input-state))
                          (plist-get context :body)))))
         (when same-edit (matrix-room--restore-edit-draft))
-        (plist-put model :notice
-                   (if same-edit "Edit accepted by SDK; previous draft restored."
-                     "Edit accepted by SDK; newer edits retained.")))))
+        (matrix--feedback-next
+         model (if same-edit "Edit accepted by SDK; previous draft restored."
+                 "Edit accepted by SDK; newer edits retained.")))))
    ((not (equal method "message.send"))
-    model)
+    (matrix--feedback-next
+     model (if error (matrix--error-text error)
+             (if (equal method "message.redact") "Redaction accepted by SDK."
+               (format "%s completed" method)))))
    (t (matrix-compose-result model result error context))))
 
 (defvar matrix-room--type

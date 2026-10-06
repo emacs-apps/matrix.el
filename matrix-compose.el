@@ -22,6 +22,7 @@
 (require 'appkit-media-resource)
 (require 'appkit-media-image)
 (require 'matrix-runtime)
+(require 'matrix)
 
 (declare-function matrix--current-surface "matrix" (&optional kind))
 (declare-function matrix--error-text "matrix" (error))
@@ -470,41 +471,40 @@ The caption belongs to the first accepted event and must not be retried."
     (apply #'concat (nreverse pieces))))
 
 (defun matrix-compose-result (model result error context)
-  "Settle confirmed SDK RESULT for the already-matched operation in MODEL.
-Never delete files here: account/Surface post-commit commands release ownership."
+  "Return a transition settling confirmed SDK RESULT for MODEL's operation.
+Draft changes commit before echo feedback and private-source release effects."
   (let* ((total (max 1 (length (plist-get context :attachments))))
          (accepted (if error 0 (plist-get result :accepted)))
          (failure (or error (plist-get result :error)))
          (valid (or error (and (integerp accepted) (<= 0 accepted total)
                               (equal total (plist-get result :total)))))
-         (same (matrix-compose--same-capture-p context)))
-    (cond
-     ((not valid)
-      (setq model (plist-put model :uncertain-send t))
-      (plist-put model :notice
-                 "SDK acceptance count is invalid; draft retained. Inspect the timeline before sending again."))
-     ((= accepted total)
-      (when same
-        (unless (string-empty-p (string-trim (plist-get context :body)))
-          (appkit-chatbuf-input-history-push (plist-get context :body)))
-        (appkit-chatbuf-input-replace "")
-        (appkit-chatbuf-aux-reset))
-      (plist-put model :notice
-                 (format "Accepted %d/%d into SDK send queue; delivery is not yet confirmed.%s"
-                         accepted total (if same "" " Newer draft retained."))))
-     (t
-      (when (or (and (> accepted 0) (not same))
-                (equal (plist-get (plist-get error :data) :code) "transport_uncertain"))
-        (setq model (plist-put model :uncertain-send t)))
-      (when (and same (> accepted 0))
-        (appkit-chatbuf-input-replace (matrix-compose--remaining-input context accepted)))
-      (plist-put model :notice
-                 (concat (format "Accepted %d/%d into SDK send queue. " accepted total)
-                         (if failure (concat (matrix--error-text failure) " ") "")
-                         (cond
-                          ((and (> accepted 0) same) "Unaccepted attachments retained; consumed caption removed.")
-                          ((> accepted 0) "Newer draft retained; inspect accepted events and review before resending.")
-                          (t "Draft retained; inspect the timeline if acceptance is uncertain."))))))))
+         (same (matrix-compose--same-capture-p context))
+         (feedback
+          (cond
+           ((not valid)
+            (setq model (plist-put model :uncertain-send t))
+            "SDK acceptance count is invalid; draft retained. Inspect the timeline before sending again.")
+           ((= accepted total)
+            (when same
+              (unless (string-empty-p (string-trim (plist-get context :body)))
+                (appkit-chatbuf-input-history-push (plist-get context :body)))
+              (appkit-chatbuf-input-replace "")
+              (appkit-chatbuf-aux-reset))
+            (format "Accepted %d/%d into SDK send queue; delivery is not yet confirmed.%s"
+                    accepted total (if same "" " Newer draft retained.")))
+           (t
+            (when (or (and (> accepted 0) (not same))
+                      (equal (plist-get (plist-get error :data) :code) "transport_uncertain"))
+              (setq model (plist-put model :uncertain-send t)))
+            (when (and same (> accepted 0))
+              (appkit-chatbuf-input-replace (matrix-compose--remaining-input context accepted)))
+            (concat (format "Accepted %d/%d into SDK send queue. " accepted total)
+                    (if failure (concat (matrix--error-text failure) " ") "")
+                    (cond
+                     ((and (> accepted 0) same) "Unaccepted attachments retained; consumed caption removed.")
+                     ((> accepted 0) "Newer draft retained; inspect accepted events and review before resending.")
+                     (t "Draft retained; inspect the timeline if acceptance is uncertain.")))))))
+    (matrix--feedback-next model feedback)))
 
 (provide 'matrix-compose)
 ;;; matrix-compose.el ends here

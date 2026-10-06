@@ -232,6 +232,26 @@ Register ROOM-ID's timeline when provided; retain the reading position."
          (equal method (plist-get operation :method))
          (equal (plist-get operation :token) (plist-get context :token)))))
 
+(defun matrix--feedback-start (_context text _observe resolve _reject)
+  "Report committed room feedback TEXT outside the composer projection."
+  (message "Matrix: %s" text)
+  (funcall resolve nil)
+  nil)
+
+(defun matrix--feedback-command (text)
+  "Return a post-commit echo-area command for non-secret TEXT."
+  (appkit-command-start-effect
+   (appkit-effect-create
+    :key 'matrix-feedback :input text :start #'matrix--feedback-start
+    :success (lambda (_input _value) '(matrix-feedback-shown))
+    :failure (lambda (_input condition) (signal (car condition) (cdr condition))))))
+
+(defun matrix--feedback-next (model text)
+  "Return settled room MODEL with ephemeral post-commit feedback TEXT."
+  (appkit-next :model model
+               :render (appkit-projection-change-create :full-p t :frame-p t)
+               :commands (list (matrix--feedback-command text))))
+
 (defun matrix--surface-update (context model message)
   "Reduce directed UI MESSAGE without issuing protocol work in a reducer."
   (let* ((room-p (eq (car (plist-get model :identity)) 'room))
@@ -266,13 +286,14 @@ Register ROOM-ID's timeline when provided; retain the reading position."
         :render (appkit-projection-change-create :frame-p t)))
       ('(matrix-send-reviewed)
        (appkit-next
-        :model (plist-put (plist-put (copy-sequence model) :uncertain-send nil)
-                          :notice "Previous submission reviewed; no message was resent.")
-        :render (appkit-projection-change-create :frame-p t)))
+        :model (plist-put (copy-sequence model) :uncertain-send nil)
+        :render (appkit-projection-change-create :frame-p t)
+        :commands (list (matrix--feedback-command
+                         "Previous submission reviewed; no message was resent."))))
       (`(matrix-operation ,operation)
        (appkit-next
-        :model (plist-put (plist-put (copy-sequence model) :operation operation)
-                          :notice nil)
+        :model (let ((next (plist-put (copy-sequence model) :operation operation)))
+                 (if room-p next (plist-put next :notice nil)))
         :render (appkit-projection-change-create :frame-p t)))
       (`(matrix-result ,_id "timeline.paginate" ,result ,error ,owned)
        (if-let* ((next (and room-p
@@ -284,20 +305,24 @@ Register ROOM-ID's timeline when provided; retain the reading position."
       (`(matrix-result ,id ,method ,result ,error ,owned)
        (if (not (matrix--matching-result-p model method owned))
            (appkit-next :model model :render appkit-render-none)
-         (let ((next (plist-put (copy-sequence model) :operation nil)))
-           (setq next (plist-put next :notice
-                                 (if error (matrix--error-text error)
-                                   (format "%s completed" method))))
-           (setq next
-                 (pcase (car (plist-get model :identity))
-                   ('room (matrix-room--result next method result error owned))
-                   ('root (matrix-root--result next method result error owned))
-                   ('verify (matrix-verify--result next method result error owned))
-                   (_ next)))
-           (appkit-next :model next
-                        :render (appkit-projection-change-create :full-p t :frame-p t)
-                        :commands (when (and room-p (equal method "message.send"))
-                                    (list (matrix-compose-complete-command owned id)))))))
+         (let* ((next (plist-put (copy-sequence model) :operation nil))
+                (settled
+                 (if room-p
+                     (matrix-room--result next method result error owned)
+                   (setq next (plist-put next :notice
+                                         (if error (matrix--error-text error)
+                                           (format "%s completed" method))))
+                   (appkit-next
+                    :model (pcase (car (plist-get model :identity))
+                             ('root (matrix-root--result next method result error owned))
+                             ('verify (matrix-verify--result next method result error owned))
+                             (_ next))
+                    :render (appkit-projection-change-create :full-p t :frame-p t)))))
+           (when (and room-p (equal method "message.send"))
+             (setf (appkit-next-commands settled)
+                   (cons (matrix-compose-complete-command owned id)
+                         (appkit-next-commands settled))))
+           settled)))
       (_ (appkit-next :model model :render appkit-render-none)))))
 
 (defun matrix--surface-type (name mode render &optional mount)

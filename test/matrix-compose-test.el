@@ -159,7 +159,6 @@
           (should (equal (plist-get (plist-get retry :params) :reply_to) "$reply-target:test"))
           (should (equal (plist-get (aref (plist-get (plist-get retry :params) :attachments) 0) :path)
                          second)))
-        (should (string-match-p "Accepted 1/2" (plist-get (appkit-surface-model surface) :notice)))
         (let ((input (appkit-chatbuf-input-state)))
           (matrix-compose-cancel)
           (should-not (appkit-chatbuf-aux-state))

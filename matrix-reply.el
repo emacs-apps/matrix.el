@@ -14,6 +14,7 @@
 (require 'appkit-chat-timeline)
 (require 'appkit-chat-history)
 (require 'appkit-ui)
+(require 'appkit-name-color)
 (require 'url-util)
 
 (declare-function matrix-room--timeline "matrix-room" (state room-id))
@@ -39,6 +40,17 @@
     "[[:cntrl:]\u2028\u2029]+" " "
     (if (stringp text) (substring-no-properties text) "") nil t)))
 
+(defun matrix-reply--sender (details)
+  "Return the safe display name of DETAILS' original author."
+  (let ((name (matrix-reply--text
+               (or (plist-get details :sender_name) (plist-get details :sender)))))
+    (if (string-empty-p name) "Unknown sender" name)))
+
+(defun matrix-reply--sender-face (details)
+  "Return the same stable author color used by Matrix message headings."
+  (when-let* ((sender (plist-get details :sender)))
+    (appkit-name-color-face sender)))
+
 (defun matrix-reply--preview (details)
   "Return an explicit SDK DETAILS preview, without parsing fallback markup."
   (pcase (plist-get details :kind)
@@ -48,14 +60,10 @@
     (_ (let ((body (matrix-reply--text (plist-get details :body))))
          (if (string-empty-p body) "[Message has no text]" body)))))
 
-(defun matrix-reply--label (reply)
-  "Describe SDK REPLY details, retaining unresolved relationships visibly."
+(defun matrix-reply--relation-preview (reply)
+  "Describe SDK REPLY content, retaining unresolved relationships visibly."
   (pcase (plist-get reply :status)
-    ("ready"
-     (let ((sender (matrix-reply--text
-                    (or (plist-get reply :sender_name) (plist-get reply :sender)))))
-       (concat (if (string-empty-p sender) "Unknown sender" sender)
-               ": " (matrix-reply--preview reply))))
+    ("ready" (matrix-reply--preview reply))
     ("pending" "[Loading replied message…]")
     ("error" "[Replied message details failed to load]")
     (_ "[Replied message unavailable]")))
@@ -141,9 +149,7 @@
         (user-error "The selected message is stale or cannot be replied to"))
       (matrix-reply-validate surface aux)
       (setq aux (append aux
-                        (list :sender-name (matrix-reply--text
-                                           (or (plist-get current :sender_name)
-                                               (plist-get current :sender)))
+                        (list :sender-name (matrix-reply--sender current)
                               :preview (matrix-reply--preview current))))
       (appkit-chatbuf-input-state-sync)
       (appkit-chatbuf-aux-set aux)
@@ -168,19 +174,17 @@
          (surface (appkit-current-surface)))
     (when (eq (plist-get aux :aux-type) 'reply)
       (let* ((item (and surface (matrix-reply--item surface (plist-get aux :message-id))))
-             (current (and item (equal (plist-get item :event_id) (plist-get aux :event-id)))))
+             (current (and item (equal (plist-get item :event_id) (plist-get aux :event-id))))
+             (name (if current (matrix-reply--sender item) (plist-get aux :sender-name)))
+             (face (and current (matrix-reply--sender-face item))))
         (appkit-chatbuf-aux-render
-         :title "Replying to message"
+         :title (concat "Reply to " (propertize name 'face face))
          :preview (appkit-ui-one-line-preview-create
-                   :label (if current
-                              (matrix-reply--text
-                               (or (plist-get item :sender_name) (plist-get item :sender)))
-                            (plist-get aux :sender-name))
-                   :separator ": "
                    :text (if current (matrix-reply--preview item)
                            "[Reply target no longer available]"))
          :cancel-action #'matrix-reply-cancel
          :cancel-help "Cancel reply target; keep text and attachments"
+         :accent-face face
          :width (or width (and (boundp 'matrix-room--width) matrix-room--width)))))))
 
 (defun matrix-reply--permalink (room-id event-id)
@@ -236,13 +240,20 @@
                                   :source-event-id (plist-get item :event_id)
                                   :event-id (plist-get reply :event_id))
                             (when surface (matrix-reply--context surface))))
-           (label (appkit-ui-render-one-line-preview
-                   (appkit-ui-one-line-preview-create :label "↪" :separator " "
-                                                      :text (matrix-reply--label reply))
-                   (max 12 (- (or (and (boundp 'matrix-room--width) matrix-room--width) 80) 4)))))
+           (ready (equal (plist-get reply :status) "ready"))
+           (label (concat
+                   (propertize "↪ " 'face 'appkit-chatbuf-aux-preview)
+                   (appkit-ui-render-one-line-preview
+                    (appkit-ui-one-line-preview-create
+                     :label (when ready (matrix-reply--sender reply))
+                     :label-face (when ready (matrix-reply--sender-face reply))
+                     :separator ":"
+                     :text (matrix-reply--relation-preview reply))
+                    (max 12 (- (or (and (boundp 'matrix-room--width) matrix-room--width) 80) 6))
+                    :face 'appkit-chatbuf-aux-preview))))
       (appkit-ui-insert-action-button
        label (lambda () (matrix-reply--follow (matrix--current-surface 'room) context))
-       :face 'shadow :help-echo "Follow the exact original reply target (Return or click)"
+       :help-echo "Follow the exact original reply target (Return or click)"
        :properties (list 'matrix-reply-context context 'rear-nonsticky t))
       (insert "\n"))))
 
