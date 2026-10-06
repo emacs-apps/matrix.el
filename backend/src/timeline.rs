@@ -4,10 +4,22 @@ use eyeball_im::VectorDiff;
 use futures_util::StreamExt;
 use matrix_sdk::{
     Client, RoomState,
-    ruma::{OwnedRoomId, events::room::message::RoomMessageEventContent},
+    room::edit::{EditError as RoomEditError, EditedContent},
+    ruma::{
+        EventId, OwnedRoomId, UserId,
+        api::error::ErrorKind,
+        events::{
+            MessageLikeEventType,
+            room::{
+                message::{MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+                power_levels::RoomPowerLevels,
+            },
+        },
+    },
 };
 use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt, Timeline, TimelineDetails, TimelineItem, VirtualTimelineItem,
+    EditError, Error as TimelineError, EventSendState, EventTimelineItem, Message, RedactError,
+    RoomExt, Timeline, TimelineDetails, TimelineItem, VirtualTimelineItem,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, OnceCell};
@@ -28,11 +40,106 @@ const PAGINATION_CANCELLED: RpcError = RpcError::new(
     "Timeline pagination was cancelled because its subscription closed",
 );
 
+const PERMISSIONS_UNAVAILABLE: RpcError = RpcError::new(
+    "permissions_unavailable",
+    "Room permissions are not available; wait for sync before changing messages",
+);
+const EVENT_MISSING: RpcError =
+    RpcError::new("event_missing", "The target event is not in this room timeline");
+const EDIT_FORBIDDEN: RpcError =
+    RpcError::new("edit_forbidden", "You may only edit your own messages with room send permission");
+const EDIT_UNAVAILABLE: RpcError = RpcError::new(
+    "edit_unavailable",
+    "This event has no editable message content; plaintext must be available",
+);
+const REDACT_FORBIDDEN: RpcError = RpcError::new(
+    "redaction_forbidden",
+    "Room permissions do not allow you to redact this event",
+);
+const ALREADY_REDACTED: RpcError =
+    RpcError::new("already_redacted", "This event is already redacted");
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct MutationPermissions {
+    send_message: bool,
+    redact_own: bool,
+    redact_other: bool,
+}
+
+impl MutationPermissions {
+    fn from_power_levels(levels: &RoomPowerLevels, user: &UserId) -> Self {
+        Self {
+            send_message: levels.user_can_send_message(user, MessageLikeEventType::RoomMessage),
+            redact_own: levels.user_can_redact_own_event(user),
+            redact_other: levels.user_can_redact_event_of_other(user),
+        }
+    }
+
+    fn can_edit(self, event: &EventTimelineItem) -> bool {
+        event.event_id().is_some()
+            && event.is_own()
+            && event.content().as_message().is_some_and(body_editable)
+            && self.send_message
+    }
+
+    fn can_redact(self, event: &EventTimelineItem) -> bool {
+        event.event_id().is_some()
+            && !is_redacted(event)
+            && event.redaction_send_state().is_none()
+            && if event.is_own() { self.redact_own } else { self.redact_other }
+    }
+}
+
+async fn mutation_permissions(room: &matrix_sdk::Room) -> Result<MutationPermissions> {
+    if room.state() != RoomState::Joined {
+        return Err(RpcError::new("room_not_joined", "Join this room before changing messages"));
+    }
+    // Never grant moderator or sending privileges from guessed/default room state.
+    let levels = room.power_levels().await.map_err(|_| PERMISSIONS_UNAVAILABLE)?;
+    Ok(MutationPermissions::from_power_levels(&levels, room.own_user_id()))
+}
+
+fn body_editable(message: &Message) -> bool {
+    matches!(
+        message.msgtype(),
+        MessageType::Text(_) | MessageType::Notice(_) | MessageType::Emote(_)
+            | MessageType::Audio(_) | MessageType::File(_) | MessageType::Image(_)
+            | MessageType::Video(_)
+    )
+}
+
+fn is_redacted(event: &EventTimelineItem) -> bool {
+    if event.content().is_redacted()
+        || event.content().is_message()
+        || event.content().is_unable_to_decrypt()
+    {
+        return event.content().is_redacted();
+    }
+    // Redacted state events retain their state-event variant in SDK content.
+    // Inspect only the marker, without copying/deserializing event bodies.
+    #[derive(serde::Deserialize)]
+    struct EventMetadata {
+        #[serde(default)]
+        unsigned: UnsignedMetadata,
+    }
+    #[derive(Default, serde::Deserialize)]
+    struct UnsignedMetadata {
+        redacted_because: Option<serde::de::IgnoredAny>,
+    }
+    event.original_json().is_some_and(|raw| {
+        serde_json::from_str::<EventMetadata>(raw.json().get())
+            .is_ok_and(|metadata| metadata.unsigned.redacted_because.is_some())
+    })
+}
 struct Subscription {
     id: String,
     timeline: OnceCell<Result<Arc<Timeline>>>,
     cancel: CancellationToken,
     tasks: TaskTracker,
+    // Admit mutations and subscription transitions in a single per-room order.
+    // Closing/replacing a view waits for already-admitted SDK queue operations,
+    // without holding the room map or blocking unrelated rooms.
+    mutations: Mutex<()>,
 }
 
 impl Subscription {
@@ -68,33 +175,48 @@ impl Timelines {
         Option<Arc<Subscription>>,
         TaskTrackerToken,
     )> {
-        let mut rooms = self.rooms.lock().await;
-        if self.cancel.is_cancelled() {
-            return Err(STALE_SUBSCRIPTION);
-        }
-        if let Some(current) = rooms.get(&room_id) {
-            if current.id == id && !current.cancel.is_cancelled() {
-                return Ok((current.clone(), None, current.tasks.token()));
+        loop {
+            let mut rooms = self.rooms.lock().await;
+            if self.cancel.is_cancelled() {
+                return Err(STALE_SUBSCRIPTION);
             }
+            let current = rooms.get(&room_id).cloned();
+            if let Some(current) = &current {
+                if current.id == id && !current.cancel.is_cancelled() {
+                    return Ok((current.clone(), None, current.tasks.token()));
+                }
+            }
+            let _transition = match &current {
+                Some(current) => match current.mutations.try_lock() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        drop(rooms);
+                        let _guard = current.mutations.lock().await;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if current.is_none() && rooms.len() >= MAX_SUBSCRIPTIONS {
+                return Err(RpcError::new(
+                    "subscription_limit",
+                    "At most 32 room timelines may be open",
+                ));
+            }
+            let subscription = Arc::new(Subscription {
+                id,
+                timeline: OnceCell::new(),
+                cancel: self.cancel.child_token(),
+                tasks: TaskTracker::new(),
+                mutations: Mutex::new(()),
+            });
+            let operation = subscription.tasks.token();
+            let old = rooms.insert(room_id, subscription.clone());
+            if let Some(old) = &old {
+                old.cancel();
+            }
+            return Ok((subscription, old, operation));
         }
-        if !rooms.contains_key(&room_id) && rooms.len() >= MAX_SUBSCRIPTIONS {
-            return Err(RpcError::new(
-                "subscription_limit",
-                "At most 32 room timelines may be open",
-            ));
-        }
-        let subscription = Arc::new(Subscription {
-            id,
-            timeline: OnceCell::new(),
-            cancel: self.cancel.child_token(),
-            tasks: TaskTracker::new(),
-        });
-        let operation = subscription.tasks.token();
-        let old = rooms.insert(room_id, subscription.clone());
-        if let Some(old) = &old {
-            old.cancel();
-        }
-        Ok((subscription, old, operation))
     }
 
     async fn is_current(&self, room_id: &OwnedRoomId, subscription: &Arc<Subscription>) -> bool {
@@ -137,12 +259,15 @@ impl Timelines {
                                 .map_err(|_| NETWORK)?,
                         ),
                     };
-                    let (items, stream) = timeline.subscribe().await;
+                    let task_sdk_room = timeline.room().clone();
+                    let mut room_updates = task_sdk_room.subscribe_to_updates();
+                    let mut permissions = mutation_permissions(&task_sdk_room).await.unwrap_or_default();
+                    let (mut items, stream) = timeline.subscribe().await;
                     if !output
                         .event(json!({
                             "type":"timeline_reset", "room_id":room_id,
                             "subscription_id":subscription.id, "revision":0,
-                            "items":items.iter().map(|i| item(i)).collect::<Vec<_>>()
+                            "items":items.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()
                         }))
                         .await
                     {
@@ -154,10 +279,34 @@ impl Timelines {
                     self.tasks.spawn(subscription.tasks.track_future(async move {
                         futures_util::pin_mut!(stream);
                         let mut revision = 0u64;
+                        let mut room_updates_open = true;
                         loop {
                             tokio::select! {
                                 biased;
                                 _ = task_cancel.cancelled() => break,
+                                update = room_updates.recv(), if room_updates_open => {
+                                    if matches!(update, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                                        room_updates_open = false;
+                                        continue;
+                                    }
+                                    let next = mutation_permissions(&task_sdk_room).await.unwrap_or_default();
+                                    if next == permissions { continue; }
+                                    permissions = next;
+                                    revision += 1;
+                                    // Reserialize our subscriber's SDK snapshot, not a separately
+                                    // fetched list that could overtake queued SDK vector diffs.
+                                    let event = json!({
+                                        "type":"timeline_diff", "room_id":task_room,
+                                        "subscription_id":task_id, "revision":revision,
+                                        "changes":[{"op":"reset", "items":items.iter()
+                                            .map(|i| item(i, permissions)).collect::<Vec<_>>()}]
+                                    });
+                                    tokio::select! {
+                                        biased;
+                                        _ = task_cancel.cancelled() => break,
+                                        sent = output.event(event) => if !sent { break; },
+                                    }
+                                }
                                 diffs = stream.next() => {
                                     let Some(diffs) = diffs else {
                                         tokio::select! {
@@ -172,8 +321,11 @@ impl Timelines {
                                     let event = json!({
                                         "type":"timeline_diff", "room_id":task_room,
                                         "subscription_id":task_id, "revision":revision,
-                                        "changes":diffs.into_iter().map(change).collect::<Vec<_>>()
+                                        "changes":diffs.iter().map(|diff| change(diff, permissions)).collect::<Vec<_>>()
                                     });
+                                    for diff in diffs {
+                                        diff.apply(&mut items);
+                                    }
                                     tokio::select! {
                                         biased;
                                         _ = task_cancel.cancelled() => break,
@@ -215,15 +367,22 @@ impl Timelines {
 
     pub async fn unsubscribe(&self, room_id: &OwnedRoomId, id: &str) {
         let _operation = self.tasks.token();
-        let old = {
+        let old = loop {
             let mut rooms = self.rooms.lock().await;
-            if rooms.get(room_id).is_some_and(|s| s.id == id) {
-                let old = rooms.remove(room_id).expect("checked subscription");
-                old.cancel();
-                Some(old)
-            } else {
-                None
-            }
+            let Some(current) = rooms.get(room_id).filter(|s| s.id == id).cloned() else {
+                break None;
+            };
+            let _transition = match current.mutations.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    drop(rooms);
+                    let _guard = current.mutations.lock().await;
+                    continue;
+                }
+            };
+            let old = rooms.remove(room_id).expect("checked subscription");
+            old.cancel();
+            break Some(old);
         };
         if let Some(old) = old {
             old.tasks.wait().await;
@@ -286,6 +445,94 @@ impl Timelines {
         Ok(())
     }
 
+    async fn mutation_subscription(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+    ) -> Result<(Arc<Subscription>, TaskTrackerToken)> {
+        if id.is_empty() || id.len() > 128 {
+            return Err(INVALID);
+        }
+        let rooms = self.rooms.lock().await;
+        let subscription = rooms
+            .get(room_id)
+            .filter(|s| s.id == id && !s.cancel.is_cancelled())
+            .ok_or(STALE_SUBSCRIPTION)?;
+        Ok((subscription.clone(), subscription.tasks.token()))
+    }
+
+    pub async fn edit(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        event_id: &EventId,
+        body: String,
+    ) -> Result<()> {
+        if body.trim().is_empty() || body.len() > 32 * 1024 {
+            return Err(INVALID);
+        }
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let _mutation = subscription.mutations.lock().await;
+        if !self.is_current(room_id, &subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        let timeline = mutation_timeline(&subscription)?;
+        let operation = async {
+            let items = timeline.items().await;
+            let event = items.iter().filter_map(|item| item.as_event())
+                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            if !event.is_own() {
+                return Err(EDIT_FORBIDDEN);
+            }
+            let message = event.content().as_message().filter(|message| body_editable(message))
+                .ok_or(EDIT_UNAVAILABLE)?;
+            let permissions = mutation_permissions(timeline.room()).await?;
+            if !permissions.can_edit(event) {
+                return Err(EDIT_FORBIDDEN);
+            }
+            timeline.edit(&event.identifier(), edited_content(message, body)?).await
+                .map_err(edit_error)
+        };
+        tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
+            result = operation => result,
+        }
+    }
+
+    pub async fn redact(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        event_id: &EventId,
+    ) -> Result<()> {
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let _mutation = subscription.mutations.lock().await;
+        if !self.is_current(room_id, &subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        let timeline = mutation_timeline(&subscription)?;
+        let operation = async {
+            let items = timeline.items().await;
+            let event = items.iter().filter_map(|item| item.as_event())
+                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            if is_redacted(event) || event.redaction_send_state().is_some() {
+                return Err(ALREADY_REDACTED);
+            }
+            if !mutation_permissions(timeline.room()).await?.can_redact(event) {
+                return Err(REDACT_FORBIDDEN);
+            }
+            timeline.redact(&event.identifier(), None).await.map_err(redact_error)
+        };
+        tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
+            result = operation => result,
+        }
+    }
+
     pub async fn retry_decryption(&self, sessions: &[String]) {
         let timelines: Vec<_> = self
             .rooms
@@ -317,6 +564,81 @@ impl Timelines {
     }
 }
 
+fn mutation_timeline(subscription: &Subscription) -> Result<&Arc<Timeline>> {
+    subscription.timeline.get().ok_or(RpcError::new(
+        "subscription_not_ready",
+        "Wait for timeline subscription to complete before changing messages",
+    ))?.as_ref().map_err(|error| *error)
+}
+
+fn edited_content(message: &Message, body: String) -> Result<EditedContent> {
+    let mut content = match message.msgtype() {
+        // A body-only edit is plain text: retain the original subtype, not stale
+        // HTML or URL previews whose content described the preceding body.
+        MessageType::Text(_) => RoomMessageEventContentWithoutRelation::text_plain(body),
+        MessageType::Notice(_) => RoomMessageEventContentWithoutRelation::notice_plain(body),
+        MessageType::Emote(_) => RoomMessageEventContentWithoutRelation::emote_plain(body),
+        MessageType::Audio(_) | MessageType::File(_) | MessageType::Image(_) | MessageType::Video(_) => {
+            // SDK caption edits preserve the attachment/filename/source, including
+            // encrypted media, instead of replacing a media message with m.text.
+            return Ok(EditedContent::MediaCaption {
+                caption: Some(body),
+                formatted_caption: None,
+                mentions: message.mentions().cloned(),
+            });
+        }
+        _ => return Err(EDIT_UNAVAILABLE),
+    };
+    content.mentions = message.mentions().cloned();
+    Ok(EditedContent::RoomMessage(content))
+}
+
+fn edit_error(error: TimelineError) -> RpcError {
+    match error {
+        TimelineError::EventNotInTimeline(_) => EVENT_MISSING,
+        TimelineError::EditError(EditError::RoomError(RoomEditError::NotAuthor)) => EDIT_FORBIDDEN,
+        TimelineError::EditError(EditError::RoomError(
+            RoomEditError::StateEvent | RoomEditError::IncompatibleEditType { .. }
+                | RoomEditError::Deserialize(_),
+        )) | TimelineError::UnsupportedEvent => EDIT_UNAVAILABLE,
+        TimelineError::EditError(EditError::RoomError(RoomEditError::Fetch(error)))
+            if error.client_api_error_kind().is_some_and(|kind| matches!(kind, ErrorKind::Forbidden)) =>
+        {
+            EDIT_FORBIDDEN
+        }
+        TimelineError::EditError(EditError::RoomError(RoomEditError::Fetch(error)))
+            if error.client_api_error_kind() == Some(&ErrorKind::NotFound) =>
+        {
+            EVENT_MISSING
+        }
+        TimelineError::Sdk(error)
+            if error.client_api_error_kind().is_some_and(|kind| matches!(kind, ErrorKind::Forbidden)) =>
+        {
+            EDIT_FORBIDDEN
+        }
+        _ => RpcError::new(
+            "edit_failed",
+            "SDK could not queue this edit; check connection, room access and device verification",
+        ),
+    }
+}
+
+fn redact_error(error: TimelineError) -> RpcError {
+    match error {
+        TimelineError::EventNotInTimeline(_)
+            | TimelineError::RedactError(RedactError::ItemNotFound(_)) => EVENT_MISSING,
+        TimelineError::Sdk(error)
+            if error.client_api_error_kind().is_some_and(|kind| matches!(kind, ErrorKind::Forbidden)) =>
+        {
+            REDACT_FORBIDDEN
+        }
+        _ => RpcError::new(
+            "redaction_failed",
+            "SDK could not queue this redaction; check room access and connection",
+        ),
+    }
+}
+
 fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Room> {
     let room = client.get_room(room_id).ok_or(RpcError::new(
         "room_missing",
@@ -331,8 +653,8 @@ fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Roo
     Ok(room)
 }
 
-fn item(item: &TimelineItem) -> Value {
-    let mut value = json!({"id": item.unique_id().0});
+fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
+    let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false});
     if let Some(event) = item.as_event() {
         value["event_id"] = json!(event.event_id());
         value["transaction_id"] = json!(event.transaction_id());
@@ -347,10 +669,15 @@ fn item(item: &TimelineItem) -> Value {
         }
         value["timestamp"] = json!(event.timestamp());
         value["own"] = json!(event.is_own());
+        value["can_edit"] = json!(permissions.can_edit(event));
+        value["can_redact"] = json!(permissions.can_redact(event));
         let content = event.content();
         if let Some(message) = content.as_message() {
             value["kind"] = json!("message");
             value["body"] = json!(message.body());
+        } else if is_redacted(event) {
+            value["kind"] = json!("redacted");
+            value["body"] = json!("Message deleted");
         } else if content.is_unable_to_decrypt() {
             value["kind"] = json!("encrypted");
             value["body"] =
@@ -395,24 +722,24 @@ fn item(item: &TimelineItem) -> Value {
     value
 }
 
-fn change(diff: VectorDiff<Arc<TimelineItem>>) -> Value {
+fn change(diff: &VectorDiff<Arc<TimelineItem>>, permissions: MutationPermissions) -> Value {
     match diff {
         VectorDiff::Append { values } => {
-            json!({"op":"append", "items":values.iter().map(|i| item(i)).collect::<Vec<_>>()})
+            json!({"op":"append", "items":values.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()})
         }
         VectorDiff::Clear => json!({"op":"clear"}),
-        VectorDiff::PushFront { value } => json!({"op":"push_front", "item":item(&value)}),
-        VectorDiff::PushBack { value } => json!({"op":"push_back", "item":item(&value)}),
+        VectorDiff::PushFront { value } => json!({"op":"push_front", "item":item(value, permissions)}),
+        VectorDiff::PushBack { value } => json!({"op":"push_back", "item":item(value, permissions)}),
         VectorDiff::PopFront => json!({"op":"pop_front"}),
         VectorDiff::PopBack => json!({"op":"pop_back"}),
         VectorDiff::Insert { index, value } => {
-            json!({"op":"insert", "index":index, "item":item(&value)})
+            json!({"op":"insert", "index":index, "item":item(value, permissions)})
         }
-        VectorDiff::Set { index, value } => json!({"op":"set", "index":index, "item":item(&value)}),
+        VectorDiff::Set { index, value } => json!({"op":"set", "index":index, "item":item(value, permissions)}),
         VectorDiff::Remove { index } => json!({"op":"remove", "index":index}),
         VectorDiff::Truncate { length } => json!({"op":"truncate", "length":length}),
         VectorDiff::Reset { values } => {
-            json!({"op":"reset", "items":values.iter().map(|i| item(i)).collect::<Vec<_>>()})
+            json!({"op":"reset", "items":values.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()})
         }
     }
 }
@@ -420,7 +747,14 @@ fn change(diff: VectorDiff<Arc<TimelineItem>>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::owned_room_id;
+    use std::time::Duration;
+    use matrix_sdk::{
+        authentication::matrix::MatrixSession,
+        config::{RequestConfig, SyncSettings},
+        ruma::{api::MatrixVersion, event_id, owned_room_id},
+    };
+    use tokio::sync::mpsc;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path_regex}};
 
     #[tokio::test]
     async fn replacement_revokes_pending_initializer_without_blocking_other_rooms() {
@@ -525,6 +859,350 @@ mod tests {
             );
         }
         drop(operation);
+        timelines.shutdown().await;
+    }
+
+    fn message(event_id: &str, sender: &str, content: Value) -> Value {
+        json!({
+            "type":"m.room.message", "event_id":event_id, "sender":sender,
+            "origin_server_ts":1000, "content":content
+        })
+    }
+
+    fn power_levels(own_level: u8) -> Value {
+        json!({"users":{"@me:example.org":own_level}, "redact":50})
+    }
+
+    async fn sdk_sync(server: &MockServer, client: &Client, levels: Option<Value>, events: Vec<Value>) {
+        let mut state = vec![
+            json!({
+                "type":"m.room.create", "state_key":"", "event_id":"$create",
+                "sender":"@me:example.org", "origin_server_ts":1,
+                "content":{"creator":"@me:example.org", "room_version":"11"}
+            }),
+            json!({
+                "type":"m.room.member", "state_key":"@me:example.org", "event_id":"$member",
+                "sender":"@me:example.org", "origin_server_ts":2, "content":{"membership":"join"}
+            }),
+            json!({
+                "type":"m.room.member", "state_key":"@other:example.org", "event_id":"$other-member",
+                "sender":"@other:example.org", "origin_server_ts":3, "content":{"membership":"join"}
+            }),
+        ];
+        if let Some(content) = levels {
+            state.push(json!({
+                "type":"m.room.power_levels", "state_key":"",
+                "event_id":format!("$powers-{}", uuid::Uuid::new_v4()),
+                "sender":"@me:example.org", "origin_server_ts":4, "content":content
+            }));
+        }
+        let response = json!({
+            "next_batch":uuid::Uuid::new_v4().to_string(),
+            "rooms":{"join":{"!room:example.org":{
+                "state":{"events":state}, "timeline":{"events":events, "limited":false},
+                "ephemeral":{"events":[]}, "account_data":{"events":[]},
+                "unread_notifications":{"notification_count":0, "highlight_count":0}
+            }}},
+            "account_data":{"events":[]}, "to_device":{"events":[]},
+            "device_lists":{"changed":[], "left":[]}, "device_one_time_keys_count":{}
+        });
+        let _sync = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/(r0|v3)/sync$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount_as_scoped(server).await;
+        client.sync_once(SyncSettings::default()).await.unwrap();
+    }
+
+    async fn sdk_fixture(
+        levels: Option<Value>,
+        events: Vec<Value>,
+    ) -> (MockServer, Client, Timelines, mpsc::Receiver<Vec<u8>>) {
+        let server = MockServer::start().await;
+        let client = Client::builder().homeserver_url(server.uri())
+            .server_versions([MatrixVersion::V1_0])
+            .request_config(RequestConfig::new().disable_retry().timeout(Duration::from_secs(5)))
+            .build().await.unwrap();
+        let session: MatrixSession = serde_json::from_value(json!({
+            "user_id":"@me:example.org", "device_id":"DEVICE", "access_token":"test-token"
+        })).unwrap();
+        client.restore_session(session).await.unwrap();
+        // Observe genuine SDK local queue updates, without a fake server echo
+        // or background HTTP retry races. The durable queue remains authoritative.
+        client.send_queue().set_enabled(false).await;
+        client.event_cache().subscribe().unwrap();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/state/m\.room\.encryption/?$"))
+            .respond_with(ResponseTemplate::new(404)
+                .set_body_json(json!({"errcode":"M_NOT_FOUND", "error":"Not encrypted"})))
+            .mount(&server).await;
+        sdk_sync(&server, &client, levels, events).await;
+        let timelines = Timelines::new(CancellationToken::new());
+        let (tx, rx) = mpsc::channel(128);
+        timelines.subscribe(&client, Output::new(tx, CancellationToken::new()),
+            owned_room_id!("!room:example.org"), "active".into()).await.unwrap();
+        (server, client, timelines, rx)
+    }
+
+    async fn snapshot_row(timelines: &Timelines, event_id: &EventId) -> Value {
+        let room = owned_room_id!("!room:example.org");
+        let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+        let timeline = mutation_timeline(&subscription).unwrap();
+        let permissions = mutation_permissions(timeline.room()).await.unwrap_or_default();
+        let items = timeline.items().await;
+        let row = items.iter().find(|item| item.as_event()
+            .is_some_and(|event| event.event_id() == Some(event_id))).unwrap();
+        let value = item(row, permissions);
+        drop(operation);
+        value
+    }
+
+    async fn next_row(
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        event_id: &str,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let bytes = rx.recv().await.expect("timeline output ended");
+                let event: Value = serde_json::from_slice(&bytes).unwrap();
+                let params = &event["params"];
+                let mut rows = Vec::new();
+                if let Some(items) = params["items"].as_array() {
+                    rows.extend(items);
+                }
+                if let Some(changes) = params["changes"].as_array() {
+                    for change in changes {
+                        if let Some(row) = change.get("item") {
+                            rows.push(row);
+                        }
+                        if let Some(items) = change["items"].as_array() {
+                            rows.extend(items);
+                        }
+                    }
+                }
+                if let Some(row) = rows.into_iter()
+                    .find(|row| row["event_id"] == event_id && predicate(row)) {
+                    return row.clone();
+                }
+            }
+        }).await.expect("SDK timeline did not publish expected event update")
+    }
+
+    #[tokio::test]
+    async fn sdk_mutation_permissions_distinguish_author_moderator_and_missing_plaintext() {
+        let mut gone = message("$gone", "@me:example.org", json!({}));
+        gone["unsigned"] = json!({"redacted_because":{
+            "type":"m.room.redaction", "event_id":"$redaction", "sender":"@me:example.org",
+            "origin_server_ts":1001, "content":{"redacts":"$gone"}
+        }});
+        let encrypted = json!({
+            "type":"m.room.encrypted", "event_id":"$encrypted", "sender":"@me:example.org",
+            "origin_server_ts":1000, "content":{
+                "algorithm":"m.megolm.v1.aes-sha2", "ciphertext":"aGVsbG8",
+                "sender_key":"aGVsbG8", "device_id":"DEVICE", "session_id":"unavailable"
+            }
+        });
+        let (server, client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$own", "@me:example.org", json!({"msgtype":"m.text", "body":"own"})),
+            message("$other", "@other:example.org", json!({"msgtype":"m.text", "body":"other"})),
+            gone, encrypted,
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        let own = snapshot_row(&timelines, event_id!("$own")).await;
+        let other = snapshot_row(&timelines, event_id!("$other")).await;
+        assert_eq!(own["can_edit"], true);
+        assert_eq!(own["can_redact"], true);
+        assert_eq!(other["can_edit"], false);
+        assert_eq!(other["can_redact"], false);
+        let encrypted = snapshot_row(&timelines, event_id!("$encrypted")).await;
+        assert_eq!(encrypted["kind"], "encrypted");
+        assert_eq!(encrypted["can_edit"], false);
+        assert_eq!(encrypted["can_redact"], true);
+        let gone = snapshot_row(&timelines, event_id!("$gone")).await;
+        assert_eq!(gone["kind"], "redacted");
+        assert_eq!(gone["can_edit"], false);
+        assert_eq!(gone["can_redact"], false);
+        assert_eq!(timelines.edit(&room, "active", event_id!("$other"), "illegal".into())
+            .await.unwrap_err().code, "edit_forbidden");
+        assert_eq!(timelines.redact(&room, "active", event_id!("$other"))
+            .await.unwrap_err().code, "redaction_forbidden");
+        assert_eq!(timelines.edit(&room, "active", event_id!("$encrypted"), "illegal".into())
+            .await.unwrap_err().code, "edit_unavailable");
+        assert_eq!(timelines.redact(&room, "active", event_id!("$gone"))
+            .await.unwrap_err().code, "already_redacted");
+        for id in ["active", "closed"] {
+            let expected = if id == "active" { "event_missing" } else { "stale_subscription" };
+            assert_eq!(timelines.edit(&room, id, event_id!("$missing"), "new".into())
+                .await.unwrap_err().code, expected);
+            assert_eq!(timelines.redact(&room, id, event_id!("$missing"))
+                .await.unwrap_err().code, expected);
+        }
+        assert_eq!(snapshot_row(&timelines, event_id!("$other")).await["body"], "other");
+        let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+        let timeline = mutation_timeline(&subscription).unwrap();
+        timeline.send(RoomMessageEventContent::text_plain("pending").into()).await.unwrap();
+        let (mut local_items, local_updates) = timeline.subscribe().await;
+        futures_util::pin_mut!(local_updates);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(local) = local_items.iter().find(|item| item.as_event()
+                    .is_some_and(|event| event.event_id().is_none())) {
+                    let flags = item(local, mutation_permissions(timeline.room()).await.unwrap());
+                    assert_eq!(flags["can_edit"], false);
+                    assert_eq!(flags["can_redact"], false);
+                    break;
+                }
+                for diff in local_updates.next().await.unwrap() { diff.apply(&mut local_items); }
+            }
+        }).await.unwrap();
+        drop(operation);
+
+        // A PL-only sync changes capabilities on existing rows, even without
+        // a message diff; a moderator still cannot edit another author's event.
+        sdk_sync(&server, &client, Some(power_levels(50)), vec![]).await;
+        let moderator_row = next_row(&mut rx, "$other", |row| row["can_redact"] == true).await;
+        assert_eq!(moderator_row["id"], other["id"]);
+        assert_eq!(moderator_row["can_edit"], false);
+        assert_eq!(timelines.edit(&room, "active", event_id!("$other"), "illegal".into())
+            .await.unwrap_err().code, "edit_forbidden");
+        timelines.redact(&room, "active", event_id!("$other")).await.unwrap();
+        let tombstone = next_row(&mut rx, "$other", |row| row["kind"] == "redacted").await;
+        assert_eq!(tombstone["id"], other["id"]);
+        assert_eq!(tombstone["event_id"], other["event_id"]);
+        assert_ne!(tombstone["body"], other["body"]);
+        assert_eq!(tombstone["can_redact"], false);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_edits_preserve_message_subtypes_reply_identity_and_media_source() {
+        let encrypted_file = json!({
+            "url":"mxc://example.org/encrypted-image", "v":"v2",
+            "key":{"kty":"oct", "alg":"A256CTR", "key_ops":["encrypt","decrypt"],
+                "k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ext":true},
+            "iv":"AAAAAAAAAAAAAAAAAAAAAA",
+            "hashes":{"sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        });
+        let (_server, _client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$text", "@me:example.org", json!({
+                "msgtype":"m.text", "body":"original", "format":"org.matrix.custom.html",
+                "formatted_body":"<b>original</b>",
+                "m.relates_to":{"m.in_reply_to":{"event_id":"$notice"}},
+                "m.mentions":{"user_ids":["@other:example.org"]}
+            })),
+            message("$notice", "@me:example.org", json!({"msgtype":"m.notice", "body":"notice"})),
+            message("$emote", "@me:example.org", json!({"msgtype":"m.emote", "body":"emote"})),
+            message("$image", "@me:example.org", json!({
+                "msgtype":"m.image", "body":"image.png", "url":"mxc://example.org/image"
+            })),
+            message("$encrypted-image", "@me:example.org", json!({
+                "msgtype":"m.image", "body":"encrypted.png", "file":encrypted_file
+            })),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        for id in ["$text", "$notice", "$emote", "$image", "$encrypted-image"] {
+            let event_id = EventId::parse(id).unwrap();
+            let original = snapshot_row(&timelines, &event_id).await;
+            assert_eq!(original["can_edit"], true);
+            timelines.edit(&room, "active", &event_id, "changed".into()).await.unwrap();
+            let edited = next_row(&mut rx, id, |row| row["body"] == "changed").await;
+            assert_eq!(edited["id"], original["id"]);
+            assert_eq!(edited["event_id"], original["event_id"]);
+        }
+        let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+        let items = mutation_timeline(&subscription).unwrap().items().await;
+        for (id, msgtype) in [
+            ("$text", "m.text"), ("$notice", "m.notice"), ("$emote", "m.emote"),
+            ("$image", "m.image"), ("$encrypted-image", "m.image"),
+        ] {
+            let event_id = EventId::parse(id).unwrap();
+            let event = items.iter().filter_map(|item| item.as_event())
+                .find(|event| event.event_id() == Some(event_id.as_ref())).unwrap();
+            let message = event.content().as_message().unwrap();
+            assert_eq!(message.msgtype().msgtype(), msgtype);
+            assert!(message.is_edited());
+            if id == "$text" {
+                assert_eq!(event.content().in_reply_to().unwrap().event_id.as_str(), "$notice");
+                assert!(message.mentions().unwrap().user_ids.contains(
+                    matrix_sdk::ruma::user_id!("@other:example.org")));
+                let MessageType::Text(text) = message.msgtype() else { panic!("text type changed") };
+                assert!(text.formatted.is_none());
+            }
+            if id == "$image" || id == "$encrypted-image" {
+                let MessageType::Image(image) = message.msgtype() else { panic!("media type changed") };
+                let (filename, source) = if id == "$image" {
+                    ("image.png", json!({"url":"mxc://example.org/image"}))
+                } else {
+                    ("encrypted.png", json!({"file":encrypted_file}))
+                };
+                assert_eq!(image.filename(), filename);
+                let source: matrix_sdk::ruma::events::room::MediaSource =
+                    serde_json::from_value(source).unwrap();
+                assert_eq!(serde_json::to_value(&image.source).unwrap(),
+                           serde_json::to_value(source).unwrap());
+                assert_eq!(image.caption(), Some("changed"));
+            }
+        }
+        drop(operation);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_unknown_and_revoked_power_levels_never_grant_mutation_privileges() {
+        let (server, client, timelines, mut rx) = sdk_fixture(None, vec![
+            message("$own", "@me:example.org", json!({"msgtype":"m.text", "body":"own"})),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        let unknown = snapshot_row(&timelines, event_id!("$own")).await;
+        assert_eq!(unknown["can_edit"], false);
+        assert_eq!(unknown["can_redact"], false);
+        assert_eq!(timelines.edit(&room, "active", event_id!("$own"), "new".into())
+            .await.unwrap_err().code, "permissions_unavailable");
+        assert_eq!(timelines.redact(&room, "active", event_id!("$own"))
+            .await.unwrap_err().code, "permissions_unavailable");
+        sdk_sync(&server, &client, Some(power_levels(0)), vec![]).await;
+        next_row(&mut rx, "$own", |row| row["can_edit"] == true && row["can_redact"] == true).await;
+        sdk_sync(&server, &client, Some(json!({
+            "users":{"@me:example.org":0},
+            "events":{"m.room.message":50, "m.room.redaction":50}
+        })), vec![]).await;
+        let revoked = next_row(&mut rx, "$own", |row| row["can_edit"] == false && row["can_redact"] == false).await;
+        assert_eq!(revoked["id"], unknown["id"]);
+        assert_eq!(timelines.edit(&room, "active", event_id!("$own"), "new".into())
+            .await.unwrap_err().code, "edit_forbidden");
+        assert_eq!(timelines.redact(&room, "active", event_id!("$own"))
+            .await.unwrap_err().code, "redaction_forbidden");
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mutation_lease_orders_replacement_without_blocking_other_rooms() {
+        let timelines = Arc::new(Timelines::new(CancellationToken::new()));
+        let room = owned_room_id!("!room:example.org");
+        let (old, _, operation) = timelines.reserve(room.clone(), "old".into()).await.unwrap();
+        drop(operation);
+        let guard = old.mutations.lock().await;
+        let pending = {
+            let timelines = timelines.clone();
+            let room = room.clone();
+            tokio::spawn(async move { timelines.reserve(room, "replacement".into()).await })
+        };
+        let (_, _, unrelated_operation) = timelines.reserve(
+            owned_room_id!("!unrelated:example.org"), "unrelated".into()).await.unwrap();
+        drop(unrelated_operation);
+        assert!(timelines.is_current(&room, &old).await);
+        drop(guard);
+        let (current, _, operation) = pending.await.unwrap().unwrap();
+        drop(operation);
+        assert!(old.cancel.is_cancelled());
+        assert!(timelines.is_current(&room, &current).await);
+        assert_eq!(timelines.edit(&room, "old", event_id!("$target"), "new".into())
+            .await.unwrap_err().code, "stale_subscription");
+        assert_eq!(timelines.redact(&room, "old", event_id!("$target"))
+            .await.unwrap_err().code, "stale_subscription");
+        timelines.unsubscribe(&room, "replacement").await;
+        assert_eq!(timelines.redact(&room, "replacement", event_id!("$target"))
+            .await.unwrap_err().code, "stale_subscription");
         timelines.shutdown().await;
     }
 }

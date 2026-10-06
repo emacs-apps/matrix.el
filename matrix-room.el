@@ -31,15 +31,22 @@
   "Stable SDK timeline identity attached to generated rows.")
 
 (defvar matrix-room-timeline-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "q") #'quit-window)
-    (define-key map (kbd "g") #'matrix-room-refresh)
-    (define-key map (kbd "n") #'matrix-room-next-message)
-    (define-key map (kbd "p") #'matrix-room-previous-message)
-    (define-key map (kbd "o") #'matrix-message-transient)
-    (define-key map (kbd "?") #'matrix-room-transient)
-    map)
+  (make-sparse-keymap)
   "Keymap active over generated Matrix timeline rows.")
+
+(appkit-bindings-define 'matrix-room-timeline-mode-map 'read-only
+  'return #'matrix-room-return
+  'app-menu #'matrix-room-transient
+  'refresh #'matrix-room-refresh
+  'next-item #'matrix-room-next-message
+  'previous-item #'matrix-room-previous-message
+  'message-menu #'matrix-message-transient
+  'edit #'matrix-message-edit
+  'delete #'matrix-message-delete
+  'history-older #'matrix-room-load-older
+  'latest #'matrix-room-latest
+  'quit #'quit-window
+  'help #'describe-mode)
 
 (define-minor-mode matrix-room-timeline-mode
   "Navigation over the read-only Matrix timeline."
@@ -48,23 +55,108 @@
 (defvar matrix-room-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-chatbuf-mode-map)
-    (define-key map (kbd "C-c C-c") #'matrix-room-send)
-    (define-key map (kbd "C-c RET") #'matrix-room-send)
-    (define-key map (kbd "C-c C-o") #'matrix-composer-transient)
-    (define-key map (kbd "C-c '") #'matrix-room-edit-draft)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
     (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
-    (define-key map (kbd "M-g") matrix-room-navigation-map)
-    (define-key map (kbd "RET") #'matrix-room-return)
     map)
   "Keymap for `matrix-room-mode'.")
 
+(appkit-bindings-define 'matrix-room-mode-map 'input
+  'return #'matrix-room-return
+  'newline #'newline
+  'submit #'matrix-room-send
+  'input-options #'matrix-composer-transient
+  'cancel #'matrix-room-cancel-edit
+  'app-menu #'matrix-room-transient
+  'navigation matrix-room-navigation-map
+  'refresh #'matrix-room-refresh
+  'latest #'matrix-room-latest
+  'help #'describe-mode)
+
 (define-derived-mode matrix-room-mode appkit-chatbuf-mode "Matrix-Room"
   "Matrix room with read-only timeline and editable plain-text composer.
-C-c ' focuses the existing draft; C-c C-c submits it.
+RET sends the draft; Shift-Return inserts a newline.
 Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (appkit-chatbuf-use-timeline-mode #'matrix-room-timeline-mode))
+
+(defun matrix-room--edit-state ()
+  "Return the SDK event edit context, if this composer is editing a message."
+  (let ((aux (appkit-chatbuf-aux-state)))
+    (and (eq (plist-get aux :aux-type) 'edit) aux)))
+
+(defun matrix-room--mutation-params (surface item capability)
+  "Capture ITEM's server event in SURFACE's current SDK subscription.
+CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
+  (let* ((app (appkit-surface-app surface))
+         (state (matrix-runtime-state app))
+         (room-id (cadr (appkit-surface-identity surface)))
+         (subscription (plist-get (matrix-room--timeline state room-id) :subscription_id))
+         (event-id (plist-get item :event_id)))
+    (unless (and (appkit-surface-live-p surface)
+                 (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
+                 (plist-get state :backend-active) (plist-get state :session))
+      (user-error "This Matrix room is not ready for message operations"))
+    (when (plist-get (appkit-surface-model surface) :operation)
+      (user-error "Wait for the current Matrix operation"))
+    (unless (and (stringp subscription) (not (string-empty-p subscription))
+                 (stringp event-id) (not (string-empty-p event-id))
+                 (eq (plist-get item capability) t))
+      (user-error "The selected message cannot be %s"
+                  (if (eq capability :can_edit) "edited" "deleted")))
+    (list :room_id room-id :subscription_id subscription :event_id event-id)))
+
+(defun matrix-room-begin-edit (surface item)
+  "Edit exact SDK ITEM in SURFACE, retaining the preceding ordinary draft."
+  (with-current-buffer (appkit-surface-buffer surface)
+    (matrix-room--mutation-params surface item :can_edit)
+    (unless (and (equal (plist-get item :kind) "message")
+                 (stringp (plist-get item :body)))
+      (user-error "This message has no editable plaintext"))
+    (when (matrix-room--edit-state)
+      (user-error "Finish or cancel the current message edit first"))
+    (appkit-chatbuf-input-state-sync)
+    (appkit-chatbuf-aux-set
+     (list :aux-type 'edit :message-id (plist-get item :id)
+           :event-id (plist-get item :event_id)
+           :subscription (plist-get (matrix-room--timeline
+                                    (matrix-runtime-state (appkit-surface-app surface))
+                                    (cadr (appkit-surface-identity surface))) :subscription_id)
+           :saved-input (copy-sequence (appkit-chatbuf-input-state))
+           :original-body (substring-no-properties (plist-get item :body))))
+    (appkit-chatbuf-input-replace (plist-get item :body))
+    (appkit-surface-send surface '(matrix-composer-context))
+    (appkit-chatbuf-enter-input)))
+
+(defun matrix-room--restore-edit-draft ()
+  "Restore the ordinary draft saved by the active message edit."
+  (let ((saved (plist-get (matrix-room--edit-state) :saved-input)))
+    (appkit-chatbuf-aux-reset)
+    (appkit-chatbuf-input-replace (or saved ""))))
+
+(defun matrix-room-cancel-edit ()
+  "Cancel editing without publishing and restore the preceding draft."
+  (interactive)
+  (let ((surface (matrix--current-surface 'room)))
+    (unless (matrix-room--edit-state) (user-error "There is no message edit to cancel"))
+    (when (plist-get (appkit-surface-model surface) :operation)
+      (user-error "Wait for the pending edit before cancelling"))
+    (matrix-room--restore-edit-draft)
+    (appkit-surface-send surface '(matrix-composer-context))))
+
+(defun matrix-room--edit-params (surface edit)
+  "Resolve EDIT against the current SDK snapshot, never a neighboring row."
+  (let ((item (seq-find
+               (lambda (candidate) (equal (plist-get candidate :id) (plist-get edit :message-id)))
+               (matrix-runtime-room-items (appkit-surface-app surface)
+                                          (cadr (appkit-surface-identity surface))))))
+    (unless (and item
+                 (equal (plist-get item :event_id) (plist-get edit :event-id))
+                 (equal (plist-get edit :subscription)
+                        (plist-get (matrix-room--timeline
+                                    (matrix-runtime-state (appkit-surface-app surface))
+                                    (cadr (appkit-surface-identity surface))) :subscription_id)))
+      (user-error "The message edit target or its timeline is no longer available"))
+    (matrix-room--mutation-params surface item :can_edit)))
 
 (defun matrix-room--metadata (state room-id)
   "Return ROOM-ID metadata from pass-scoped STATE."
@@ -104,7 +196,14 @@ Closing this buffer does not stop account sync."
    (when-let* ((error (plist-get state :last-error)))
      (concat (propertize (format "Account: %s" error) 'face 'error) "\n"))
    (when (plist-get model :operation) "Waiting for account operation…\n")
-   (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))))
+   (when-let* ((notice (plist-get model :notice))) (concat notice "\n"))
+   (when-let* ((edit (matrix-room--edit-state)))
+     (appkit-chatbuf-aux-render
+      :title "Editing message"
+      :preview (appkit-ui-one-line-preview-create :text (plist-get edit :original-body))
+      :cancel-action #'matrix-room-cancel-edit
+      :cancel-help "Cancel message edit and restore the previous draft"
+      :width matrix-room--width))))
 
 (defun matrix-room--row-context (previous item)
   "Group adjacent messages by stable sender and a five-minute interval."
@@ -368,14 +467,9 @@ Closing this buffer does not stop account sync."
                  (when error (matrix--error-text error))))))
 
 (defun matrix-room-return ()
-  "Insert a newline in input; activate only an exact timeline action otherwise."
+  "Send the draft in input; activate exact timeline controls or focus input."
   (interactive)
-  (cond
-   ((appkit-chatbuf-point-in-input-p) (newline))
-   ((get-text-property (point) appkit-ui-action-property)
-    (appkit-ui-activate-at (point)))
-   ((button-at (point)) (push-button (point)))
-   (t (appkit-chatbuf-focus-input))))
+  (appkit-chatbuf-dispatch-return #'matrix-room-send))
 
 (defun matrix-room--move-message (backward)
   "Move to the next semantic message, or previous when BACKWARD."
@@ -420,8 +514,28 @@ Closing this buffer does not stop account sync."
 
 (defun matrix-room--result (model method _result error context)
   "Settle METHOD without clearing a draft newer than captured CONTEXT."
-  (if (not (equal method "message.send"))
-      model
+  (cond
+   ((equal method "message.edit")
+    (if error
+        (progn
+          (when (equal (plist-get (plist-get error :data) :code) "transport_uncertain")
+            (setq model (plist-put model :uncertain-send t)))
+          (plist-put model :notice
+                     (concat "Edit not confirmed: " (matrix--error-text error) " Edits retained.")))
+      (appkit-chatbuf-input-state-sync)
+      (let ((same-edit
+             (and (equal (plist-get (matrix-room--edit-state) :event-id)
+                         (plist-get context :edit-event))
+                  (= (appkit-chatbuf-composer-revision) (plist-get context :revision))
+                  (equal (substring-no-properties (appkit-chatbuf-input-state))
+                         (plist-get context :body)))))
+        (when same-edit (matrix-room--restore-edit-draft))
+        (plist-put model :notice
+                   (if same-edit "Edit accepted by SDK; previous draft restored."
+                     "Edit accepted by SDK; newer edits retained.")))))
+   ((not (equal method "message.send"))
+    model)
+   (t
     (if error
         (progn
           (when (equal (plist-get (plist-get error :data) :code) "transport_uncertain")
@@ -442,7 +556,7 @@ Closing this buffer does not stop account sync."
           (appkit-chatbuf-input-replace ""))
         (plist-put model :notice
                    (concat "Accepted into SDK send queue, not yet necessarily delivered. "
-                           (if same-draft "" "Newer draft retained.")))))))
+                           (if same-draft "" "Newer draft retained."))))))))
 
 (defvar matrix-room--type
   (matrix--surface-type 'matrix-room #'matrix-room-mode #'matrix-room--render)
@@ -478,7 +592,8 @@ text.  An uncertain submission is never retried with a new transaction ID."
     (appkit-chatbuf-input-state-sync)
     (let ((body (substring-no-properties (appkit-chatbuf-input-state)))
           (revision (appkit-chatbuf-composer-revision))
-          (room (matrix-runtime-room app room-id)))
+          (room (matrix-runtime-room app room-id))
+          (edit (matrix-room--edit-state)))
       (when (string-empty-p (string-trim body)) (user-error "The draft is empty"))
       (when (plist-get model :uncertain-send)
         (user-error "Previous submission is uncertain; inspect the timeline, then use C-c C-u"))
@@ -489,8 +604,15 @@ text.  An uncertain submission is never retried with a new transaction ID."
                    (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
                    (equal session (plist-get (matrix-runtime-state app) :session)))
         (user-error "The room or account changed during confirmation; draft retained"))
-      (matrix--request surface "message.send" (list :room_id room-id :body body)
-                       (list :revision revision :body body)))))
+      (unless (equal edit (matrix-room--edit-state))
+        (user-error "The message edit context changed during confirmation; draft retained"))
+      (if edit
+          (let ((params (matrix-room--edit-params surface edit)))
+            (matrix--request surface "message.edit" (append params (list :body body))
+                             (list :revision revision :body body
+                                   :edit-event (plist-get edit :event-id))))
+        (matrix--request surface "message.send" (list :room_id room-id :body body)
+                         (list :revision revision :body body))))))
 
 (defun matrix-room-review-send ()
   "Acknowledge an uncertain submission without sending or changing the draft."

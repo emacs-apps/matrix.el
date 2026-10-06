@@ -38,6 +38,8 @@
 (autoload 'matrix-message-transient "matrix-transient" nil t)
 (autoload 'matrix-composer-transient "matrix-transient" nil t)
 (autoload 'matrix-verify-transient "matrix-transient" nil t)
+(autoload 'matrix-message-edit "matrix-transient" nil t)
+(autoload 'matrix-message-delete "matrix-transient" nil t)
 
 (defvar matrix-navigation-map
   (let ((map (make-sparse-keymap)))
@@ -237,6 +239,9 @@ Register ROOM-ID's timeline when provided; retain the reading position."
       ('(matrix-geometry)
        (appkit-next :model model
                     :render (appkit-projection-change-create :geometry-p t :frame-p t)))
+      ('(matrix-composer-context)
+       (appkit-next :model model
+                    :render (appkit-projection-change-create :frame-p t)))
       (`(matrix-filter ,filter)
        (appkit-next :model (plist-put (copy-sequence model) :filter filter)
                     :render (appkit-projection-change-create :full-p t :frame-p t)))

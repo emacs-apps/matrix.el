@@ -16,16 +16,18 @@
 (defvar matrix-root-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-directory-mode-map)
-    (define-key map (kbd "g") #'matrix-root-refresh)
     (define-key map (kbd "j") #'matrix-join-room)
     (define-key map (kbd "c") #'matrix-create-room)
     (define-key map (kbd "v") #'matrix-devices)
     (define-key map (kbd "D") #'matrix-disconnect)
-    (define-key map (kbd "/") #'matrix-root-filter)
-    (define-key map (kbd "?") #'matrix-root-transient)
-    (define-key map (kbd "M-g") matrix-navigation-map)
     map)
   "Keymap for `matrix-root-mode'.")
+
+(appkit-bindings-define 'matrix-root-mode-map 'read-only
+  'app-menu #'matrix-root-transient
+  'navigation matrix-navigation-map
+  'refresh #'matrix-root-refresh
+  'search #'matrix-root-filter)
 
 (define-derived-mode matrix-root-mode appkit-directory-mode "Matrix"
   "Matrix room directory.  RET opens a room; j joins and c creates a room.")

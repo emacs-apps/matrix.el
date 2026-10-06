@@ -118,6 +118,47 @@
   (let ((id (plist-get item :event_id)))
     (and (stringp id) (not (string-empty-p id)))))
 
+(defun matrix-message-edit (scope)
+  "Edit SCOPE's exact message, never the draft or a nearby timeline row."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (matrix-room-begin-edit (matrix-menu--surface scope) (matrix-menu--message scope)))
+
+(defun matrix-message-delete (scope)
+  "Confirm and redact SCOPE's exact server event through the Matrix SDK."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (let* ((surface (matrix-menu--surface scope))
+         (app (appkit-surface-app surface))
+         (session (copy-tree (plist-get (matrix-runtime-state app) :session)))
+         (params (matrix-room--mutation-params surface (matrix-menu--message scope) :can_redact)))
+    (when (yes-or-no-p "Permanently delete the selected Matrix message? ")
+      (unless (and (eq surface (matrix-menu--surface scope))
+                   (equal session (plist-get (matrix-runtime-state app) :session))
+                   (equal params (matrix-room--mutation-params
+                                  surface (matrix-menu--message scope) :can_redact)))
+        (user-error "The selected message or account changed during confirmation"))
+      (matrix--request surface "message.redact" params
+                       (list :event-id (plist-get params :event_id))))))
+
+(defun matrix-menu--mutation-inapt-p (capability)
+  "Return non-nil when the captured message cannot perform CAPABILITY."
+  (condition-case nil
+      (or (matrix-menu--request-inapt-p)
+          (not (matrix-menu--server-id-p (matrix-menu--message (matrix-menu--scope))))
+          (not (eq (plist-get (matrix-menu--message (matrix-menu--scope)) capability) t)))
+    (user-error t)))
+
+(defun matrix-menu--edit-inapt-p ()
+  "Return whether editing the captured message is unavailable."
+  (or (matrix-menu--mutation-inapt-p :can_edit)
+      (condition-case nil
+          (with-current-buffer (appkit-surface-buffer (matrix-menu--surface (matrix-menu--scope)))
+            (not (null (matrix-room--edit-state))))
+        (user-error t))))
+
+(defun matrix-menu--delete-inapt-p ()
+  "Return whether redacting the captured message is unavailable."
+  (matrix-menu--mutation-inapt-p :can_redact))
+
 (defun matrix-menu--root-entry (scope)
   "Resolve SCOPE's captured actionable directory entry by its public key."
   (let ((surface (matrix-menu--surface scope)))
@@ -330,13 +371,15 @@
   (interactive)
   (setq scope (matrix-menu--capture 'room nil scope))
   (if (matrix-menu-scope-input-p scope)
-      (matrix-composer-transient scope)
+      (transient-setup 'matrix-composer-transient nil nil :scope scope)
     (transient-setup 'matrix-room-transient nil nil :scope scope)))
 
 (transient-define-prefix matrix-message-transient (&optional scope)
   "Actions on the captured SDK message, independent of subsequent point motion."
   [:description matrix-menu--message-description
    ["Message"
+    ("e" "Edit message" matrix-message-edit :inapt-if matrix-menu--edit-inapt-p)
+    ("d" "Delete message" matrix-message-delete :inapt-if matrix-menu--delete-inapt-p)
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
     ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
     ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]
@@ -351,7 +394,14 @@
     ("c" "Send current draft" matrix-room-send :inapt-if matrix-menu--send-inapt-p)
     ("i" "Focus input" matrix-room-edit-draft :advice* matrix-menu--focus-command)
     ("u" "Review uncertain submission" matrix-room-review-send
-     :inapt-if matrix-menu--review-inapt-p)]
+     :inapt-if matrix-menu--review-inapt-p)
+    ("k" "Cancel message edit" matrix-room-cancel-edit
+     :inapt-if (lambda ()
+                 (condition-case nil
+                     (with-current-buffer
+                         (appkit-surface-buffer (matrix-menu--surface (matrix-menu--scope)))
+                       (not (matrix-room--edit-state)))
+                   (user-error t))))]
    ["Navigate" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("r" "Room directory" matrix-accounts)
     ("s" "Switch room" matrix-switch-room)

@@ -13,7 +13,7 @@ use matrix_sdk::{
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     latest_events::LatestEventValue,
     ruma::{
-        OwnedDeviceId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
+        OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
         api::{
             client::{room::create_room, session::get_login_types::v3::LoginType},
             error::ErrorKind,
@@ -113,6 +113,21 @@ struct AvatarParam {
 struct SendParam {
     room_id: OwnedRoomId,
     body: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    event_id: OwnedEventId,
+    body: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedactParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    event_id: OwnedEventId,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -581,6 +596,20 @@ impl Account {
                 }
                 self.timelines
                     .send(&self.client, &args.room_id, args.body)
+                    .await?;
+                Ok(json!({}))
+            }
+            "message.edit" => {
+                let args: EditParam = params(value)?;
+                self.timelines
+                    .edit(&args.room_id, &args.subscription_id, &args.event_id, args.body)
+                    .await?;
+                Ok(json!({}))
+            }
+            "message.redact" => {
+                let args: RedactParam = params(value)?;
+                self.timelines
+                    .redact(&args.room_id, &args.subscription_id, &args.event_id)
                     .await?;
                 Ok(json!({}))
             }

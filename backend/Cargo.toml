@@ -24,6 +24,9 @@ zeroize = "1.8"
 
 tempfile = "3"
 
+[dev-dependencies]
+wiremock = "0.6.5"
+
 [patch.crates-io]
 # Build the locked version from imported source; its build script is relocatable.
 libsqlite3-sys = { path = "../../../third_party/rusqlite/libsqlite3-sys" }

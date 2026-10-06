@@ -16,12 +16,14 @@
 (defvar matrix-verify-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map appkit-directory-mode-map)
-    (define-key map (kbd "g") #'matrix-verify-refresh)
     (define-key map (kbd "v") #'matrix-verification-request)
-    (define-key map (kbd "?") #'matrix-verify-transient)
-    (define-key map (kbd "M-g") matrix-navigation-map)
     map)
   "Keymap for the device and SAS directory.")
+
+(appkit-bindings-define 'matrix-verify-mode-map 'read-only
+  'app-menu #'matrix-verify-transient
+  'navigation matrix-navigation-map
+  'refresh #'matrix-verify-refresh)
 
 (define-derived-mode matrix-verify-mode appkit-directory-mode "Matrix-Verify"
   "Matrix devices and explicit short authentication string verification."
