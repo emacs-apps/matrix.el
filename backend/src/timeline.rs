@@ -1,17 +1,19 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
 
 use eyeball_im::VectorDiff;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use matrix_sdk::{
     Client, RoomState,
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo},
+    room::reply::{EnforceThread, Reply},
     room::edit::{EditError as RoomEditError, EditedContent},
     ruma::{
-        EventId, OwnedEventId, OwnedRoomId, UserId,
+        EventId, OwnedEventId, OwnedRoomId, UInt, UserId,
         api::error::ErrorKind,
         events::{
             MessageLikeEventType,
             room::{
-                message::{MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+                message::{AddMentions, MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation, TextMessageEventContent},
                 power_levels::RoomPowerLevels,
             },
         },
@@ -19,10 +21,10 @@ use matrix_sdk::{
 };
 use matrix_sdk_ui::timeline::{
     EditError, Error as TimelineError, EventSendState, EventTimelineItem, Message, RedactError,
-    RoomExt, Timeline, TimelineDetails, TimelineItem, VirtualTimelineItem,
+    InReplyToDetails, RoomExt, Timeline, TimelineDetails, TimelineItem, VirtualTimelineItem,
 };
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::{io::AsyncReadExt, sync::{Mutex, OnceCell}};
 use tokio_util::{
     sync::CancellationToken,
     task::{TaskTracker, task_tracker::TaskTrackerToken},
@@ -32,6 +34,92 @@ use crate::protocol::{INVALID, NETWORK, Output, Result, RpcError};
 use crate::{media, storage::valid_source_id};
 
 const MAX_SUBSCRIPTIONS: usize = 32;
+const MAX_REPLY_FETCHES: usize = 4;
+const ATTACHMENT_READ_FAILED: RpcError = RpcError::new(
+    "attachment_read_failed", "Cannot read an attachment; select a readable regular local file",
+);
+const SEND_FAILED: RpcError = RpcError::new(
+    "send_failed", "SDK could not queue this message; check room access and device verification",
+);
+const REPLY_UNAVAILABLE: RpcError = RpcError::new(
+    "reply_unavailable", "This event is no longer available for replies in this timeline",
+);
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    path: PathBuf,
+    filename: String,
+    mime_type: String,
+    width: Option<u64>,
+    height: Option<u64>,
+}
+
+struct PreparedAttachment {
+    file: tokio::fs::File,
+    filename: String,
+    mime: mime::Mime,
+    width: Option<UInt>,
+    height: Option<UInt>,
+    capacity: usize,
+}
+
+impl Attachment {
+    async fn prepare(self) -> Result<PreparedAttachment> {
+        if !self.path.is_absolute() || self.filename.trim().is_empty()
+            || self.filename.contains(['/', '\\', '\0'])
+        {
+            return Err(INVALID);
+        }
+        let mime: mime::Mime = self.mime_type.parse().map_err(|_| INVALID)?;
+        if mime.type_() == mime::STAR || mime.subtype() == mime::STAR {
+            return Err(INVALID);
+        }
+        let dimension = |value: u64| {
+            if value == 0 { return Err(INVALID); }
+            UInt::try_from(value).map_err(|_| INVALID)
+        };
+        let width = self.width.map(dimension).transpose()?;
+        let height = self.height.map(dimension).transpose()?;
+        // Open each source before queue admission, but retain handles, not every
+        // file's bytes. O_NONBLOCK prevents a replaced FIFO from hanging admission.
+        let file = tokio::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK)
+            .open(&self.path).await.map_err(|_| ATTACHMENT_READ_FAILED)?;
+        let metadata = file.metadata().await.map_err(|_| ATTACHMENT_READ_FAILED)?;
+        if !metadata.is_file() {
+            return Err(ATTACHMENT_READ_FAILED);
+        }
+        UInt::try_from(metadata.len()).map_err(|_| INVALID)?;
+        let capacity = usize::try_from(metadata.len()).map_err(|_| INVALID)?;
+        Ok(PreparedAttachment { file, filename: self.filename, mime, width, height, capacity })
+    }
+}
+
+impl PreparedAttachment {
+    fn info(&self, size: UInt) -> AttachmentInfo {
+        match self.mime.type_() {
+            mime::IMAGE => AttachmentInfo::Image(BaseImageInfo {
+                size: Some(size), width: self.width, height: self.height, ..Default::default()
+            }),
+            mime::VIDEO => AttachmentInfo::Video(BaseVideoInfo {
+                size: Some(size), width: self.width, height: self.height, ..Default::default()
+            }),
+            mime::AUDIO => AttachmentInfo::Audio(BaseAudioInfo {
+                size: Some(size), ..Default::default()
+            }),
+            _ => AttachmentInfo::File(BaseFileInfo { size: Some(size) }),
+        }
+    }
+}
+
+fn send_outcome(accepted: usize, total: usize, error: Option<RpcError>) -> Result<Value> {
+    if let Some(error) = error {
+        if accepted == 0 { return Err(error); }
+        return Ok(json!({"accepted":accepted, "total":total,
+            "error":{"code":error.code, "message":error.message}}));
+    }
+    Ok(json!({"accepted":accepted, "total":total}))
+}
 const STALE_SUBSCRIPTION: RpcError = RpcError::new(
     "stale_subscription",
     "This timeline subscription is no longer active",
@@ -275,10 +363,18 @@ impl Timelines {
         let initialize = async {
             let reusable = if let Some(old) = old {
                 old.tasks.wait().await;
-                old.timeline
-                    .get()
-                    .and_then(|result| result.as_ref().ok())
-                    .cloned()
+                let candidate = old.timeline.get()
+                    .and_then(|result| result.as_ref().ok()).cloned();
+                if let Some(timeline) = candidate {
+                    // SDK fetch cancellation can leave its details Pending. Never
+                    // transfer that abandoned waiter to a replacement view.
+                    let pending = timeline.items().await.iter().filter_map(|item| item.as_event())
+                        .any(|event| event.content().in_reply_to()
+                            .is_some_and(|reply| matches!(reply.event, TimelineDetails::Pending)));
+                    (!pending).then_some(timeline)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -311,14 +407,39 @@ impl Timelines {
                     let task_cancel = subscription.cancel.clone();
                     let task_room = room_id.clone();
                     let task_id = subscription.id.clone();
+                    let task_timeline = timeline.clone();
                     self.tasks.spawn(subscription.tasks.track_future(async move {
                         futures_util::pin_mut!(stream);
                         let mut revision = 0u64;
                         let mut room_updates_open = true;
+                        let mut reply_fetches = FuturesUnordered::new();
+                        let mut attempted_replies = HashSet::new();
                         loop {
+                            // Only SDK Unavailable details are admitted, once per
+                            // source event in this subscription. No HTTP or reply
+                            // content index: the SDK vector remains authoritative.
+                            for event in items.iter().filter_map(|item| item.as_event()) {
+                                if reply_fetches.len() == MAX_REPLY_FETCHES { break; }
+                                let Some(event_id) = event.event_id() else { continue; };
+                                if !event.content().in_reply_to().is_some_and(|reply|
+                                    matches!(reply.event, TimelineDetails::Unavailable))
+                                    || attempted_replies.contains(event_id)
+                                {
+                                    continue;
+                                }
+                                attempted_replies.insert(event_id.to_owned());
+                                let timeline = task_timeline.clone();
+                                let event_id = event_id.to_owned();
+                                reply_fetches.push(async move {
+                                    // SDK publishes Pending/Ready/Error through this
+                                    // same vector stream; Error is never auto-retried.
+                                    let _ = timeline.fetch_details_for_event(&event_id).await;
+                                });
+                            }
                             tokio::select! {
                                 biased;
                                 _ = task_cancel.cancelled() => break,
+                                _ = reply_fetches.next(), if !reply_fetches.is_empty() => {}
                                 update = room_updates.recv(), if room_updates_open => {
                                     if matches!(update, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                                         room_updates_open = false;
@@ -460,24 +581,81 @@ impl Timelines {
         result
     }
 
-    pub async fn send(&self, client: &Client, room_id: &OwnedRoomId, body: String) -> Result<()> {
-        let room = joined_room(client, room_id)?;
-        let timeline = self.rooms.lock().await.get(room_id).and_then(|s| {
-            s.timeline
-                .get()
-                .and_then(|result| result.as_ref().ok())
-                .cloned()
-        });
-        let timeline = match timeline {
-            Some(timeline) => timeline,
-            None => Arc::new(room.timeline().await.map_err(|_| NETWORK)?),
-        };
-        // The SDK persists the queue and owns retries/transaction IDs even when this view is gone.
-        timeline
-            .send(RoomMessageEventContent::text_plain(body).into())
-            .await
-            .map_err(|_| NETWORK)?;
-        Ok(())
+    pub async fn send(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        body: String,
+        attachments: Vec<Attachment>,
+        reply_to: Option<OwnedEventId>,
+    ) -> Result<Value> {
+        if body.len() > 32 * 1024 || (body.trim().is_empty() && attachments.is_empty()) {
+            return Err(INVALID);
+        }
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let mut prepared = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            prepared.push(attachment.prepare().await?);
+        }
+        let _mutation = subscription.mutations.lock().await;
+        if !self.is_current(room_id, &subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        let timeline = mutation_timeline(&subscription)?;
+        if timeline.room().state() != RoomState::Joined {
+            return Err(RpcError::new("room_not_joined", "Join this room before sending messages"));
+        }
+        if let Some(target) = &reply_to {
+            let items = timeline.items().await;
+            if !items.iter().filter_map(|item| item.as_event())
+                .any(|event| event.event_id() == Some(target.as_ref()) && event.can_be_replied_to())
+            {
+                return Err(REPLY_UNAVAILABLE);
+            }
+        }
+        // Once admitted, await SDK durable acceptance, rather than cancelling an
+        // enqueue mid-persist and incorrectly reporting that nothing was accepted.
+        // View transitions wait on this lock; the account dispatch holds its lease.
+        if prepared.is_empty() {
+            let result = match reply_to {
+                Some(target) => timeline.send_reply(
+                    RoomMessageEventContentWithoutRelation::text_plain(body), target,
+                ).await,
+                None => timeline.send(RoomMessageEventContent::text_plain(body).into()).await,
+            };
+            return send_outcome(usize::from(result.is_ok()), 1, result.err().map(|_| SEND_FAILED));
+        }
+        let total = prepared.len();
+        let mut accepted = 0;
+        let mut caption = (!body.is_empty()).then(|| TextMessageEventContent::plain(body));
+        for mut attachment in prepared {
+            if !self.is_current(room_id, &subscription).await {
+                return send_outcome(accepted, total, Some(STALE_SUBSCRIPTION));
+            }
+            let mut data = Vec::with_capacity(attachment.capacity);
+            if attachment.file.read_to_end(&mut data).await.is_err() {
+                return send_outcome(accepted, total, Some(ATTACHMENT_READ_FAILED));
+            }
+            let size = match UInt::try_from(data.len()) {
+                Ok(size) => size,
+                Err(_) => return send_outcome(accepted, total, Some(INVALID)),
+            };
+            let config = AttachmentConfig::new().info(attachment.info(size))
+                .caption(caption.take()).reply(reply_to.as_ref().map(|target| Reply {
+                    event_id: target.clone(), enforce_thread: EnforceThread::MaybeThreaded,
+                    add_mentions: AddMentions::Yes,
+                }));
+            // SDK owns media-cache persistence, upload/encryption, transaction IDs
+            // and retries. A successful return releases this local file's ownership.
+            if timeline.room().send_queue().send_attachment(
+                attachment.filename, attachment.mime, data, config,
+            ).await.is_err() {
+                return send_outcome(accepted, total, Some(SEND_FAILED));
+            }
+            accepted += 1;
+        }
+        send_outcome(accepted, total, None)
     }
 
     async fn mutation_subscription(
@@ -759,8 +937,41 @@ fn image_metadata(image: &matrix_sdk::ruma::events::room::message::ImageMessageE
     }
     value
 }
+fn reply_metadata(reply: &InReplyToDetails) -> Value {
+    let mut value = json!({"event_id":reply.event_id});
+    match &reply.event {
+        TimelineDetails::Unavailable => value["status"] = json!("unavailable"),
+        TimelineDetails::Pending => value["status"] = json!("pending"),
+        TimelineDetails::Error(_) => value["status"] = json!("error"),
+        TimelineDetails::Ready(event) => {
+            value["status"] = json!("ready");
+            value["sender"] = json!(event.sender);
+            if let TimelineDetails::Ready(profile) = &event.sender_profile {
+                if let Some(name) = &profile.display_name {
+                    value["sender_name"] = json!(name);
+                }
+            }
+            if let Some(message) = event.content.as_message() {
+                value["kind"] = json!("message");
+                value["body"] = json!(message.body());
+            } else if event.content.is_redacted() {
+                value["kind"] = json!("redacted");
+                value["body"] = json!("Message deleted");
+            } else if event.content.is_unable_to_decrypt() {
+                value["kind"] = json!("encrypted");
+                value["body"] = json!("Encrypted message — keys unavailable");
+            } else {
+                value["kind"] = json!("state");
+                value["body"] = json!(event.content.event_type_str()
+                    .unwrap_or_else(|| "Redacted event".into()));
+            }
+        }
+    }
+    value
+}
+
 fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
-    let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false});
+    let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false, "can_reply":false});
     if let Some(event) = item.as_event() {
         value["event_id"] = json!(event.event_id());
         value["transaction_id"] = json!(event.transaction_id());
@@ -777,6 +988,10 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
         value["own"] = json!(event.is_own());
         value["can_edit"] = json!(permissions.can_edit(event));
         value["can_redact"] = json!(permissions.can_redact(event));
+        value["can_reply"] = json!(event.can_be_replied_to());
+        if let Some(reply) = event.content().in_reply_to() {
+            value["reply"] = reply_metadata(reply);
+        }
         let content = event.content();
         if let Some(message) = content.as_message() {
             value["kind"] = json!("message");
@@ -1027,7 +1242,14 @@ mod tests {
         levels: Option<Value>,
         events: Vec<Value>,
     ) -> (MockServer, Client, Timelines, mpsc::Receiver<Vec<u8>>) {
-        let server = MockServer::start().await;
+        sdk_fixture_with_server(MockServer::start().await, levels, events).await
+    }
+
+    async fn sdk_fixture_with_server(
+        server: MockServer,
+        levels: Option<Value>,
+        events: Vec<Value>,
+    ) -> (MockServer, Client, Timelines, mpsc::Receiver<Vec<u8>>) {
         let client = Client::builder().homeserver_url(server.uri())
             .server_versions([MatrixVersion::V1_0])
             .request_config(RequestConfig::new().disable_retry().timeout(Duration::from_secs(5)))
@@ -1490,6 +1712,376 @@ mod tests {
         timelines.unsubscribe(&room, "replacement").await;
         assert_eq!(timelines.redact(&room, "replacement", event_id!("$target"))
             .await.unwrap_err().code, "stale_subscription");
+        timelines.shutdown().await;
+    }
+
+    fn attachment(path: &std::path::Path, filename: &str, mime_type: &str) -> Attachment {
+        Attachment { path: path.into(), filename: filename.into(), mime_type: mime_type.into(),
+            width: None, height: None }
+    }
+
+    async fn queued_content(client: &Client) -> Vec<Value> {
+        let echoes = client.send_queue().local_echoes().await.unwrap();
+        echoes.get(&owned_room_id!("!room:example.org")).into_iter().flatten()
+            .filter_map(|echo| {
+                let matrix_sdk::send_queue::LocalEchoContent::Event { serialized_event, .. } =
+                    &echo.content else { return None; };
+                Some(serde_json::from_str(serialized_event.raw().0.json().get()).unwrap())
+            }).collect()
+    }
+
+    fn reply_message(event_id: &str, target: &str) -> Value {
+        message(event_id, "@me:example.org", json!({
+            "msgtype":"m.text", "body":"response",
+            "m.relates_to":{"m.in_reply_to":{"event_id":target}}
+        }))
+    }
+
+    #[tokio::test]
+    async fn sdk_send_queues_typed_media_first_caption_reply_and_owned_bytes() {
+        let (_server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$target", "@other:example.org", json!({"msgtype":"m.text", "body":"target"})),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("image.png");
+        let file_path = directory.path().join("document.bin");
+        std::fs::write(&image_path, IMAGE_PNG).unwrap();
+        std::fs::write(&file_path, b"document").unwrap();
+        let mut image = attachment(&image_path, "image.png", "image/png");
+        image.width = Some(1);
+        image.height = Some(1);
+        assert_eq!(timelines.send(&room, "active", "caption".into(),
+            vec![image, attachment(&file_path, "document.bin", "application/octet-stream")],
+            Some(event_id!("$target").to_owned())).await.unwrap(),
+            json!({"accepted":2, "total":2}));
+        std::fs::remove_file(&image_path).unwrap();
+        std::fs::remove_file(&file_path).unwrap();
+        let content = queued_content(&client).await;
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["msgtype"], "m.image");
+        assert_eq!(content[0]["body"], "caption");
+        assert_eq!(content[0]["filename"], "image.png");
+        assert_eq!(content[0]["info"]["size"], IMAGE_PNG.len());
+        assert_eq!(content[0]["info"]["mimetype"], "image/png");
+        assert_eq!(content[0]["info"]["w"], 1);
+        assert_eq!(content[0]["info"]["h"], 1);
+        assert_eq!(content[1]["msgtype"], "m.file");
+        assert_eq!(content[1]["body"], "document.bin");
+        assert_eq!(content[1]["info"]["size"], 8);
+        for (content, bytes) in content.iter().zip([IMAGE_PNG, b"document".as_slice()]) {
+            assert_eq!(content["m.relates_to"]["m.in_reply_to"]["event_id"], "$target");
+            assert_eq!(content["m.mentions"]["user_ids"], json!(["@other:example.org"]));
+            let source: matrix_sdk::ruma::events::room::MediaSource =
+                serde_json::from_value(json!({"url":content["url"]})).unwrap();
+            let request = matrix_sdk::media::MediaRequestParameters {
+                source, format: matrix_sdk::media::MediaFormat::File,
+            };
+            assert_eq!(client.media().get_media_content(&request, true).await.unwrap(), bytes);
+        }
+        assert_eq!(timelines.send(&room, "active", "text reply".into(), vec![],
+            Some(event_id!("$target").to_owned())).await.unwrap(),
+            json!({"accepted":1, "total":1}));
+        let content = queued_content(&client).await;
+        assert_eq!(content[2]["msgtype"], "m.text");
+        assert_eq!(content[2]["body"], "text reply");
+        assert_eq!(content[2]["m.relates_to"]["m.in_reply_to"]["event_id"], "$target");
+        let source = directory.path().join("only.png");
+        std::fs::write(&source, IMAGE_PNG).unwrap();
+        assert_eq!(timelines.send(&room, "active", String::new(),
+            vec![attachment(&source, "only.png", "application/octet-stream")], None)
+            .await.unwrap(), json!({"accepted":1, "total":1}));
+        let content = queued_content(&client).await;
+        assert_eq!(content[3]["msgtype"], "m.file");
+        assert_eq!(content[3]["body"], "only.png");
+        assert!(content[3].get("filename").is_none());
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_send_validation_and_revoked_admission_leave_queue_unchanged() {
+        let (_server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        let room = owned_room_id!("!room:example.org");
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), IMAGE_PNG).unwrap();
+        for invalid in [
+            attachment(source.path(), "bad.png", "not a mime type"),
+            attachment(source.path(), "bad.png", "image/*"),
+            attachment(std::path::Path::new("relative.png"), "bad.png", "image/png"),
+            attachment(source.path().parent().unwrap(), "directory", "application/octet-stream"),
+            Attachment { width: Some(0), ..attachment(source.path(), "bad.png", "image/png") },
+        ] {
+            assert!(timelines.send(&room, "active", "caption".into(),
+                vec![attachment(source.path(), "good.png", "image/png"), invalid], None)
+                .await.is_err());
+            assert!(queued_content(&client).await.is_empty());
+        }
+        assert_eq!(timelines.send(&room, "active", String::new(), vec![], None)
+            .await.unwrap_err().code, "invalid_params");
+        assert_eq!(timelines.send(&room, "active", "x".repeat(32 * 1024 + 1), vec![], None)
+            .await.unwrap_err().code, "invalid_params");
+        assert_eq!(timelines.send(&room, "active", "reply".into(), vec![],
+            Some(event_id!("$missing").to_owned())).await.unwrap_err().code, "reply_unavailable");
+        let timelines = Arc::new(timelines);
+        let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+        drop(operation);
+        let guard = subscription.mutations.lock().await;
+        let send = {
+            let timelines = timelines.clone();
+            let room = room.clone();
+            tokio::spawn(async move {
+                timelines.send(&room, "active", "must not publish".into(), vec![], None).await
+            })
+        };
+        // A stream/account cancellation revokes an admission waiting on the
+        // mutation fence; it cannot enqueue using its captured generation.
+        subscription.cancel.cancel();
+        drop(guard);
+        assert_eq!(send.await.unwrap().unwrap_err().code, "stale_subscription");
+        assert!(queued_content(&client).await.is_empty());
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_send_partial_result_preserves_confirmed_prefix_and_zero_is_outer_error() {
+        let (_server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        let room = owned_room_id!("!room:example.org");
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), IMAGE_PNG).unwrap();
+        // Linux exposes a regular, openable file whose read at offset zero
+        // genuinely fails. No fake SDK forwarding or injected queue result.
+        let unreadable = std::path::Path::new("/proc/self/mem");
+        let result = timelines.send(&room, "active", "consumed caption".into(), vec![
+            attachment(source.path(), "accepted.png", "image/png"),
+            attachment(unreadable, "memory.bin", "application/octet-stream"),
+        ], None).await.unwrap();
+        assert_eq!(result["accepted"], 1);
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["error"]["code"], "attachment_read_failed");
+        let content = queued_content(&client).await;
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["body"], "consumed caption");
+        assert_eq!(content[0]["filename"], "accepted.png");
+        assert_eq!(timelines.send(&room, "active", String::new(),
+            vec![attachment(unreadable, "memory.bin", "application/octet-stream")], None)
+            .await.unwrap_err().code, "attachment_read_failed");
+        assert_eq!(queued_content(&client).await.len(), 1);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_reply_projection_tracks_ready_edits_redaction_and_no_fallback_inference() {
+        let (server, client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$target", "@other:example.org", json!({"msgtype":"m.text", "body":"original"})),
+            reply_message("$reply", "$target"),
+            json!({
+                "type":"m.room.encrypted", "event_id":"$encrypted-target",
+                "sender":"@other:example.org", "origin_server_ts":1000,
+                "content":{"algorithm":"m.megolm.v1.aes-sha2", "ciphertext":"aGVsbG8",
+                    "sender_key":"aGVsbG8", "device_id":"OTHER", "session_id":"unavailable"}
+            }),
+            reply_message("$encrypted-reply", "$encrypted-target"),
+            json!({
+                "type":"m.room.topic", "state_key":"", "event_id":"$state-target",
+                "sender":"@other:example.org", "origin_server_ts":1000, "content":{"topic":"topic"}
+            }),
+            reply_message("$state-reply", "$state-target"),
+            message("$fallback", "@other:example.org", json!({
+                "msgtype":"m.text", "body":"> <@me:example.org> pretend quote\n\nplain",
+                "format":"org.matrix.custom.html",
+                "formatted_body":"<mx-reply><blockquote>not a relationship</blockquote></mx-reply>plain"
+            })),
+        ]).await;
+        let original = snapshot_row(&timelines, event_id!("$reply")).await;
+        assert_eq!(original["can_reply"], true);
+        assert_eq!(original["reply"]["event_id"], "$target");
+        assert_eq!(original["reply"]["status"], "ready");
+        assert_eq!(original["reply"]["sender"], "@other:example.org");
+        assert_eq!(original["reply"]["kind"], "message");
+        assert_eq!(original["reply"]["body"], "original");
+        assert!(snapshot_row(&timelines, event_id!("$fallback")).await.get("reply").is_none());
+        let encrypted = snapshot_row(&timelines, event_id!("$encrypted-reply")).await;
+        assert_eq!(encrypted["reply"]["status"], "ready");
+        assert_eq!(encrypted["reply"]["kind"], "encrypted");
+        assert_eq!(encrypted["reply"]["event_id"], "$encrypted-target");
+        assert_ne!(encrypted["reply"]["body"], "aGVsbG8");
+        let state = snapshot_row(&timelines, event_id!("$state-reply")).await;
+        assert_eq!(state["reply"]["status"], "ready");
+        assert_eq!(state["reply"]["kind"], "state");
+        assert_eq!(state["reply"]["event_id"], "$state-target");
+        sdk_sync(&server, &client, None, vec![
+            message("$edit-target", "@other:example.org", json!({
+                "msgtype":"m.text", "body":"* changed",
+                "m.new_content":{"msgtype":"m.text", "body":"changed"},
+                "m.relates_to":{"rel_type":"m.replace", "event_id":"$target"}
+            })),
+        ]).await;
+        let edited = next_row(&mut rx, "$reply", |row| row["reply"]["body"] == "changed").await;
+        assert_eq!(edited["id"], original["id"]);
+        assert_eq!(edited["reply"]["event_id"], "$target");
+        sdk_sync(&server, &client, None, vec![json!({
+            "type":"m.room.redaction", "event_id":"$redact-target", "sender":"@other:example.org",
+            "origin_server_ts":2000, "redacts":"$target", "content":{"redacts":"$target"}
+        })]).await;
+        let redacted = next_row(&mut rx, "$reply", |row| row["reply"]["kind"] == "redacted").await;
+        assert_eq!(redacted["reply"]["status"], "ready");
+        assert_eq!(redacted["reply"]["event_id"], "$target");
+        assert_ne!(redacted["reply"]["body"], "changed");
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_unloaded_reply_fetch_publishes_ready_error_without_blocking_vector_updates() {
+        let server = MockServer::start().await;
+        let mut remote = message("$remote", "@other:example.org",
+            json!({"msgtype":"m.text", "body":"remote preview"}));
+        remote["room_id"] = json!("!room:example.org");
+        Mock::given(method("GET")).and(path_regex(r"/event/.*remote$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(remote)
+                .set_delay(Duration::from_secs(2)))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET")).and(path_regex(r"/event/.*gone$"))
+            .respond_with(ResponseTemplate::new(404)
+                .set_body_json(json!({"errcode":"M_NOT_FOUND", "error":"gone"})))
+            .expect(1).mount(&server).await;
+        let (server, client, timelines, mut rx) = sdk_fixture_with_server(server,
+            Some(power_levels(0)), vec![
+                reply_message("$remote-reply", "$remote"), reply_message("$gone-reply", "$gone"),
+            ]).await;
+        next_row(&mut rx, "$remote-reply", |row| row["reply"]["status"] == "unavailable").await;
+        next_row(&mut rx, "$remote-reply", |row| row["reply"]["status"] == "pending").await;
+        sdk_sync(&server, &client, None, vec![
+            message("$live", "@other:example.org", json!({"msgtype":"m.text", "body":"live"})),
+        ]).await;
+        tokio::time::timeout(Duration::from_secs(1),
+            next_row(&mut rx, "$live", |row| row["body"] == "live")).await
+            .expect("reply fetch blocked the live SDK vector stream");
+        let ready = next_row(&mut rx, "$remote-reply", |row| row["reply"]["status"] == "ready").await;
+        assert_eq!(ready["reply"]["event_id"], "$remote");
+        assert_eq!(ready["reply"]["sender"], "@other:example.org");
+        assert_eq!(ready["reply"]["body"], "remote preview");
+        let error = snapshot_row(&timelines, event_id!("$gone-reply")).await;
+        assert_eq!(error["reply"]["status"], "error");
+        assert_eq!(error["reply"]["event_id"], "$gone");
+        assert!(error["reply"].get("body").is_none());
+        sdk_sync(&server, &client, Some(power_levels(50)), vec![]).await;
+        next_row(&mut rx, "$gone-reply", |row| row["can_redact"] == true).await;
+        assert_eq!(snapshot_row(&timelines, event_id!("$gone-reply")).await["reply"]["status"], "error");
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_reply_fetches_are_bounded_and_replacement_does_not_inherit_abandoned_pending() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let admitted = Arc::new(tokio::sync::Notify::new());
+        let request_count = requests.clone();
+        let request_admitted = admitted.clone();
+        Mock::given(method("GET")).and(path_regex(r"/event/.*unloaded-[0-9]+$"))
+            .respond_with(move |_: &wiremock::Request| {
+                if request_count.fetch_add(1, Ordering::SeqCst) + 1 == MAX_REPLY_FETCHES {
+                    request_admitted.notify_one();
+                }
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"errcode":"M_NOT_FOUND", "error":"unavailable"}))
+                    .set_delay(Duration::from_secs(2))
+            }).mount(&server).await;
+        let events = (0..8).map(|index|
+            reply_message(&format!("$reply-{index}"), &format!("$unloaded-{index}"))).collect();
+        let (server, client, timelines, mut rx) = sdk_fixture_with_server(server,
+            Some(power_levels(0)), events).await;
+        tokio::time::timeout(Duration::from_secs(1), admitted.notified()).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), MAX_REPLY_FETCHES);
+        sdk_sync(&server, &client, None, vec![
+            message("$still-live", "@other:example.org", json!({"msgtype":"m.text", "body":"live"})),
+        ]).await;
+        tokio::time::timeout(Duration::from_secs(1),
+            next_row(&mut rx, "$still-live", |_| true)).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), MAX_REPLY_FETCHES);
+        let (tx, mut replacement_rx) = mpsc::channel(128);
+        timelines.subscribe(&client, Output::new(tx, CancellationToken::new()),
+            owned_room_id!("!room:example.org"), "replacement".into()).await.unwrap();
+        let reset: Value = serde_json::from_slice(&replacement_rx.recv().await.unwrap()).unwrap();
+        assert_eq!(reset["params"]["subscription_id"], "replacement");
+        assert!(reset["params"]["items"].as_array().unwrap().iter()
+            .filter_map(|row| row.get("reply"))
+            .all(|reply| reply["status"] != "pending"));
+        assert_eq!(timelines.send(&owned_room_id!("!room:example.org"), "active",
+            "stale".into(), vec![], None).await.unwrap_err().code, "stale_subscription");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut errors = HashSet::new();
+            while errors.len() < 8 {
+                let frame: Value = serde_json::from_slice(
+                    &replacement_rx.recv().await.expect("replacement output ended")).unwrap();
+                let params = &frame["params"];
+                let mut rows = Vec::new();
+                if let Some(items) = params["items"].as_array() { rows.extend(items); }
+                if let Some(changes) = params["changes"].as_array() {
+                    for change in changes {
+                        if let Some(row) = change.get("item") { rows.push(row); }
+                        if let Some(items) = change["items"].as_array() { rows.extend(items); }
+                    }
+                }
+                for row in rows {
+                    if row["reply"]["status"] == "error" {
+                        errors.insert(row["event_id"].as_str().unwrap().to_owned());
+                    }
+                }
+            }
+        }).await.expect("replacement inherited abandoned SDK Pending replies");
+        assert!(queued_content(&client).await.is_empty());
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_encrypted_media_upload_survives_source_release_and_owns_ciphertext_metadata() {
+        let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        sdk_sync(&server, &client, None, vec![json!({
+            "type":"m.room.encryption", "state_key":"", "event_id":"$encryption",
+            "sender":"@me:example.org", "origin_server_ts":1,
+            "content":{"algorithm":"m.megolm.v1.aes-sha2"}
+        })]).await;
+        let room_id = owned_room_id!("!room:example.org");
+        let room = client.get_room(&room_id).unwrap();
+        assert!(room.encryption_state().is_encrypted());
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), IMAGE_PNG).unwrap();
+        timelines.send(&room_id, "active", "encrypted caption".into(),
+            vec![attachment(source.path(), "secret.png", "image/png")], None).await.unwrap();
+        source.close().unwrap();
+        let queue = room.send_queue();
+        let disable_after_upload = queue.clone();
+        Mock::given(method("POST")).and(path_regex(r"^/_matrix/media/(r0|v3)/upload$"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert_eq!(request.body.len(), IMAGE_PNG.len());
+                assert_ne!(request.body, IMAGE_PNG);
+                // Stop before the next queued request (the encrypted room event),
+                // so this test exercises real media encryption without key fixtures.
+                disable_after_upload.set_enabled(false);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"content_uri":"mxc://example.org/sdk-encrypted"}))
+            }).expect(1).mount(&server).await;
+        let (_, mut updates) = queue.subscribe().await.unwrap();
+        client.send_queue().set_enabled(true).await;
+        let source = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let matrix_sdk::send_queue::RoomSendQueueUpdate::MediaUpload {
+                    file: Some(source), ..
+                } = updates.recv().await.unwrap() {
+                    break source;
+                }
+            }
+        }).await.unwrap();
+        let matrix_sdk::ruma::events::room::MediaSource::Encrypted(file) = &source
+            else { panic!("SDK uploaded plaintext media to an encrypted room") };
+        assert_eq!(file.url.as_str(), "mxc://example.org/sdk-encrypted");
+        assert_eq!(file.version, "v2");
+        let request = matrix_sdk::media::MediaRequestParameters {
+            source, format: matrix_sdk::media::MediaFormat::File,
+        };
+        assert_eq!(client.media().get_media_content(&request, true).await.unwrap(), IMAGE_PNG);
+        assert_eq!(queued_content(&client).await.len(), 1);
         timelines.shutdown().await;
     }
 }

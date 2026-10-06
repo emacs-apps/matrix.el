@@ -36,7 +36,7 @@ use crate::{
     media,
     protocol::{INVALID, NETWORK, Output, Result, RpcError, params},
     storage::{SavedSession, Store},
-    timeline::Timelines,
+    timeline::{Attachment, Timelines},
     verification::Verifications,
 };
 
@@ -120,7 +120,11 @@ struct ImageParam {
 #[serde(deny_unknown_fields)]
 struct SendParam {
     room_id: OwnedRoomId,
+    subscription_id: String,
     body: String,
+    #[serde(default)]
+    attachments: Vec<Attachment>,
+    reply_to: Option<OwnedEventId>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -622,13 +626,10 @@ impl Account {
             }
             "message.send" => {
                 let args: SendParam = params(value)?;
-                if args.body.trim().is_empty() || args.body.len() > 32 * 1024 {
-                    return Err(INVALID);
-                }
                 self.timelines
-                    .send(&self.client, &args.room_id, args.body)
-                    .await?;
-                Ok(json!({}))
+                    .send(&args.room_id, &args.subscription_id, args.body,
+                        args.attachments, args.reply_to)
+                    .await
             }
             "message.edit" => {
                 let args: EditParam = params(value)?;
