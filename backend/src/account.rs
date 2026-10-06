@@ -110,6 +110,14 @@ struct AvatarParam {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ImageParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    event_id: OwnedEventId,
+    source_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SendParam {
     room_id: OwnedRoomId,
     body: String,
@@ -296,6 +304,29 @@ impl Backend {
                         &self.avatar_slots,
                     )
                     .await?;
+                    return Ok(json!({"path":path}));
+                }
+                if method == "media.image" {
+                    let args: ImageParam = params(value)?;
+                    let client = account.client.clone();
+                    let generation = account.generation.clone();
+                    let cancel = account.cancel.clone();
+                    let timelines = account.timelines.clone();
+                    let _operation = account.tasks.token();
+                    drop(slot);
+                    let lease = timelines.image_lease(
+                        &args.room_id, &args.subscription_id, &args.event_id, args.source_id,
+                    ).await?;
+                    let path = media::image(
+                        self.store.clone(),
+                        client,
+                        generation,
+                        &timelines,
+                        &lease,
+                        cancel,
+                        self.timeline_cancel.clone(),
+                        &self.avatar_slots,
+                    ).await?;
                     return Ok(json!({"path":path}));
                 }
                 account.dispatch(&self.store, method, value).await
@@ -957,6 +988,30 @@ fn empty(value: Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_rpc_accepts_only_timeline_scoped_identity_not_media_urls_or_keys() {
+        let value = json!({
+            "room_id":"!room:example.org", "subscription_id":"active",
+            "event_id":"$image", "source_id":"0".repeat(64)
+        });
+        let args: ImageParam = params(value.clone()).unwrap();
+        assert_eq!(args.event_id.as_str(), "$image");
+        for (field, content) in [
+            ("uri", json!("mxc://example.org/image")),
+            ("url", json!("https://example.org/image")),
+            ("file", json!({"key":"secret"})),
+        ] {
+            let mut extra = value.clone();
+            extra[field] = content;
+            assert!(params::<ImageParam>(extra).is_err());
+        }
+        for field in ["room_id", "subscription_id", "event_id", "source_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(params::<ImageParam>(missing).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn import_snapshot_rejects_symlinks_and_nonregular_files() {

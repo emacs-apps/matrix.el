@@ -6,7 +6,7 @@ use matrix_sdk::{
     Client, RoomState,
     room::edit::{EditError as RoomEditError, EditedContent},
     ruma::{
-        EventId, OwnedRoomId, UserId,
+        EventId, OwnedEventId, OwnedRoomId, UserId,
         api::error::ErrorKind,
         events::{
             MessageLikeEventType,
@@ -29,6 +29,7 @@ use tokio_util::{
 };
 
 use crate::protocol::{INVALID, NETWORK, Output, Result, RpcError};
+use crate::{media, storage::valid_source_id};
 
 const MAX_SUBSCRIPTIONS: usize = 32;
 const STALE_SUBSCRIPTION: RpcError = RpcError::new(
@@ -146,6 +147,40 @@ impl Subscription {
     fn cancel(&self) {
         self.cancel.cancel();
         self.tasks.close();
+    }
+}
+
+pub struct ImageLease {
+    subscription: Arc<Subscription>,
+    room_id: OwnedRoomId,
+    event_id: OwnedEventId,
+    pub source_id: String,
+    pub request: matrix_sdk::media::MediaRequestParameters,
+    _operation: TaskTrackerToken,
+    _subscription_operation: TaskTrackerToken,
+}
+
+impl ImageLease {
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.subscription.cancel
+    }
+
+    pub async fn validate(&self, timelines: &Timelines) -> Result<()> {
+        if !timelines.is_current(&self.room_id, &self.subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        let timeline = mutation_timeline(&self.subscription)?;
+        let items = timeline.items().await;
+        let event = items.iter().filter_map(|item| item.as_event())
+            .find(|event| event.event_id() == Some(self.event_id.as_ref())).ok_or(EVENT_MISSING)?;
+        let image = event_image(event).ok_or(media::STALE_IMAGE)?;
+        if media::source_id(&image.source) != self.source_id {
+            return Err(media::STALE_IMAGE);
+        }
+        if !timelines.is_current(&self.room_id, &self.subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        Ok(())
     }
 }
 
@@ -461,6 +496,45 @@ impl Timelines {
         Ok((subscription.clone(), subscription.tasks.token()))
     }
 
+    pub async fn image_lease(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        event_id: &EventId,
+        source_id: String,
+    ) -> Result<ImageLease> {
+        if !valid_source_id(&source_id) {
+            return Err(INVALID);
+        }
+        let operation = self.tasks.token();
+        let (subscription, subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let request = {
+            let timeline = mutation_timeline(&subscription)?;
+            let items = timeline.items().await;
+            let event = items.iter().filter_map(|item| item.as_event())
+                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            let image = event_image(event).ok_or(media::STALE_IMAGE)?;
+            if media::source_id(&image.source) != source_id {
+                return Err(media::STALE_IMAGE);
+            }
+            matrix_sdk::media::MediaRequestParameters {
+                source: image.source.clone(),
+                format: matrix_sdk::media::MediaFormat::File,
+            }
+        };
+        let lease = ImageLease {
+            subscription,
+            room_id: room_id.clone(),
+            event_id: event_id.to_owned(),
+            source_id,
+            request,
+            _operation: operation,
+            _subscription_operation: subscription_operation,
+        };
+        lease.validate(self).await?;
+        Ok(lease)
+    }
+
     pub async fn edit(
         &self,
         room_id: &OwnedRoomId,
@@ -653,6 +727,38 @@ fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Roo
     Ok(room)
 }
 
+
+fn event_image(event: &EventTimelineItem) -> Option<&matrix_sdk::ruma::events::room::message::ImageMessageEventContent> {
+    if is_redacted(event) {
+        return None;
+    }
+    match event.content().as_message()?.msgtype() {
+        MessageType::Image(image) => Some(image),
+        _ => None,
+    }
+}
+
+fn image_metadata(image: &matrix_sdk::ruma::events::room::message::ImageMessageEventContent) -> Value {
+    let mut value = json!({
+        "source_id":media::source_id(&image.source),
+        "filename":image.filename(),
+    });
+    if let Some(info) = &image.info {
+        if let Some(mime) = &info.mimetype {
+            value["mime_type"] = json!(mime);
+        }
+        if let Some(width) = info.width.filter(|width| u64::from(*width) > 0) {
+            value["width"] = json!(width);
+        }
+        if let Some(height) = info.height.filter(|height| u64::from(*height) > 0) {
+            value["height"] = json!(height);
+        }
+        if let Some(size) = info.size {
+            value["size"] = json!(size);
+        }
+    }
+    value
+}
 fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
     let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false});
     if let Some(event) = item.as_event() {
@@ -675,6 +781,9 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
         if let Some(message) = content.as_message() {
             value["kind"] = json!("message");
             value["body"] = json!(message.body());
+            if let Some(image) = event_image(event) {
+                value["image"] = image_metadata(image);
+            }
         } else if is_redacted(event) {
             value["kind"] = json!("redacted");
             value["body"] = json!("Message deleted");
@@ -747,6 +856,7 @@ fn change(diff: &VectorDiff<Arc<TimelineItem>>, permissions: MutationPermissions
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use matrix_sdk::{
         authentication::matrix::MatrixSession,
@@ -1074,6 +1184,179 @@ mod tests {
         timelines.shutdown().await;
     }
 
+    const IMAGE_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
+        \x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\
+        \x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDAT\
+        \x78\xda\x63\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xa3\xf0\xad\
+        \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+    fn encrypted_image_file() -> Value {
+        json!({
+            "url":"mxc://example.org/encrypted-image", "v":"v2",
+            "key":{"kty":"oct", "alg":"A256CTR", "key_ops":["encrypt","decrypt"],
+                "k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ext":true},
+            "iv":"AAAAAAAAAAAAAAAAAAAAAA",
+            "hashes":{"sha256":"Q9pQ6XVX9EBh7tc2oNfdlmYmMA8SDoJsbzfhmqHZX7k"}
+        })
+    }
+
+    #[tokio::test]
+    async fn sdk_images_download_original_decrypted_bytes_and_reuse_only_complete_sources() {
+        let mut bad_file = encrypted_image_file();
+        bad_file["hashes"]["sha256"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$image", "@other:example.org", json!({
+                "msgtype":"m.image", "body":"caption", "filename":"image.png",
+                "url":"mxc://example.org/image",
+                "info":{"mimetype":"image/png", "w":0, "h":1, "size":IMAGE_PNG.len()}
+            })),
+            message("$encrypted-image", "@other:example.org", json!({
+                "msgtype":"m.image", "body":"encrypted.png", "file":encrypted_image_file()
+            })),
+            message("$bad-image", "@other:example.org", json!({
+                "msgtype":"m.image", "body":"bad.png", "file":bad_file
+            })),
+            message("$text", "@other:example.org", json!({
+                "msgtype":"m.text", "body":"image.png", "url":"mxc://example.org/image"
+            })),
+            message("$file", "@other:example.org", json!({
+                "msgtype":"m.file", "body":"image.png", "url":"mxc://example.org/image",
+                "info":{"mimetype":"image/png"}
+            })),
+        ]).await;
+        let ciphertext = "55c58e3faf4a9383ad48a219dbcc64d5530f8afac74536b8a167b4f1c47e6f87cca7403d46292f2f53361fb0460c8218716301cad805dad9d1a2f58e3c437bca7308d1aa";
+        let ciphertext: Vec<u8> = (0..ciphertext.len()).step_by(2)
+            .map(|offset| u8::from_str_radix(&ciphertext[offset..offset + 2], 16).unwrap()).collect();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/image$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(IMAGE_PNG))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/encrypted-image$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ciphertext))
+            .expect(2).mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(crate::storage::Store::open(directory.path().into()).unwrap());
+        let generation = uuid::Uuid::new_v4().to_string();
+        let slots = tokio::sync::Semaphore::new(2);
+        let room = owned_room_id!("!room:example.org");
+        let plain = snapshot_row(&timelines, event_id!("$image")).await;
+        assert_eq!(plain["body"], "caption");
+        assert_eq!(plain["image"]["filename"], "image.png");
+        assert_eq!(plain["image"]["mime_type"], "image/png");
+        assert_eq!(plain["image"]["height"], 1);
+        assert_eq!(plain["image"]["size"], IMAGE_PNG.len());
+        assert!(plain["image"].get("width").is_none());
+        assert!(plain["image"].get("url").is_none());
+        assert!(plain["image"].get("file").is_none());
+        for id in ["$text", "$file"] {
+            let event_id = EventId::parse(id).unwrap();
+            assert!(snapshot_row(&timelines, &event_id).await.get("image").is_none());
+        }
+        for id in ["$image", "$encrypted-image"] {
+            let event_id = EventId::parse(id).unwrap();
+            let row = snapshot_row(&timelines, &event_id).await;
+            let source = row["image"]["source_id"].as_str().unwrap();
+            let lease = timelines.image_lease(&room, "active", &event_id, source.into()).await.unwrap();
+            let first = media::image(store.clone(), client.clone(), generation.clone(),
+                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots).await.unwrap();
+            assert_eq!(std::fs::read(&first).unwrap(), IMAGE_PNG);
+            assert!(first.starts_with(directory.path().join("media").join(&generation)));
+            let cached = media::image(store.clone(), client.clone(), generation.clone(),
+                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots).await.unwrap();
+            assert_eq!(first, cached);
+        }
+        let bad = snapshot_row(&timelines, event_id!("$bad-image")).await;
+        let good = snapshot_row(&timelines, event_id!("$encrypted-image")).await;
+        assert_ne!(bad["image"]["source_id"], good["image"]["source_id"]);
+        let source = bad["image"]["source_id"].as_str().unwrap();
+        let lease = timelines.image_lease(&room, "active", event_id!("$bad-image"), source.into()).await.unwrap();
+        assert!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
+            CancellationToken::new(), CancellationToken::new(), &slots).await.is_err());
+        assert_eq!(store.cached_image(&generation, source).unwrap(), None);
+        drop(lease);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_image_leases_reject_source_replacement_redaction_and_reopened_subscription() {
+        let (server, client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$image", "@other:example.org", json!({
+                "msgtype":"m.image", "body":"image.png", "url":"mxc://example.org/image"
+            })),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        let row = snapshot_row(&timelines, event_id!("$image")).await;
+        let source = row["image"]["source_id"].as_str().unwrap().to_owned();
+        assert_eq!(timelines.image_lease(&room, "old", event_id!("$image"), source.clone())
+            .await.err().unwrap().code, "stale_subscription");
+        assert_eq!(timelines.image_lease(&room, "active", event_id!("$image"), "0".repeat(64))
+            .await.err().unwrap().code, "stale_image");
+        let lease = timelines.image_lease(&room, "active", event_id!("$image"), source).await.unwrap();
+        let new_content = json!({
+            "msgtype":"m.image", "body":"replacement.png", "url":"mxc://example.org/replacement"
+        });
+        sdk_sync(&server, &client, None, vec![
+            message("$replacement", "@other:example.org", json!({
+                "msgtype":"m.image", "body":"* replacement.png", "url":"mxc://example.org/replacement",
+                "m.new_content":new_content, "m.relates_to":{"rel_type":"m.replace", "event_id":"$image"}
+            })),
+        ]).await;
+        let replacement = next_row(&mut rx, "$image", |row| row["body"] == "replacement.png").await;
+        assert_ne!(replacement["image"]["source_id"], row["image"]["source_id"]);
+        assert_eq!(lease.validate(&timelines).await.unwrap_err().code, "stale_image");
+        let source = replacement["image"]["source_id"].as_str().unwrap().to_owned();
+        let replacement_lease = timelines.image_lease(&room, "active", event_id!("$image"), source).await.unwrap();
+        sdk_sync(&server, &client, None, vec![json!({
+            "type":"m.room.redaction", "event_id":"$redaction", "sender":"@other:example.org",
+            "origin_server_ts":2000, "redacts":"$image", "content":{"redacts":"$image"}
+        })]).await;
+        let redacted = next_row(&mut rx, "$image", |row| row["kind"] == "redacted").await;
+        assert!(redacted.get("image").is_none());
+        assert_eq!(replacement_lease.validate(&timelines).await.unwrap_err().code, "stale_image");
+        drop(replacement_lease);
+        let (_, _, operation) = timelines.reserve(room.clone(), "replacement".into()).await.unwrap();
+        drop(operation);
+        assert_eq!(lease.validate(&timelines).await.unwrap_err().code, "stale_subscription");
+        drop(lease);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_image_download_revokes_account_and_transport_before_publication() {
+        for cancel_transport in [false, true] {
+            let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+                message("$image", "@other:example.org", json!({
+                    "msgtype":"m.image", "body":"image.png", "url":"mxc://example.org/image"
+                })),
+            ]).await;
+            let cancel = CancellationToken::new();
+            let transport = CancellationToken::new();
+            let revoke = if cancel_transport { transport.clone() } else { cancel.clone() };
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/image$"))
+                .respond_with(move |_: &wiremock::Request| {
+                    revoke.cancel();
+                    ResponseTemplate::new(200).set_body_bytes(IMAGE_PNG)
+                }).expect(1).mount(&server).await;
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let store = Arc::new(crate::storage::Store::open(directory.path().into()).unwrap());
+            let generation = uuid::Uuid::new_v4().to_string();
+            let row = snapshot_row(&timelines, event_id!("$image")).await;
+            let source = row["image"]["source_id"].as_str().unwrap();
+            let lease = timelines.image_lease(&owned_room_id!("!room:example.org"), "active",
+                event_id!("$image"), source.into()).await.unwrap();
+            let slots = tokio::sync::Semaphore::new(1);
+            assert_eq!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
+                cancel, transport, &slots).await.unwrap_err().code, "image_cancelled");
+            assert_eq!(store.cached_image(&generation, source).unwrap(), None);
+            drop(lease);
+            timelines.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn sdk_edits_preserve_message_subtypes_reply_identity_and_media_source() {
         let encrypted_file = json!({
@@ -1108,6 +1391,10 @@ mod tests {
             let edited = next_row(&mut rx, id, |row| row["body"] == "changed").await;
             assert_eq!(edited["id"], original["id"]);
             assert_eq!(edited["event_id"], original["event_id"]);
+            if original.get("image").is_some() {
+                assert_eq!(edited["image"]["source_id"], original["image"]["source_id"]);
+                assert_eq!(edited["image"]["filename"], original["image"]["filename"]);
+            }
         }
         let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
         let items = mutation_timeline(&subscription).unwrap().items().await;

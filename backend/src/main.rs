@@ -129,7 +129,7 @@ async fn run(store: Store) {
                 continue;
             }
         };
-        let admission = if request.method == "media.avatar" {
+        let admission = if matches!(request.method.as_str(), "media.avatar" | "media.image") {
             &media_requests
         } else {
             &semaphore

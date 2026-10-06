@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use fs2::FileExt;
@@ -28,6 +29,11 @@ pub const INVALID_AVATAR: RpcError = RpcError::new(
     "Avatar thumbnail is absent, oversized, or not a supported image",
 );
 pub const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
+pub const INVALID_IMAGE: RpcError = RpcError::new(
+    "image_invalid",
+    "Image is absent, oversized, or not a supported raster image",
+);
+pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +48,7 @@ pub struct SavedSession {
 pub struct Store {
     root: PathBuf,
     _lock: File,
+    media_cache: Mutex<()>,
 }
 
 impl Store {
@@ -69,7 +76,7 @@ impl Store {
             )
         })?;
         check_tree(&root)?;
-        Ok(Self { root, _lock: lock })
+        Ok(Self { root, _lock: lock, media_cache: Mutex::new(()) })
     }
 
     pub fn root(&self) -> &Path {
@@ -237,6 +244,44 @@ impl Store {
         Ok(path)
     }
 
+    fn image_path(&self, generation: &str, source_id: &str) -> Result<PathBuf> {
+        self.sdk_path(generation)?;
+        if !valid_source_id(source_id) {
+            return Err(INVALID_IMAGE);
+        }
+        let media = self.root.join("media");
+        private_cache_directory(&media)?;
+        let directory = media.join(generation);
+        private_cache_directory(&directory)?;
+        Ok(directory.join(format!("{source_id}.image")))
+    }
+
+    pub fn cached_image(&self, generation: &str, source_id: &str) -> Result<Option<PathBuf>> {
+        let _cache = self.media_cache.lock().map_err(|_| STORAGE)?;
+        let path = self.image_path(generation, source_id)?;
+        Ok(cached_image_at(&path)?.then_some(path))
+    }
+
+    pub fn cache_image(&self, generation: &str, source_id: &str, bytes: &[u8]) -> Result<PathBuf> {
+        if !valid_image(bytes) {
+            return Err(INVALID_IMAGE);
+        }
+        // Store's exclusive process lock plus this file-operation-only mutex
+        // orders the existence check and atomic publication. Concurrent downloads
+        // never replace an already accepted complete-source identity.
+        let _cache = self.media_cache.lock().map_err(|_| STORAGE)?;
+        let path = self.image_path(generation, source_id)?;
+        if cached_image_at(&path)? {
+            return Ok(path);
+        }
+        self.atomic_write_at(
+            path.parent().ok_or(STORAGE)?,
+            path.file_name().and_then(|name| name.to_str()).ok_or(STORAGE)?,
+            bytes,
+        )?;
+        Ok(path)
+    }
+
     fn remove(&self, name: &str) -> Result<()> {
         fs::remove_file(self.root.join(name)).map_err(|_| STORAGE)?;
         self.sync_directory()
@@ -290,9 +335,44 @@ fn private_cache_directory(path: &Path) -> Result<()> {
 }
 
 pub fn valid_avatar(bytes: &[u8]) -> bool {
-    if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
-        return false;
+    !bytes.is_empty() && bytes.len() <= MAX_AVATAR_BYTES && raster_signature(bytes)
+}
+
+pub fn valid_image(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES && raster_signature(bytes)
+}
+
+pub fn valid_source_id(source_id: &str) -> bool {
+    source_id.len() == 64 && source_id.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn cached_image_at(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => check_private(path, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(STORAGE),
     }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| PRIVATE)?;
+    let metadata = file.metadata().map_err(|_| STORAGE)?;
+    if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES as u64 {
+        return Err(INVALID_IMAGE);
+    }
+    let mut header = [0u8; 24];
+    let length = (metadata.len() as usize).min(header.len());
+    file.read_exact(&mut header[..length]).map_err(|_| STORAGE)?;
+    if !valid_image(&header[..length]) {
+        // Complete-source files are immutable, including on corruption: do not
+        // silently replace an existing private path with different bytes.
+        return Err(INVALID_IMAGE);
+    }
+    Ok(true)
+}
+
+fn raster_signature(bytes: &[u8]) -> bool {
     // The presentation layer owns decoding. Accept only conventional raster
     // signatures here, never an HTML/error body or executable SVG content.
     (bytes.len() >= 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR")
@@ -344,6 +424,94 @@ mod tests {
         \x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDAT\
         \x78\xda\x63\xfc\xff\x1f\x00\x03\x03\x02\x00\xef\xa3\xf0\xad\
         \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+    #[test]
+    fn image_cache_is_private_immutable_and_complete_identity_scoped() {
+        let dir = private_dir();
+        let store = Store::open(dir.path().into()).unwrap();
+        let generation = Uuid::new_v4().to_string();
+        let source = format!("{:x}", Sha256::digest(b"complete source"));
+        let path = store.cache_image(&generation, &source, AVATAR_PNG).unwrap();
+        assert!(path.is_absolute());
+        assert_eq!(path, dir.path().join("media").join(&generation).join(format!("{source}.image")));
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        for directory in [dir.path().join("media"), path.parent().unwrap().into()] {
+            assert_eq!(fs::metadata(directory).unwrap().mode() & 0o777, 0o700);
+        }
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(store.cached_image(&generation, &source).unwrap(), Some(path.clone()));
+        let different_raster = b"GIF89a\x01\x00\x01\x00\x00\x00\x00";
+        assert_eq!(store.cache_image(&generation, &source, different_raster).unwrap(), path);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), AVATAR_PNG);
+        let replacement = format!("{:x}", Sha256::digest(b"replacement crypto"));
+        assert_ne!(store.cache_image(&generation, &replacement, AVATAR_PNG).unwrap(), path);
+        let next_generation = Uuid::new_v4().to_string();
+        assert_eq!(store.cached_image(&next_generation, &source).unwrap(), None);
+        assert_ne!(store.cache_image(&next_generation, &source, AVATAR_PNG).unwrap(), path);
+        let mut oversized = AVATAR_PNG.to_vec();
+        oversized.resize(MAX_IMAGE_BYTES + 1, 0);
+        assert!(!valid_image(&oversized));
+        oversized.truncate(MAX_IMAGE_BYTES);
+        assert!(valid_image(&oversized));
+        for bytes in [b"".as_slice(), b"<svg>executable</svg>".as_slice(), b"<html>error</html>".as_slice()] {
+            assert_eq!(store.cache_image(&generation, &source, bytes).unwrap_err().code, "image_invalid");
+        }
+        for invalid in ["../outside", "", "abc", &"A".repeat(64)] {
+            assert!(store.cached_image(&generation, invalid).is_err());
+        }
+        assert!(store.cached_image("../outside", &source).is_err());
+    }
+
+    #[test]
+    fn image_cache_rejects_unsafe_and_corrupted_paths_without_replacement() {
+        let dir = private_dir();
+        let store = Store::open(dir.path().into()).unwrap();
+        let generation = Uuid::new_v4().to_string();
+        let source = "0".repeat(64);
+        let outside_directory = private_dir();
+        let media = dir.path().join("media");
+        std::os::unix::fs::symlink(outside_directory.path(), &media).unwrap();
+        assert_eq!(store.cached_image(&generation, &source).unwrap_err().code, "store_permissions");
+        fs::remove_file(&media).unwrap();
+        let path = store.image_path(&generation, &source).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), AVATAR_PNG).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+        assert_eq!(store.cache_image(&generation, &source, AVATAR_PNG).unwrap_err().code, "store_permissions");
+        assert_eq!(fs::read(outside.path()).unwrap(), AVATAR_PNG);
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(outside.path(), &path).unwrap();
+        assert_eq!(store.cached_image(&generation, &source).unwrap_err().code, "store_permissions");
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"<html>failed media").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(store.cached_image(&generation, &source).unwrap_err().code, "store_permissions");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(store.cache_image(&generation, &source, AVATAR_PNG).unwrap_err().code, "image_invalid");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), b"<html>failed media");
+    }
+
+    #[test]
+    fn concurrent_image_downloads_publish_only_one_immutable_file() {
+        let dir = private_dir();
+        let store = std::sync::Arc::new(Store::open(dir.path().into()).unwrap());
+        let generation = Uuid::new_v4().to_string();
+        let source = "1".repeat(64);
+        let workers: Vec<_> = (0..8).map(|_| {
+            let store = store.clone();
+            let generation = generation.clone();
+            let source = source.clone();
+            std::thread::spawn(move || {
+                let path = store.cache_image(&generation, &source, AVATAR_PNG).unwrap();
+                fs::metadata(path).unwrap().ino()
+            })
+        }).collect();
+        let inodes: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert!(inodes.iter().all(|inode| *inode == inodes[0]));
+    }
 
     #[test]
     fn avatar_cache_is_private_immutable_and_identity_scoped() {
