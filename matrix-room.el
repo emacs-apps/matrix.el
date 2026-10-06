@@ -15,6 +15,12 @@
 (require 'appkit-chat-avatar)
 (require 'appkit-name-color)
 (require 'appkit-ui)
+(require 'matrix-media)
+
+(declare-function appkit-media-inline-host-at-point "appkit-media-inline"
+                  (&optional position))
+(declare-function appkit-media-inline-host-activate "appkit-media-inline"
+                  (host &optional presentation))
 
 (defvar-local matrix-room--width 80
   "Width of the last committed room presentation.")
@@ -258,6 +264,50 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                             (plist-get item :send_state)))
                 " · ")))))))
 
+(defun matrix-room--insert-image (item prefixes)
+  "Insert ITEM's committed Canvas image below its caption with PREFIXES."
+  (when-let* ((image (plist-get item :image)))
+    (let* ((surface (appkit-current-surface))
+           (app (appkit-surface-app surface))
+           (room (cadr (appkit-surface-identity surface)))
+           (timeline (matrix-room--timeline (matrix-runtime-state app) room))
+           (key (matrix-media-resource-key app room (plist-get timeline :subscription_id) item))
+           (state (and key (appkit-resource-state surface key)))
+           (width (max 1 (floor
+                          (min appkit-media-preview-max-width
+                               (/ (* (max 1 (- matrix-room--width
+                                               (string-width (plist-get prefixes :rest-body))))
+                                     (appkit-media--char-pixel-width)
+                                     (appkit-media--base-char-pixel-height))
+                                  (float (appkit-media--char-pixel-height)))))))
+           (poster (and key (matrix-media-cached-poster app key width))))
+      (cond
+       ((and poster (not (stringp poster)))
+        ;; Each call authors a fresh occurrence; committed Surface mounting
+        ;; supplies viewer actions and distinct animated playback leases.
+        (let ((rows (appkit-media-image-slice-rows poster)))
+          (while rows
+            (insert (pop rows))
+            (if rows (appkit-media-insert-slice-newline) (insert "\n")))))
+       (t
+        (insert
+         (propertize
+          (concat
+           (cond
+            ((not (matrix-media-rendering-available-p)) "[Image: Canvas display required")
+            ((not key) "[Image unavailable: missing event identity")
+            ((stringp poster) (substring poster 0 -1))
+            ((and state (eq (appkit-resource-state-status state) 'failed))
+             "[Image unavailable: acquisition failed")
+            (t "[Image loading"))
+           (when-let* ((filename (plist-get image :filename))
+                        ((stringp filename)))
+             (concat " · " (matrix--one-line filename)))
+           "]\n")
+          'face (if (or (stringp poster)
+                        (and state (eq (appkit-resource-state-status state) 'failed)))
+                    'error 'shadow))))))))
+
 (defun matrix-room--print-row (row)
   "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
   (let* ((item (appkit-chat-timeline-row-payload row))
@@ -302,6 +352,8 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                        (propertize "[Unable to decrypt encrypted event]" 'face 'warning)
                      (substring-no-properties (or (plist-get item :body) ""))))
            (when (or (= body-start (point)) (not (bolp))) (insert "\n"))
+           (when (equal kind "message")
+             (matrix-room--insert-image item prefixes))
            (when compact
              (save-excursion
                (goto-char body-start)
@@ -372,18 +424,28 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
           :context-function #'matrix-room--row-context
           :dependencies-function
           (lambda (item)
-            (when-let* ((key (matrix-avatar-resource-key app (plist-get item :avatar_url))))
-              (list key))))
+            (delq nil
+                  (list (matrix-avatar-resource-key app (plist-get item :avatar_url))
+                        (matrix-media-resource-key
+                         app room-id (plist-get timeline :subscription_id) item)))))
          :changed-resources (appkit-projection-change-resources request)
          :force-keys (when (appkit-projection-change-geometry-p request)
                        (appkit-chat-timeline-keys)))
         (appkit-chat-timeline-set-frame
          header footer :bind-input-function #'matrix-room--bind-composer
          :composer-visible-p t))
-      (matrix--avatar-resource-result
-       surface (mapcar (lambda (item)
-                         (cons (plist-get item :id) (plist-get item :avatar_url)))
-                       items)))))
+      (let (media-rows media-keys)
+        (dolist (item items)
+          (when-let* ((demand (matrix-media-demand
+                              app room-id (plist-get timeline :subscription_id) item)))
+            (push (cons (plist-get item :id) demand) media-rows)
+            (push (appkit-resource-demand-key demand) media-keys)))
+        (matrix-media-retain app room-id media-keys)
+        (matrix--avatar-resource-result
+         surface (mapcar (lambda (item)
+                           (cons (plist-get item :id) (plist-get item :avatar_url)))
+                         items)
+         (nreverse media-rows))))))
 
 (defun matrix-room--defer-observation (_context surface _observe resolve reject)
   "Check committed geometry at idle, with cancellation owned by the Surface."
@@ -467,9 +529,13 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                  (when error (matrix--error-text error))))))
 
 (defun matrix-room-return ()
-  "Send the draft in input; activate exact timeline controls or focus input."
+  "Send only in input; activate image playback or exact timeline controls."
   (interactive)
-  (appkit-chatbuf-dispatch-return #'matrix-room-send))
+  (if-let* (((not (appkit-chatbuf-point-in-input-p)))
+             ((fboundp 'appkit-media-inline-host-at-point))
+             (host (appkit-media-inline-host-at-point)))
+      (appkit-media-inline-host-activate host)
+    (appkit-chatbuf-dispatch-return #'matrix-room-send)))
 
 (defun matrix-room--move-message (backward)
   "Move to the next semantic message, or previous when BACKWARD."

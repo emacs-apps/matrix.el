@@ -81,8 +81,11 @@ The runtime bridge is the only substituted boundary; files and resources are rea
                              :name 'matrix-avatar-test
                              :init (lambda (_context model)
                                      (appkit-next :model model :render appkit-render-none))
-                             :update (lambda (_context model _message)
-                                       (appkit-next :model model :render appkit-render-none))
+                             :update (lambda (_context model message)
+                                       (appkit-next
+                                        :model (if (eq (car-safe message) 'matrix-test-snapshot)
+                                                   (cadr message) model)
+                                        :render appkit-render-none))
                              :shutdown #'matrix-avatar-clear-cache)
                             :identity (list 'matrix-account store)
                             :input (list :transport (matrix-rpc-transport-create :store store)

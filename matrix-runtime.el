@@ -435,6 +435,8 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
     (puthash store transport matrix-runtime--retiring)
     (when (fboundp 'matrix-avatar-clear-cache)
       (matrix-avatar-clear-cache app))
+    (when (fboundp 'matrix-media-clear-cache)
+      (matrix-media-clear-cache app))
     (clrhash (plist-get model :pending))
     (clrhash (plist-get model :watches))))
 

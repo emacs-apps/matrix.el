@@ -91,20 +91,28 @@
           (push (car row) changed))))
     (nreverse changed)))
 
-(defun matrix--avatar-resource-result (surface rows)
-  "Retain private avatars for the currently projected (ROW-KEY . URI) ROWS."
+(defun matrix--avatar-resource-result (surface rows &optional resource-rows)
+  "Retain ROWS' avatars and RESOURCE-ROWS in one replace interest result.
+RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
   (let ((app (appkit-surface-app surface))
         (demands (make-hash-table :test #'equal))
         (interests (make-hash-table :test #'equal))
         order)
-    (when (appkit-media-inline-image-rendering-available-p)
-      (dolist (row rows)
-        (when-let* ((demand (matrix-avatar-demand app (cdr row))))
-          (let ((key (appkit-resource-demand-key demand)))
-            (unless (gethash key demands)
-              (puthash key demand demands)
-              (push key order))
-            (puthash key (cons (car row) (gethash key interests)) interests)))))
+    (dolist (row
+             (append
+              (when (appkit-media-inline-image-rendering-available-p)
+                (delq nil
+                      (mapcar (lambda (row)
+                                (when-let* ((demand (matrix-avatar-demand app (cdr row))))
+                                  (cons (car row) demand)))
+                              rows)))
+              resource-rows))
+      (let* ((demand (cdr row))
+             (key (appkit-resource-demand-key demand)))
+        (unless (gethash key demands)
+          (puthash key demand demands)
+          (push key order))
+        (puthash key (cons (car row) (gethash key interests)) interests)))
     (appkit-render-result-create
      :resource-demands (mapcar (lambda (key) (gethash key demands)) (nreverse order))
      :resource-interest-update
