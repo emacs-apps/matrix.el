@@ -221,6 +221,72 @@ fn is_redacted(event: &EventTimelineItem) -> bool {
             .is_ok_and(|metadata| metadata.unsigned.redacted_because.is_some())
     })
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct ReadState {
+    unread_messages: Option<u64>,
+    all_read: Option<bool>,
+    first_unread_index: Option<usize>,
+}
+
+async fn read_state<'a>(
+    timeline: &Timeline,
+    items: impl Iterator<Item = &'a Arc<TimelineItem>>,
+) -> ReadState {
+    // SDK counts cover cached events and expose no completeness bit.
+    let room = timeline.room();
+    let fully_read = room.fully_read_event_id();
+    let receipt = timeline.latest_user_read_receipt(room.own_user_id()).await;
+    let all_read = timeline.latest_event_id().await.is_some_and(|latest| {
+        fully_read.as_ref() == Some(&latest)
+            || receipt.as_ref().is_some_and(|(event, _)| *event == latest)
+    });
+    let receipt_position = if receipt.is_some() {
+        timeline.latest_user_read_receipt_timeline_event_id(room.own_user_id()).await
+    } else {
+        None
+    };
+    // The SDK maps receipts on hidden events to their visible predecessor.
+    let fully_read_position = if receipt.as_ref().is_some_and(|(event, _)| {
+        fully_read.as_ref() == Some(event)
+    }) {
+        receipt_position.as_ref().or(fully_read.as_ref())
+    } else {
+        fully_read.as_ref()
+    };
+    let mut found_fully_read = fully_read.is_none();
+    let mut found_receipt = receipt.is_none();
+    let mut passed_frontier = false;
+    let mut first_unread_index = None;
+    if !all_read {
+        for (index, item) in items.enumerate() {
+            let Some(event) = item.as_event() else { continue };
+            let Some(event_id) = event.event_id() else { continue };
+            let fully_here = fully_read_position.is_some_and(|id| id.as_str() == event_id.as_str());
+            let receipt_here = receipt.as_ref().is_some_and(|(id, _)| id.as_str() == event_id.as_str())
+                || receipt_position.as_ref().is_some_and(|id| id.as_str() == event_id.as_str());
+            if fully_here || receipt_here {
+                found_fully_read |= fully_here;
+                found_receipt |= receipt_here;
+                passed_frontier = true;
+                first_unread_index = None;
+            } else if passed_frontier && first_unread_index.is_none() && read_capable(event) {
+                first_unread_index = Some(index);
+            }
+        }
+    }
+    ReadState {
+        unread_messages: all_read.then_some(0),
+        all_read: all_read.then_some(true),
+        // Indices belong to the exact subscriber snapshot emitted in this revision.
+        // An unresolved frontier never falls back to an older fully-read marker.
+        first_unread_index: if found_fully_read && found_receipt {
+            first_unread_index
+        } else {
+            None
+        },
+    }
+}
 struct Subscription {
     id: String,
     timeline: OnceCell<Result<Arc<Timeline>>>,
@@ -396,13 +462,17 @@ impl Timelines {
                     };
                     let task_sdk_room = timeline.room().clone();
                     let mut room_updates = task_sdk_room.subscribe_to_updates();
+                    let mut room_info = task_sdk_room.subscribe_info();
+                    let receipt_updates = timeline.subscribe_own_user_read_receipts_changed().await;
                     let mut permissions = mutation_permissions(&task_sdk_room).await.unwrap_or_default();
                     let (mut items, stream) = timeline.subscribe().await;
+                    let mut reading = read_state(&timeline, items.iter()).await;
                     if !output
                         .event(json!({
                             "type":"timeline_reset", "room_id":room_id,
                             "subscription_id":subscription.id, "revision":0,
-                            "items":items.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()
+                            "items":items.iter().map(|i| item(i, permissions)).collect::<Vec<_>>(),
+                            "read_state":reading
                         }))
                         .await
                     {
@@ -414,6 +484,7 @@ impl Timelines {
                     let task_timeline = timeline.clone();
                     self.tasks.spawn(subscription.tasks.track_future(async move {
                         futures_util::pin_mut!(stream);
+                        futures_util::pin_mut!(receipt_updates);
                         let mut revision = 0u64;
                         let mut room_updates_open = true;
                         let mut reply_fetches = FuturesUnordered::new();
@@ -444,6 +515,28 @@ impl Timelines {
                                 biased;
                                 _ = task_cancel.cancelled() => break,
                                 _ = reply_fetches.next(), if !reply_fetches.is_empty() => {}
+                                read_update = async {
+                                    tokio::select! {
+                                        info = room_info.next() => info.is_some(),
+                                        receipt = receipt_updates.next() => receipt.is_some(),
+                                    }
+                                } => {
+                                    if !read_update { break; }
+                                    let next = read_state(&task_timeline, items.iter()).await;
+                                    if next == reading { continue; }
+                                    reading = next;
+                                    revision += 1;
+                                    let event = json!({
+                                        "type":"timeline_diff", "room_id":task_room,
+                                        "subscription_id":task_id, "revision":revision,
+                                        "changes":[], "read_state":reading
+                                    });
+                                    tokio::select! {
+                                        biased;
+                                        _ = task_cancel.cancelled() => break,
+                                        sent = output.event(event) => if !sent { break; },
+                                    }
+                                }
                                 update = room_updates.recv(), if room_updates_open => {
                                     if matches!(update, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
                                         room_updates_open = false;
@@ -453,11 +546,13 @@ impl Timelines {
                                     if next == permissions { continue; }
                                     permissions = next;
                                     revision += 1;
+                                    reading = read_state(&task_timeline, items.iter()).await;
                                     // Reserialize our subscriber's SDK snapshot, not a separately
                                     // fetched list that could overtake queued SDK vector diffs.
                                     let event = json!({
                                         "type":"timeline_diff", "room_id":task_room,
                                         "subscription_id":task_id, "revision":revision,
+                                        "read_state":reading,
                                         "changes":[{"op":"reset", "items":items.iter()
                                             .map(|i| item(i, permissions)).collect::<Vec<_>>()}]
                                     });
@@ -478,7 +573,7 @@ impl Timelines {
                                     };
                                     if diffs.is_empty() { continue; }
                                     revision += 1;
-                                    let event = json!({
+                                    let mut event = json!({
                                         "type":"timeline_diff", "room_id":task_room,
                                         "subscription_id":task_id, "revision":revision,
                                         "changes":diffs.iter().map(|diff| change(diff, permissions)).collect::<Vec<_>>()
@@ -486,6 +581,8 @@ impl Timelines {
                                     for diff in diffs {
                                         diff.apply(&mut items);
                                     }
+                                    reading = read_state(&task_timeline, items.iter()).await;
+                                    event["read_state"] = json!(reading);
                                     tokio::select! {
                                         biased;
                                         _ = task_cancel.cancelled() => break,
@@ -1252,6 +1349,17 @@ mod tests {
     }
 
     async fn sdk_sync(server: &MockServer, client: &Client, levels: Option<Value>, events: Vec<Value>) {
+        sdk_sync_with_receipts(server, client, levels, events, None, None).await;
+    }
+
+    async fn sdk_sync_with_receipts(
+        server: &MockServer,
+        client: &Client,
+        levels: Option<Value>,
+        events: Vec<Value>,
+        receipt: Option<&str>,
+        marker: Option<&str>,
+    ) {
         let mut state = vec![
             json!({
                 "type":"m.room.create", "state_key":"", "event_id":"$create",
@@ -1278,7 +1386,14 @@ mod tests {
             "next_batch":uuid::Uuid::new_v4().to_string(),
             "rooms":{"join":{"!room:example.org":{
                 "state":{"events":state}, "timeline":{"events":events, "limited":false},
-                "ephemeral":{"events":[]}, "account_data":{"events":[]},
+                "ephemeral":{"events":receipt.map(|event_id| json!({
+                    "type":"m.receipt", "content":{event_id:{
+                        "m.read.private":{"@me:example.org":{"ts":2000}}
+                    }}
+                })).into_iter().collect::<Vec<_>>()},
+                "account_data":{"events":marker.map(|event_id| json!({
+                    "type":"m.fully_read", "content":{"event_id":event_id}
+                })).into_iter().collect::<Vec<_>>()},
                 "unread_notifications":{"notification_count":0, "highlight_count":0}
             }}},
             "account_data":{"events":[]}, "to_device":{"events":[]},
@@ -1373,6 +1488,130 @@ mod tests {
         }).await.expect("SDK timeline did not publish expected event update")
     }
 
+    async fn next_read_state(rx: &mut mpsc::Receiver<Vec<u8>>, all_read: bool) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event: Value = serde_json::from_slice(&rx.recv().await.unwrap()).unwrap();
+                let event = &event["params"];
+                if event["read_state"].is_object()
+                    && (event["read_state"]["all_read"] == true) == all_read
+                {
+                    return event.clone();
+                }
+            }
+        }).await.expect("SDK timeline did not publish expected read state")
+    }
+
+    #[tokio::test]
+    async fn sdk_read_state_requires_complete_frontier_not_notification_zero() {
+        let (server, client, timelines, mut rx) = sdk_fixture(None, vec![
+            message("$z", "@other:example.org", json!({"msgtype":"m.notice", "body":"first"})),
+            message("$m", "@other:example.org", json!({"msgtype":"m.notice", "body":"middle"})),
+            message("$a", "@other:example.org", json!({"msgtype":"m.notice", "body":"last"})),
+        ]).await;
+        let room_id = owned_room_id!("!room:example.org");
+        let room = client.get_room(&room_id).unwrap();
+        let initial = next_read_state(&mut rx, false).await;
+        assert!(initial["read_state"]["unread_messages"].is_null());
+        assert_eq!(room.num_unread_notifications(), 0);
+        // Notices are unread messages, but the default suppress-notices push rule
+        // gives them no notification badge. Neither number is the other's proxy.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while room.num_unread_messages() == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let (subscription, operation) = timelines.mutation_subscription(&room_id, "active").await.unwrap();
+        let timeline = mutation_timeline(&subscription).unwrap();
+
+        // An unresolved receipt and a zero notification badge do not prove read-all.
+        sdk_sync_with_receipts(&server, &client, None, vec![], Some("$unloaded"), None).await;
+        let unresolved = read_state(&timeline, timeline.items().await.iter()).await;
+        assert!(unresolved.all_read.is_none());
+        assert!(unresolved.first_unread_index.is_none());
+
+        // Opaque ids sort opposite to timeline order. A partial receipt stays partial.
+        sdk_sync_with_receipts(&server, &client, None, vec![], Some("$m"), Some("$m")).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if timeline.latest_user_read_receipt(room.own_user_id()).await
+                    .is_some_and(|(id, _)| id == event_id!("$m"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let partial = read_state(&timeline, timeline.items().await.iter()).await;
+        assert!(partial.all_read.is_none());
+        assert!(partial.unread_messages.is_none());
+        assert_eq!(room.num_unread_notifications(), 0);
+
+        // Receipt-only sync from another client must publish, even though own
+        // receipts don't change visible rows and the notification count stays zero.
+        sdk_sync_with_receipts(&server, &client, None, vec![], Some("$a"), None).await;
+        let complete = next_read_state(&mut rx, true).await;
+        assert_eq!(complete["subscription_id"], "active");
+        assert_eq!(complete["read_state"]["unread_messages"], 0);
+        assert_eq!(room.num_unread_notifications(), 0);
+
+        // A new remote message revokes completeness; don't retain an old zero.
+        sdk_sync(&server, &client, None, vec![
+            message("$0", "@other:example.org", json!({"msgtype":"m.notice", "body":"new"})),
+        ]).await;
+        let unread = next_read_state(&mut rx, false).await;
+        assert!(unread["read_state"]["unread_messages"].is_null());
+        assert!(unread["revision"].as_u64().unwrap() > complete["revision"].as_u64().unwrap());
+        // The old fully-read marker must not recreate a boundary before $m/$a.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let items = timeline.items().await;
+                let reading = read_state(&timeline, items.iter()).await;
+                if reading.first_unread_index.and_then(|index| items.get(index))
+                    .and_then(|item| item.as_event()).and_then(|event| event.event_id())
+                    == Some(event_id!("$0"))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        drop(operation);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_read_boundary_resolves_receipts_loaded_before_timeline_creation() {
+        let (server, client, timelines, _rx) = sdk_fixture(None, vec![
+            message("$before", "@other:example.org", json!({"msgtype":"m.text", "body":"read"})),
+            message("$after", "@other:example.org", json!({"msgtype":"m.text", "body":"unread"})),
+        ]).await;
+        sdk_sync_with_receipts(&server, &client, None, vec![],
+            Some("$before"), Some("$before")).await;
+        let timeline = client.get_room(&owned_room_id!("!room:example.org")).unwrap()
+            .timeline().await.unwrap();
+        let items = timeline.items().await;
+        let reading = read_state(&timeline, items.iter()).await;
+        assert!(!reading.all_read.unwrap_or(false));
+        assert_eq!(reading.first_unread_index.and_then(|index| items.get(index))
+            .and_then(|item| item.as_event()).and_then(|event| event.event_id()),
+            Some(event_id!("$after")));
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_read_state_empty_timeline_is_unknown_and_fully_read_can_confirm() {
+        let (server, client, timelines, mut rx) = sdk_fixture(None, vec![]).await;
+        let initial = next_read_state(&mut rx, false).await;
+        assert!(initial["read_state"]["unread_messages"].is_null());
+        sdk_sync_with_receipts(&server, &client, None, vec![
+            message("$latest", "@other:example.org", json!({"msgtype":"m.text", "body":"last"})),
+        ], None, Some("$latest")).await;
+        let complete = next_read_state(&mut rx, true).await;
+        assert_eq!(complete["read_state"]["unread_messages"], 0);
+        timelines.shutdown().await;
+    }
+
     #[tokio::test]
     async fn sdk_read_through_replacement_revokes_inflight_receipt() {
         let (server, _client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
@@ -1430,6 +1669,9 @@ mod tests {
         let mutation = subscription.mutations.lock().await;
         tokio::time::timeout(Duration::from_secs(5),
             timelines.read_through(&room, "active", event_id!("$z"))).await.unwrap().unwrap();
+        // Successful partial acknowledgement must not clear the live boundary.
+        let timeline = mutation_timeline(&subscription).unwrap();
+        assert!(read_state(timeline, timeline.items().await.iter()).await.all_read.is_none());
         drop(mutation);
         drop(operation);
         timelines.unsubscribe(&room, "active").await;

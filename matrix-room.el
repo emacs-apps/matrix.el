@@ -4,10 +4,12 @@
 ;; SDK timeline IDs own generated rows.  The composer is a separate AppKit
 ;; region, never rebuilt by sync.  An accepted send clears only its captured
 ;; revision; delivery and encryption state remain SDK authority.
-;; The SDK ReadMarker supplies an exact first-unread position, latched by the
-;; shared reading-session projection.  Receipts never move or clear that bar.
+;; SDK read positions and their matching timeline revision locate the boundary.
+;; Partial reading keeps it fixed; authoritative completion removes it.
 ;; `matrix-room-read-through' explicitly acknowledges the selected remote event
 ;; (newest loaded eligible event from the composer) through private SDK receipts.
+;; SDK cache-derived counts lack completeness evidence; notification badges
+;; remain separate from exact unread-message progress.
 
 ;;; Code:
 
@@ -438,8 +440,10 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
       (setq matrix-room--unread-key
             (appkit-chat-read-update
              (mapcar (lambda (item) (plist-get item :id)) items)
-             :first-unread-key (matrix-room--first-unread-key (plist-get timeline :items))
-             :known-p (and timeline t)))
+             :first-unread-key (matrix-room--first-unread-key timeline)
+             :known-p (and timeline t)
+             :unread-count (plist-get (plist-get timeline :read_state) :unread_messages)
+             :all-read-p (eq (plist-get (plist-get timeline :read_state) :all_read) t)))
       (matrix--frame
        state nil nil
        (pcase (plist-get room :encrypted)
@@ -447,6 +451,9 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                          'help-echo "Encrypted room; Matrix SDK enforces device trust."))
          (_ (propertize "[?E2EE]" 'face 'warning
                          'help-echo "Room is not known encrypted; sending requires consent."))))
+      (when-let* ((count (appkit-chat-read-count-text
+                         (plist-get (plist-get timeline :read_state) :unread_messages))))
+        (setq matrix--header-line (concat matrix--header-line "  " count)))
       (let ((footer (matrix-room--footer state timeline model)))
         (appkit-chat-timeline-ensure
          :printer #'matrix-room--print-row
@@ -647,21 +654,19 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
        (stringp (plist-get item :event_id))
        (not (member (plist-get item :kind) '("state" "day" "read_marker")))))
 
-(defun matrix-room--first-unread-key (items)
-  "Find the first canonical event after the SDK ReadMarker in ordered ITEMS.
-Never infer a frontier from a room's unread count or event ID ordering."
-  (let (after-marker key)
-    (while (and items (not key))
-      (let ((item (pop items)))
-        (cond
-         ((equal (plist-get item :kind) "read_marker") (setq after-marker t))
-         ((and after-marker (matrix-room--read-capable-p item))
-          (setq key (plist-get item :id))))))
-    key))
+(defun matrix-room--first-unread-key (timeline)
+  "Resolve TIMELINE's SDK-derived unread index in its exact revision.
+The fully-read marker alone may lag the user's private read receipt."
+  (let ((index (plist-get (plist-get timeline :read_state) :first_unread_index)))
+    (when (and (integerp index) (>= index 0))
+      (let ((item (nth index (plist-get timeline :items))))
+        (when (matrix-room--read-capable-p item)
+          (plist-get item :id))))))
 
 (defun matrix-room-read-through ()
   "Acknowledge the selected remote event, or newest loaded event in composer.
-Advance SDK fully-read and private receipts without dismissing the session bar."
+Advance fully-read and private receipts.
+SDK complete-read evidence clears the bar."
   (interactive)
   (let* ((surface (matrix--current-surface 'room))
          (app (appkit-surface-app surface))

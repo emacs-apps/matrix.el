@@ -111,6 +111,7 @@ A skipped revision signals `matrix-timeline-gap'.  Neither input is mutated."
           (signal 'matrix-timeline-gap nil))
         (list :subscription_id (plist-get timeline :subscription_id)
               :revision revision :loading nil :error nil
+              :read_state (plist-get event :read_state)
               :items (matrix-state--items
                       (matrix-state--array (plist-get event :items)))))
        ((equal (plist-get event :type) "timeline_diff")
@@ -118,6 +119,7 @@ A skipped revision signals `matrix-timeline-gap'.  Neither input is mutated."
           (signal 'matrix-timeline-gap nil))
         (list :subscription_id (plist-get timeline :subscription_id)
               :revision revision :loading nil :error nil
+              :read_state (plist-get event :read_state)
               :items (matrix-state-apply-changes
                       (plist-get timeline :items) (plist-get event :changes))))
        (t (signal 'matrix-protocol-error '("Unknown timeline notification")))))))

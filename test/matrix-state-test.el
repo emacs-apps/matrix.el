@@ -91,5 +91,32 @@
       :revision 1 :changes [(:op "push_back" :item (:id "a" :body "message"))]))
    :type 'matrix-timeline-gap))
 
+(ert-deftest matrix-state-read-metadata-is-revision-and-subscription-owned ()
+  (let* ((initial (matrix-state-timeline-update
+                   '(:subscription_id "one")
+                   '(:type "timeline_reset" :subscription_id "one" :revision 0
+                     :items [(:id "a" :body "current")]
+                     :read_state (:unread_messages 2))))
+         (complete '(:type "timeline_diff" :subscription_id "one" :revision 1
+                     :changes [] :read_state (:unread_messages 0 :all_read t)))
+         (read (matrix-state-timeline-update initial complete)))
+    (should (= (plist-get (plist-get initial :read_state) :unread_messages) 2))
+    (should (= (plist-get (plist-get read :read_state) :unread_messages) 0))
+    (should (eq (plist-get (plist-get read :read_state) :all_read) t))
+    (should (equal (plist-get initial :items) (plist-get read :items)))
+    (should (eq (matrix-state-timeline-update read complete) 'stale))
+    (should (eq (matrix-state-timeline-update
+                 initial (plist-put (copy-sequence complete) :subscription_id "old"))
+                'stale))
+    (should-error (matrix-state-timeline-update
+                   initial (plist-put (copy-sequence complete) :revision 2))
+                  :type 'matrix-timeline-gap)
+    ;; Absent metadata becomes unknown, never a retained authoritative zero.
+    (should-not
+     (plist-get
+      (matrix-state-timeline-update
+       read '(:type "timeline_diff" :subscription_id "one" :revision 2 :changes []))
+      :read_state))))
+
 (provide 'matrix-state-test)
 ;;; matrix-state-test.el ends here

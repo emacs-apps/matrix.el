@@ -21,12 +21,13 @@
                               :membership "join" :encrypted t)))
           :timelines timelines :verifications (make-hash-table :test #'equal))))
 
-(defun matrix-ui-test--items-state (items)
-  "Return an account snapshot whose authoritative timeline contains ITEMS."
+(defun matrix-ui-test--items-state (items &optional read-state)
+  "Return a snapshot with authoritative ITEMS and nullable READ-STATE metadata."
   (let* ((state (matrix-ui-test--state ""))
          (timelines (plist-get state :timelines))
          (timeline (gethash "!room:test" timelines)))
-    (puthash "!room:test" (plist-put timeline :items items) timelines)
+    (puthash "!room:test"
+             (plist-put (plist-put timeline :items items) :read_state read-state) timelines)
     state))
 
 (defun matrix-ui-test--open (app &optional buffer)
@@ -660,7 +661,8 @@
            (marker '(:id "marker" :kind "read_marker"))
            (day '(:id "day" :kind "day" :timestamp 2000)))
       (appkit-chatbuf-input-replace "Keep draft")
-      (appkit-app-send app (matrix-ui-test--items-state (list before marker day after)))
+      (appkit-app-send app (matrix-ui-test--items-state
+                           (list before marker day after) '(:first_unread_index 3)))
       (appkit-surface-send surface '(matrix-update timeline "!room:test"))
       (should (equal (appkit-chat-timeline-keys) '("before" "day" "after")))
       (should (equal matrix-room--unread-key "after"))
@@ -668,14 +670,62 @@
                          (appkit-chat-timeline-row "after")) :unread))
       (should-not (plist-get (appkit-chat-timeline-row-context
                              (appkit-chat-timeline-row "after")) :compact))
-      ;; Server receipts remove/move the SDK marker, not this reading-session bar.
+      ;; A missing/moved marker alone is not authoritative complete-read evidence.
       (appkit-app-send app (matrix-ui-test--items-state (list before after marker)))
       (appkit-surface-send surface '(matrix-update timeline "!room:test"))
       (should (equal matrix-room--unread-key "after"))
       (should (equal (appkit-chatbuf-input-string) "Keep draft"))
       (goto-char (text-property-any (point-min) (point-max) 'appkit-chat-read-divider t))
       (should-not (appkit-chat-read-target))
-      (should-not (matrix-room--first-unread-key (list before after))))))
+      (should-not (matrix-room--first-unread-key (list :items (list before after))))
+      (appkit-app-send app (matrix-ui-test--items-state (list before after)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (equal matrix-room--unread-key "after"))
+      ;; Another client's confirmed frontier clears even while old marker rows remain.
+      (appkit-app-send app (matrix-ui-test--items-state
+                           (list before marker after) '(:all_read t)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should-not matrix-room--unread-key)
+      (should-not (text-property-any (point-min) (point-max) 'appkit-chat-read-divider t))
+      (should-not (plist-get (appkit-chat-timeline-row-context
+                             (appkit-chat-timeline-row "after")) :unread))
+      ;; New traffic with an unresolved position cannot revive the old marker.
+      (appkit-app-send app (matrix-ui-test--items-state (list before marker after)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should-not matrix-room--unread-key)
+      (let ((new '(:id "new" :kind "message" :event_id "$new:test"
+                   :can_read t :sender "@other:test" :body "New unread")))
+        (appkit-app-send app (matrix-ui-test--items-state
+                             (list before marker after new) '(:first_unread_index 3)))
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (should (equal matrix-room--unread-key "new")))
+      (should (equal (appkit-chatbuf-input-string) "Keep draft")))))
+
+(ert-deftest matrix-ui-exact-count-is-independent-of-notification-badge ()
+  (matrix-ui-test--with-room
+    (let* ((appkit-chat-show-unread-divider t)
+           (items '((:id "before" :kind "message" :event_id "$z:test" :can_read t
+                     :sender "@other:test" :timestamp 1000 :body "Before")
+                    (:id "marker" :kind "read_marker")
+                    (:id "after" :kind "message" :event_id "$a:test" :can_read t
+                     :sender "@other:test" :timestamp 2000 :body "After"))))
+      (appkit-chatbuf-input-replace "Keep draft")
+      (dolist (count '(2 1 nil 0))
+        (let* ((state (matrix-ui-test--items-state
+                       items (list :unread_messages count :first_unread_index 2)))
+               (room (car (plist-get state :rooms))))
+          (setf (plist-get room :unread) 0)
+          (appkit-app-send app state)
+          (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+          (if (eql count 0)
+              (progn
+                (should-not matrix-room--unread-key)
+                (should-not (text-property-any (point-min) (point-max)
+                                              'appkit-chat-read-divider t)))
+            (should (equal matrix-room--unread-key "after")))
+          (should (string-match-p "\\[E2EE\\]" matrix--header-line))
+          (should-not (string-match-p "Encrypted room" matrix--header-line))
+          (should (equal (appkit-chatbuf-input-string) "Keep draft")))))))
 
 (ert-deftest matrix-ui-read-through-targets-loaded-event-without-owning-send ()
   (matrix-ui-test--with-room
