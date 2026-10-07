@@ -4,6 +4,10 @@
 ;; SDK timeline IDs own generated rows.  The composer is a separate AppKit
 ;; region, never rebuilt by sync.  An accepted send clears only its captured
 ;; revision; delivery and encryption state remain SDK authority.
+;; The SDK ReadMarker supplies an exact first-unread position, latched by the
+;; shared reading-session projection.  Receipts never move or clear that bar.
+;; C-c C-k acknowledges only the selected remote event (newest loaded eligible
+;; event from the composer), using SDK fully-read and private read receipts.
 
 ;;; Code:
 
@@ -12,6 +16,7 @@
 (require 'appkit-chat-timeline)
 (require 'appkit-chat-history)
 (require 'appkit-chat-ins)
+(require 'appkit-chat-read)
 (require 'appkit-chat-avatar)
 (require 'appkit-name-color)
 (require 'appkit-ui)
@@ -26,6 +31,9 @@
 
 (defvar-local matrix-room--width 80
   "Width of the last committed room presentation.")
+
+(defvar-local matrix-room--unread-key nil
+  "Stable reading-session boundary returned by the shared read projection.")
 
 (defvar matrix-room-navigation-map
   (let ((map (make-sparse-keymap)))
@@ -66,6 +74,7 @@
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
     (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
+    (define-key map (kbd "C-c C-k") #'matrix-room-read-through)
     map)
   "Keymap for `matrix-room-mode'.")
 
@@ -88,6 +97,8 @@
 (define-derived-mode matrix-room-mode appkit-chatbuf-mode "Matrix-Room"
   "Matrix room with a read-only timeline and structured editable composer.
 RET submits text and staged attachments; Shift-Return inserts a newline.
+C-c C-k acknowledges through the selected message, or newest loaded message
+from the composer, without changing the draft or the session unread bar.
 Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (matrix-compose-setup)
@@ -226,8 +237,10 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
   "Group adjacent messages by stable sender and a five-minute interval."
   (list
    :self (eq (plist-get item :own) t)
+   :unread (equal (plist-get item :id) matrix-room--unread-key)
    :compact
-   (and (equal (plist-get previous :kind) "message")
+   (and (not (equal (plist-get item :id) matrix-room--unread-key))
+        (equal (plist-get previous :kind) "message")
         (equal (plist-get item :kind) "message")
         (equal (plist-get previous :sender) (plist-get item :sender))
         (plist-get item :sender)
@@ -325,13 +338,16 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
          (kind (plist-get item :kind))
          (context (appkit-chat-timeline-row-context row))
          (timestamp (plist-get item :timestamp))
-         (start (point)))
+         start)
+    (when (plist-get context :unread)
+      (appkit-chat-read-insert-divider matrix-room--width))
+    (setq start (point))
     (pcase kind
-      ((or "day" "read_marker")
+      ("day"
        (appkit-chat-ins-insert-divider-row
-        (if (and (equal kind "day") (numberp timestamp))
+        (if (numberp timestamp)
             (format-time-string "%Y-%m-%d" (seconds-to-time (/ timestamp 1000.0)))
-          (matrix--one-line (or (plist-get item :body) "Read up to here")))
+          (matrix--one-line (or (plist-get item :body) "Day")))
         'shadow matrix-room--width))
       (_
        (let* ((sender (or (plist-get item :sender) "Unknown sender"))
@@ -414,14 +430,19 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
            (items
             ;; Bounds refer to raw SDK rows, including protocol-only entries.
             (seq-remove
-             (lambda (item) (equal (plist-get item :kind) "state"))
+             (lambda (item) (member (plist-get item :kind) '("state" "read_marker")))
              (plist-get (appkit-chat-history-window-slice
                          (plist-get timeline :items) (lambda (item) (plist-get item :id)))
                         :entries)))
            (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
       (setq matrix-room--width (matrix--width surface))
+      (setq matrix-room--unread-key
+            (appkit-chat-read-update
+             (mapcar (lambda (item) (plist-get item :id)) items)
+             :first-unread-key (matrix-room--first-unread-key (plist-get timeline :items))
+             :known-p (and timeline t)))
       (matrix--frame
-       state (or (plist-get room :name) room-id) nil
+       state nil nil
        (pcase (plist-get room :encrypted)
          ('t (propertize "[E2EE]" 'face 'success
                          'help-echo "Encrypted room; Matrix SDK enforces device trust."))
@@ -563,7 +584,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
            (lambda (candidate)
              (and (not (member (plist-get (appkit-chat-timeline-row-payload
                                           (appkit-chat-timeline-row candidate)) :kind)
-                               '("day" "read_marker")))
+                               '("day")))
                   (funcall (if backward #'< #'>)
                            (appkit-chat-timeline-key-position candidate) position)))
            (if backward (reverse keys) keys))))
@@ -620,6 +641,50 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
              (if (equal method "message.redact") "Redaction accepted by SDK."
                (format "%s completed" method)))))
    (t (matrix-compose-result model result error context))))
+
+(defun matrix-room--read-capable-p (item)
+  "Whether ITEM is a canonical remote SDK event that can be acknowledged."
+  (and (eq (plist-get item :can_read) t)
+       (stringp (plist-get item :event_id))
+       (not (member (plist-get item :kind) '("state" "day" "read_marker")))))
+
+(defun matrix-room--first-unread-key (items)
+  "Find the first canonical event after the SDK ReadMarker in ordered ITEMS.
+Never infer a frontier from a room's unread count or event ID ordering."
+  (let (after-marker key)
+    (while (and items (not key))
+      (let ((item (pop items)))
+        (cond
+         ((equal (plist-get item :kind) "read_marker") (setq after-marker t))
+         ((and after-marker (matrix-room--read-capable-p item))
+          (setq key (plist-get item :id))))))
+    key))
+
+(defun matrix-room-read-through ()
+  "Acknowledge the selected remote event, or newest loaded event in composer.
+Advance SDK fully-read and private receipts without dismissing the session bar."
+  (interactive)
+  (let* ((surface (matrix--current-surface 'room))
+         (app (appkit-surface-app surface))
+         (state (matrix-runtime-state app))
+         (model (appkit-surface-model surface))
+         (room-id (cadr (appkit-surface-identity surface)))
+         (subscription (plist-get (matrix-room--timeline state room-id) :subscription_id))
+         (row (appkit-chat-read-target
+               nil (lambda (candidate)
+                     (matrix-room--read-capable-p
+                      (appkit-chat-timeline-row-payload candidate)))))
+         (event-id (and row (plist-get (appkit-chat-timeline-row-payload row) :event_id))))
+    (unless (and event-id subscription
+                 (appkit-surface-live-p surface)
+                 (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
+                 (plist-get state :backend-active) (plist-get state :session))
+      (user-error "No read-capable message in this live Matrix timeline"))
+    ;; A receipt owns neither the composer nor the durable-send operation slot.
+    (matrix-runtime-request
+     app "timeline.read"
+     (list :room_id room-id :subscription_id subscription :event_id event-id)
+     (list :target (plist-get model :address) :subscription subscription))))
 
 (defvar matrix-room--type
   (matrix--surface-type 'matrix-room #'matrix-room-mode #'matrix-room--render)

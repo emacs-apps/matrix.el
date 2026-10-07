@@ -650,5 +650,65 @@
           (should (equal (appkit-chatbuf-input-string) "Unsent draft"))
           (should (equal (appkit-chat-timeline-keys) '("stable-row"))))))))
 
+(ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
+  (matrix-ui-test--with-room
+    (let* ((appkit-chat-show-unread-divider t)
+           (before '(:id "before" :kind "message" :event_id "$z:test" :can_read t
+                     :sender "@other:test" :timestamp 1000 :body "Before"))
+           (after '(:id "after" :kind "message" :event_id "$a:test" :can_read t
+                    :sender "@other:test" :timestamp 2000 :body "After"))
+           (marker '(:id "marker" :kind "read_marker"))
+           (day '(:id "day" :kind "day" :timestamp 2000)))
+      (appkit-chatbuf-input-replace "Keep draft")
+      (appkit-app-send app (matrix-ui-test--items-state (list before marker day after)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (equal (appkit-chat-timeline-keys) '("before" "day" "after")))
+      (should (equal matrix-room--unread-key "after"))
+      (should (plist-get (appkit-chat-timeline-row-context
+                         (appkit-chat-timeline-row "after")) :unread))
+      (should-not (plist-get (appkit-chat-timeline-row-context
+                             (appkit-chat-timeline-row "after")) :compact))
+      ;; Server receipts remove/move the SDK marker, not this reading-session bar.
+      (appkit-app-send app (matrix-ui-test--items-state (list before after marker)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (equal matrix-room--unread-key "after"))
+      (should (equal (appkit-chatbuf-input-string) "Keep draft"))
+      (goto-char (text-property-any (point-min) (point-max) 'appkit-chat-read-divider t))
+      (should-not (appkit-chat-read-target))
+      (should-not (matrix-room--first-unread-key (list before after))))))
+
+(ert-deftest matrix-ui-read-through-targets-loaded-event-without-owning-send ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let* ((state (matrix-ui-test--items-state
+                   '((:id "old" :kind "message" :event_id "$z:test" :can_read t :body "Old")
+                     (:id "new" :kind "message" :event_id "$a:test" :can_read t :body "New")
+                     (:id "echo" :kind "message" :body "Pending" :send_state "pending"))))
+           requests context)
+      (setq state (plist-put state :backend-active t))
+      (appkit-app-send app state)
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (appkit-chatbuf-input-replace "Durable send draft")
+      (let ((send (matrix-ui-test--capture surface 7)))
+        (cl-letf (((symbol-function 'matrix-runtime-request)
+                   (lambda (_app method params owned)
+                     (push (list method params) requests) (setq context owned) 1)))
+          (appkit-chatbuf-focus-input)
+          (matrix-room-read-through)
+          (should (equal (plist-get (cadar requests) :event_id) "$a:test"))
+          (goto-char (appkit-chat-timeline-key-position "old"))
+          (matrix-room-read-through)
+          (should (equal (plist-get (cadar requests) :event_id) "$z:test"))
+          (goto-char (appkit-chat-timeline-key-position "echo"))
+          (should-error (matrix-room-read-through) :type 'user-error))
+        (appkit-surface-send surface (list 'matrix-result 1 "timeline.read" nil nil context))
+        (should (equal (plist-get (appkit-surface-model surface) :operation) send))
+        (should (equal (appkit-chatbuf-input-string) "Durable send draft"))
+        (setq context (plist-put context :subscription "replaced"))
+        (appkit-surface-send surface
+                             (list 'matrix-result 2 "timeline.read" nil
+                                   '(:message "Stale result") context))
+        (should (equal (plist-get (appkit-surface-model surface) :operation) send))))))
+
 (provide 'matrix-ui-test)
 ;;; matrix-ui-test.el ends here

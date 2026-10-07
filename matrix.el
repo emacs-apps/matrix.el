@@ -71,7 +71,7 @@
    matrix--header-line
    (concat " Matrix" (when badge (concat " " badge))
            " · " (matrix--one-line (plist-get state :account))
-           " · " (matrix--one-line title)
+           (when title (concat " · " (matrix--one-line title)))
            (when (and detail (not (string-empty-p detail)))
              (concat "  " (matrix--one-line detail)))))
   (setq-local header-line-format '(:eval matrix--header-line))
@@ -295,6 +295,15 @@ Register ROOM-ID's timeline when provided; retain the reading position."
         :model (let ((next (plist-put (copy-sequence model) :operation operation)))
                  (if room-p next (plist-put next :notice nil)))
         :render (appkit-projection-change-create :frame-p t)))
+      (`(matrix-result ,_id "timeline.read" ,_result ,error ,owned)
+       (if (and room-p
+                (equal (plist-get model :address) (plist-get owned :target))
+                (equal (plist-get owned :subscription)
+                       (plist-get (matrix-room--timeline
+                                   state (cadr (plist-get model :identity))) :subscription_id)))
+           (if error (matrix--feedback-next model (matrix--error-text error))
+             (appkit-next :model model :render appkit-render-none))
+         (appkit-next :model model :render appkit-render-none)))
       (`(matrix-result ,_id "timeline.paginate" ,result ,error ,owned)
        (if-let* ((next (and room-p
                            (matrix-room--history-complete model state result error owned))))

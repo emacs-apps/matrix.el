@@ -5,6 +5,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use matrix_sdk::{
     Client, RoomState,
     attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo},
+    room::Receipts,
     room::reply::{EnforceThread, Reply},
     room::edit::{EditError as RoomEditError, EditedContent},
     ruma::{
@@ -229,6 +230,8 @@ struct Subscription {
     // Closing/replacing a view waits for already-admitted SDK queue operations,
     // without holding the room map or blocking unrelated rooms.
     mutations: Mutex<()>,
+    // Read receipts serialize independently of composer/durable message mutations.
+    receipts: Mutex<()>,
 }
 
 impl Subscription {
@@ -332,6 +335,7 @@ impl Timelines {
                 cancel: self.cancel.child_token(),
                 tasks: TaskTracker::new(),
                 mutations: Mutex::new(()),
+                receipts: Mutex::new(()),
             });
             let operation = subscription.tasks.token();
             let old = rooms.insert(room_id, subscription.clone());
@@ -713,6 +717,46 @@ impl Timelines {
         Ok(lease)
     }
 
+    pub async fn read_through(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        event_id: &EventId,
+    ) -> Result<()> {
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let operation = async {
+            let _receipt = subscription.receipts.lock().await;
+            if !self.is_current(room_id, &subscription).await {
+                return Err(STALE_SUBSCRIPTION);
+            }
+            let timeline = mutation_timeline(&subscription)?;
+            let items = timeline.items().await;
+            if !items.iter().filter_map(|item| item.as_event())
+                .any(|event| event.event_id() == Some(event_id) && read_capable(event))
+            {
+                return Err(EVENT_MISSING);
+            }
+            drop(items);
+            // The SDK compares timeline positions and coalesces older receipts.
+            // Never use mark_as_read: its account cache may include unseen events.
+            timeline.send_multiple_receipts(
+                Receipts::new()
+                    .fully_read_marker(event_id.to_owned())
+                    .private_read_receipt(event_id.to_owned()),
+            ).await.map_err(|_| NETWORK)?;
+            if !self.is_current(room_id, &subscription).await {
+                return Err(STALE_SUBSCRIPTION);
+            }
+            Ok(())
+        };
+        tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
+            result = operation => result,
+        }
+    }
+
     pub async fn edit(
         &self,
         room_id: &OwnedRoomId,
@@ -970,8 +1014,16 @@ fn reply_metadata(reply: &InReplyToDetails) -> Value {
     value
 }
 
+fn read_capable(event: &EventTimelineItem) -> bool {
+    event.is_remote_event()
+        && event.event_id().is_some()
+        && (event.content().as_message().is_some()
+            || event.content().is_unable_to_decrypt()
+            || event.content().is_redacted())
+}
+
 fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
-    let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false, "can_reply":false});
+    let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false, "can_reply":false, "can_read":false});
     if let Some(event) = item.as_event() {
         value["event_id"] = json!(event.event_id());
         value["transaction_id"] = json!(event.transaction_id());
@@ -989,6 +1041,7 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
         value["can_edit"] = json!(permissions.can_edit(event));
         value["can_redact"] = json!(permissions.can_redact(event));
         value["can_reply"] = json!(event.can_be_replied_to());
+        value["can_read"] = json!(read_capable(event));
         if let Some(reply) = event.content().in_reply_to() {
             value["reply"] = reply_metadata(&reply);
         }
@@ -1321,6 +1374,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_read_through_replacement_revokes_inflight_receipt() {
+        let (server, _client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$target", "@other:example.org", json!({"msgtype":"m.text", "body":"selected"})),
+        ]).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/read_markers$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({}))
+                .set_delay(Duration::from_secs(4)))
+            .mount(&server).await;
+        let timelines = Arc::new(timelines);
+        let reading = timelines.clone();
+        let request = tokio::spawn(async move {
+            reading.read_through(&owned_room_id!("!room:example.org"), "active",
+                event_id!("$target")).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server.received_requests().await.unwrap().iter()
+                    .any(|request| request.url.path().ends_with("/read_markers")) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let (_, _, replacement_operation) = timelines
+            .reserve(owned_room_id!("!room:example.org"), "replacement".into()).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), request)
+            .await.unwrap().unwrap().unwrap_err().code, "stale_subscription");
+        drop(replacement_operation);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_read_through_uses_exact_remote_event_and_independent_receipt_lease() {
+        let (server, _client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$z", "@other:example.org", json!({"msgtype":"m.text", "body":"selected"})),
+            message("$a", "@other:example.org", json!({"msgtype":"m.text", "body":"unseen"})),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        Mock::given(method("POST"))
+            .and(path_regex(r"/read_markers$"))
+            .and(wiremock::matchers::body_json(json!({
+                "m.fully_read":"$z", "m.read.private":"$z"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server).await;
+        assert_eq!(snapshot_row(&timelines, event_id!("$z")).await["can_read"], true);
+        assert_eq!(timelines.read_through(&room, "active", event_id!("$missing"))
+            .await.unwrap_err().code, "event_missing");
+        assert_eq!(timelines.read_through(&room, "replaced", event_id!("$z"))
+            .await.unwrap_err().code, "stale_subscription");
+        let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+        let mutation = subscription.mutations.lock().await;
+        tokio::time::timeout(Duration::from_secs(5),
+            timelines.read_through(&room, "active", event_id!("$z"))).await.unwrap().unwrap();
+        drop(mutation);
+        drop(operation);
+        timelines.unsubscribe(&room, "active").await;
+        assert_eq!(timelines.read_through(&room, "active", event_id!("$a"))
+            .await.unwrap_err().code, "stale_subscription");
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn sdk_mutation_permissions_distinguish_author_moderator_and_missing_plaintext() {
         let mut gone = message("$gone", "@me:example.org", json!({}));
         gone["unsigned"] = json!({"redacted_because":{
@@ -1382,6 +1500,7 @@ mod tests {
                     let flags = item(local, mutation_permissions(timeline.room()).await.unwrap());
                     assert_eq!(flags["can_edit"], false);
                     assert_eq!(flags["can_redact"], false);
+                    assert_eq!(flags["can_read"], false);
                     break;
                 }
                 for diff in local_updates.next().await.unwrap() { diff.apply(&mut local_items); }

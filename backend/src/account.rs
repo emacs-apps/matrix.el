@@ -279,6 +279,14 @@ impl Backend {
                     }
                     return Ok(json!({}));
                 }
+                if method == "timeline.read" {
+                    let args: RedactParam = params(value)?;
+                    let timelines = account.timelines.clone();
+                    drop(slot);
+                    timelines.read_through(&args.room_id, &args.subscription_id, &args.event_id)
+                        .await?;
+                    return Ok(json!({}));
+                }
                 if method == "timeline.paginate" {
                     let args: PaginateParam = params(value)?;
                     let timelines = account.timelines.clone();
