@@ -6,8 +6,8 @@
 ;; revision; delivery and encryption state remain SDK authority.
 ;; The SDK ReadMarker supplies an exact first-unread position, latched by the
 ;; shared reading-session projection.  Receipts never move or clear that bar.
-;; C-c C-k acknowledges only the selected remote event (newest loaded eligible
-;; event from the composer), using SDK fully-read and private read receipts.
+;; `matrix-room-read-through' explicitly acknowledges the selected remote event
+;; (newest loaded eligible event from the composer) through private SDK receipts.
 
 ;;; Code:
 
@@ -74,7 +74,6 @@
     (set-keymap-parent map appkit-chatbuf-mode-map)
     (define-key map (kbd "C-c C-r") #'matrix-accounts)
     (define-key map (kbd "C-c C-u") #'matrix-room-review-send)
-    (define-key map (kbd "C-c C-k") #'matrix-room-read-through)
     map)
   "Keymap for `matrix-room-mode'.")
 
@@ -97,8 +96,8 @@
 (define-derived-mode matrix-room-mode appkit-chatbuf-mode "Matrix-Room"
   "Matrix room with a read-only timeline and structured editable composer.
 RET submits text and staged attachments; Shift-Return inserts a newline.
-C-c C-k acknowledges through the selected message, or newest loaded message
-from the composer, without changing the draft or the session unread bar.
+\\[matrix-room-read-through] acknowledges through the selected message, or newest
+loaded message from the composer, without changing the draft or session bar.
 Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (matrix-compose-setup)
