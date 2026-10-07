@@ -356,10 +356,15 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
              (appkit-ui-apply-line-prefix
               heading (point)
               (appkit-ui-make-prefix-state
-               (plist-get prefixes :header) (plist-get prefixes :rest-body)))))
+               (plist-get prefixes :header) (plist-get prefixes :rest-body)))
+             (appkit-ui-append-face heading (point) 'appkit-chat-heading)))
          (let ((body-start (point))
+               (body-prefix
+                (appkit-ui-make-prefix-state
+                 (if compact (plist-get prefixes :rest-body) (plist-get prefixes :first-body))
+                 (plist-get prefixes :rest-body)))
                body-text-start)
-           (matrix-reply-insert item)
+           (matrix-reply-insert item body-prefix)
            (setq body-text-start (point))
            ;; Never interpret formatted_body as HTML or executable markup.
            (insert (if (equal kind "encrypted")
@@ -375,11 +380,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                (matrix-room--insert-time item (plist-get prefixes :rest-body))))
            (when-let* ((error (plist-get item :error)))
              (insert (propertize (format "Error: %s\n" error) 'face 'error)))
-           (appkit-ui-apply-line-prefix
-            body-start (point)
-            (appkit-ui-make-prefix-state
-             (if compact (plist-get prefixes :rest-body) (plist-get prefixes :first-body))
-             (plist-get prefixes :rest-body)))))))
+           (appkit-ui-apply-line-prefix body-text-start (point) body-prefix)))))
     (add-text-properties start (point)
                          (list matrix-room-message-key-property
                                (appkit-chat-timeline-row-key row)

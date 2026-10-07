@@ -14,6 +14,7 @@
 (require 'appkit-chat-timeline)
 (require 'appkit-chat-history)
 (require 'appkit-ui)
+(require 'appkit-chat-ins)
 (require 'appkit-name-color)
 (require 'url-util)
 
@@ -232,30 +233,26 @@
                  (matrix-reply--permalink (plist-get context :room-id) event-id))
         nil))))
 
-(defun matrix-reply-insert (item)
-  "Insert ITEM's SDK relationship as one safe, actionable quote line."
+(defun matrix-reply-insert (item prefix)
+  "Insert ITEM's SDK relationship with the shared body PREFIX state."
   (when-let* ((reply (plist-get item :reply)))
     (let* ((surface (appkit-current-surface))
            (context (append (list :message-id (plist-get item :id)
                                   :source-event-id (plist-get item :event_id)
                                   :event-id (plist-get reply :event_id))
                             (when surface (matrix-reply--context surface))))
-           (ready (equal (plist-get reply :status) "ready"))
-           (label (concat
-                   (propertize "↪ " 'face 'appkit-chatbuf-aux-preview)
-                   (appkit-ui-render-one-line-preview
-                    (appkit-ui-one-line-preview-create
-                     :label (when ready (matrix-reply--sender reply))
-                     :label-face (when ready (matrix-reply--sender-face reply))
-                     :separator ":"
-                     :text (matrix-reply--relation-preview reply))
-                    (max 12 (- (or (and (boundp 'matrix-room--width) matrix-room--width) 80) 6))
-                    :face 'appkit-chatbuf-aux-preview))))
-      (appkit-ui-insert-action-button
-       label (lambda () (matrix-reply--follow (matrix--current-surface 'room) context))
+           (ready (equal (plist-get reply :status) "ready")))
+      (appkit-chat-ins-insert-reply-preview
+       (appkit-ui-one-line-preview-create
+        :label (when ready (matrix-reply--sender reply))
+        :label-face (when ready (matrix-reply--sender-face reply))
+        :text (matrix-reply--relation-preview reply))
+       (max 12 (- (or (and (boundp 'matrix-room--width) matrix-room--width) 80)
+                  (string-width (appkit-ui-prefix-string prefix nil ""))))
+       :prefix prefix
+       :action (lambda () (matrix-reply--follow (matrix--current-surface 'room) context))
        :help-echo "Follow the exact original reply target (Return or click)"
-       :properties (list 'matrix-reply-context context 'rear-nonsticky t))
-      (insert "\n"))))
+       :properties (list 'matrix-reply-context context)))))
 
 (defun matrix-reply-goto ()
   "Follow the exact SDK reply quote or replied-to relationship at point."
