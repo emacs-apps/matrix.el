@@ -25,6 +25,6 @@ rust_binary(
         "@platforms//cpu:x86_64",
     ],
     version = _CRATE["version"],
-    visibility = ["//visibility:public"],
+    visibility = ["//wdoom:__pkg__"],
     deps = all_crate_deps(normal = True),
 )
