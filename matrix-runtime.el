@@ -573,5 +573,31 @@ Cancellation revokes publication, not an already accepted backend read."
   "Refresh APP's room summaries from the backend."
   (matrix-runtime-request app "rooms.list" nil))
 
+(defun matrix-room-members (app room-id resolve &optional reject display-name)
+  "Request ROOM-ID's joined members from APP.
+When DISPLAY-NAME is non-nil, ask the backend for that exact display name
+only.  Call RESOLVE with `matrix-state-members' output, or REJECT with an
+error value.  The read is account-owned and cancellable; return its
+cancellation."
+  (matrix-runtime-resource-request
+   app "room.members"
+   (append (list :room_id room-id)
+           (when display-name (list :display_name display-name)))
+   (lambda (result)
+     (condition-case condition
+         (funcall resolve (matrix-state-members (plist-get result :members)))
+       (error (funcall (or reject #'ignore) condition))))
+   (or reject #'ignore)))
+
+(defun matrix-room-member-resolve (app room-id display-name resolve &optional reject)
+  "Resolve the first joined member of ROOM-ID named DISPLAY-NAME.
+Call RESOLVE with the member plist or nil; REJECT with an error value.  A
+matrix room may contain duplicate display names, so this is best-effort."
+  (matrix-room-members
+   app room-id
+   (lambda (members)
+     (funcall resolve (matrix-state-member-by-display-name members display-name)))
+   reject display-name))
+
 (provide 'matrix-runtime)
 ;;; matrix-runtime.el ends here

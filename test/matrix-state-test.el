@@ -118,5 +118,30 @@
        read '(:type "timeline_diff" :subscription_id "one" :revision 2 :changes []))
       :read_state))))
 
+(ert-deftest matrix-state-members-keep-optional-profile-fields ()
+  (let ((members [(:user_id "@alice:example.org" :display_name "Alice"
+                   :avatar_url "mxc://example.org/alice")
+                  (:user_id "@bob:example.org")]))
+    (should (equal (matrix-state-members members)
+                   '((:user_id "@alice:example.org" :display_name "Alice"
+                      :avatar_url "mxc://example.org/alice")
+                     (:user_id "@bob:example.org"))))))
+
+(ert-deftest matrix-state-members-reject-ambiguous-or-malformed-identities ()
+  (dolist (members (list [(:user_id "@a:example.org") (:user_id "@a:example.org")]
+                         [(:display_name "No identity")]
+                         [(:user_id "")]
+                         [(:user_id "@a:example.org" :display_name 7)]
+                         [(:user_id "@a:example.org" :avatar_url :not-a-string)]))
+    (should-error (matrix-state-members members)
+                  :type 'matrix-protocol-error)))
+
+(ert-deftest matrix-state-member-by-display-name-keeps-backend-order ()
+  (let ((members '((:user_id "@first:example.org" :display_name "Same")
+                   (:user_id "@second:example.org" :display_name "Same"))))
+    (should (equal (matrix-state-member-by-display-name members "Same")
+                   (car members)))
+    (should-not (matrix-state-member-by-display-name members "Absent"))))
+
 (provide 'matrix-state-test)
 ;;; matrix-state-test.el ends here
