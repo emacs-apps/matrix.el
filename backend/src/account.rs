@@ -8,7 +8,7 @@ use std::{
 };
 
 use matrix_sdk::{
-    Client, RoomState,
+    Client, RoomMemberships, RoomState,
     config::{RequestConfig, SyncSettings},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     latest_events::LatestEventValue,
@@ -48,6 +48,9 @@ const CORRUPT: RpcError = RpcError::new(
     "session_corrupt",
     "Saved session or SDK store is corrupt; no new device was created",
 );
+// Bound one member snapshot so a pathological room cannot exceed the frame
+// limit and tear down the transport; the response reports truncation.
+const MEMBERS_LIMIT: usize = 4096;
 
 pub struct Backend {
     store: Arc<Store>,
@@ -83,6 +86,12 @@ struct Login {
 #[serde(deny_unknown_fields)]
 struct RoomParam {
     room_id: OwnedRoomId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembersParam {
+    room_id: OwnedRoomId,
+    display_name: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -632,6 +641,46 @@ impl Account {
                 room.leave().await.map_err(|_| NETWORK)?;
                 Ok(json!({}))
             }
+            "room.members" => {
+                let args: MembersParam = params(value)?;
+                if args
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|name| name.len() > 512)
+                {
+                    return Err(INVALID);
+                }
+                let room = self
+                    .client
+                    .get_room(&args.room_id)
+                    .ok_or(RpcError::new("room_missing", "Room is not known"))?;
+                let members = room
+                    .members(RoomMemberships::JOIN)
+                    .await
+                    .map_err(|_| NETWORK)?;
+                let mut result = Vec::new();
+                let mut truncated = false;
+                for member in members {
+                    if let Some(filter) = &args.display_name
+                        && member.display_name() != Some(filter.as_str())
+                    {
+                        continue;
+                    }
+                    if result.len() >= MEMBERS_LIMIT {
+                        truncated = true;
+                        break;
+                    }
+                    let mut entry = json!({"user_id":member.user_id()});
+                    if let Some(name) = member.display_name() {
+                        entry["display_name"] = json!(name);
+                    }
+                    if let Some(uri) = member.avatar_url() {
+                        entry["avatar_url"] = json!(uri);
+                    }
+                    result.push(entry);
+                }
+                Ok(json!({"members":result, "truncated":truncated}))
+            }
             "message.send" => {
                 let args: SendParam = params(value)?;
                 self.timelines
@@ -1043,6 +1092,21 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn members_rpc_accepts_only_room_identity_and_exact_filter() {
+        let value = json!({"room_id":"!room:example.org", "display_name":"Alice"});
+        let args: MembersParam = params(value.clone()).unwrap();
+        assert_eq!(args.room_id.as_str(), "!room:example.org");
+        assert_eq!(args.display_name.as_deref(), Some("Alice"));
+        assert!(params::<MembersParam>(json!({"room_id":"!room:example.org"})).is_ok());
+        let mut extra = value.clone();
+        extra["user_id"] = json!("@alice:example.org");
+        assert!(params::<MembersParam>(extra).is_err());
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("room_id");
+        assert!(params::<MembersParam>(missing).is_err());
     }
 
     #[test]

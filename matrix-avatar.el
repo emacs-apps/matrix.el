@@ -54,6 +54,27 @@ The SDK remains responsible for authoritative URI validation."
      :sharing-policy 'app-private
      :cache-policy 'while-interested)))
 
+(defun matrix-avatar-fetch (app uri resolve &optional reject)
+  "Fetch URI's avatar through APP to a private local file.
+RESOLVE receives the source file path; REJECT receives an error value.  The
+backend performs authenticated acquisition and only a path inside APP's
+private store is published.  Unlike `matrix-avatar-demand', this is usable
+outside a Surface.  Return a cancellation."
+  (let* ((transport (plist-get (appkit-app-model app) :transport))
+         (store (and (matrix-rpc-transport-p transport)
+                     (matrix-rpc-transport-store transport))))
+    (unless (and store (matrix-avatar--mxc-p uri))
+      (user-error "Matrix avatar requires a connected account and an MXC URI"))
+    (matrix-runtime-resource-request
+     app "media.avatar" (list :uri uri)
+     (lambda (result)
+       (let ((source (condition-case nil
+                         (matrix-avatar--source store result)
+                       (error nil))))
+         (funcall (if source resolve (or reject #'ignore))
+                  (if source (car source) 'invalid-avatar-source))))
+     (or reject #'ignore))))
+
 (defun matrix-avatar--private-p (path directory-p)
   "Whether PATH is owned by this user, private and of the required kind."
   (let ((attributes (file-attributes path 'integer))

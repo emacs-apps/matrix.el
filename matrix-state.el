@@ -137,5 +137,30 @@ A skipped revision signals `matrix-timeline-gap'.  Neither input is mutated."
         (puthash id t seen)))
     rooms))
 
+(defun matrix-state-members (value)
+  "Return joined members with unique, nonempty user identities from VALUE.
+A member's `:display_name' and `:avatar_url' are optional strings."
+  (let ((members (matrix-state--array value))
+        (seen (make-hash-table :test #'equal)))
+    (dolist (member members)
+      (let ((id (plist-get member :user_id))
+            (name (plist-get member :display_name))
+            (avatar (plist-get member :avatar_url)))
+        (unless (and (stringp id) (not (string-empty-p id))
+                     (or (null name) (stringp name))
+                     (or (null avatar) (stringp avatar))
+                     (not (gethash id seen)))
+          (signal 'matrix-protocol-error '("Invalid or duplicate room member")))
+        (puthash id t seen)))
+    members))
+
+(defun matrix-state-member-by-display-name (members display-name)
+  "Return the first MEMBER named DISPLAY-NAME, or nil.
+Duplicate display names keep backend order; this lookup is best-effort, as
+in the bridge bots that only relay a Matrix display name."
+  (seq-find (lambda (member)
+              (equal display-name (plist-get member :display_name)))
+            members))
+
 (provide 'matrix-state)
 ;;; matrix-state.el ends here
