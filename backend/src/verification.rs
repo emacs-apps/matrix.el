@@ -49,8 +49,8 @@ impl Verifications {
             .add_event_handler(move |event: ToDeviceKeyVerificationRequestEvent| {
                 let weak = weak.clone();
                 async move {
-                    if let Some(this) = weak.upgrade() {
-                        if let Some(request) = this
+                    if let Some(this) = weak.upgrade()
+                        && let Some(request) = this
                             .client
                             .encryption()
                             .get_verification_request(
@@ -61,7 +61,6 @@ impl Verifications {
                         {
                             let _ = this.watch(request, false).await;
                         }
-                    }
                 }
             });
         let weak = Arc::downgrade(&this);
@@ -221,11 +220,10 @@ impl Verifications {
                             json!(emojis.iter().map(|emoji| emoji.symbol).collect::<Vec<_>>());
                     }
                     let mut flows = self.flows.lock().await;
-                    if self.output.event(event).await {
-                        if let Some(flow) = flows.get_mut(key) {
+                    if self.output.event(event).await
+                        && let Some(flow) = flows.get_mut(key) {
                             flow.presented = true;
                         }
-                    }
                 }
                 SasState::Confirmed => {
                     self.emit(key, "confirmed", Some(sas.other_device().device_id()))

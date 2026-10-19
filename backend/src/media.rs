@@ -63,120 +63,104 @@ pub fn source_id(source: &MediaSource) -> String {
     format!("{:x}", writer.0.finalize())
 }
 
-fn check_image_live(
-    lease: &MediaLease,
-    cancel: &CancellationToken,
-    transport: &CancellationToken,
-) -> Result<()> {
-    if lease.cancellation().is_cancelled() || cancel.is_cancelled() || transport.is_cancelled() {
-        Err(MEDIA_CANCELLED)
-    } else {
-        Ok(())
+/// One gated read of a lease's event media: the account, the transport or
+/// the lease's subscription closing revokes it.
+pub struct Download<'a> {
+    pub client: Client,
+    pub timelines: &'a Timelines,
+    pub lease: &'a MediaLease,
+    pub cancel: CancellationToken,
+    pub transport: CancellationToken,
+    pub slots: &'a Semaphore,
+}
+
+impl Download<'_> {
+    fn tokens(&self) -> [CancellationToken; 3] {
+        [self.cancel.clone(), self.transport.clone(), self.lease.cancellation().clone()]
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.tokens().iter().any(CancellationToken::is_cancelled) {
+            Err(MEDIA_CANCELLED)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Fail unless still live and the lease still names the event's source.
+    async fn validate(&self) -> Result<()> {
+        self.check()?;
+        self.lease.validate(self.timelines).await?;
+        self.check()
+    }
+
+    /// Await FUTURE unless the download is revoked first.
+    async fn while_live<T>(&self, future: impl Future<Output = T>) -> Result<T> {
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => Err(MEDIA_CANCELLED),
+            _ = self.transport.cancelled() => Err(MEDIA_CANCELLED),
+            _ = self.lease.cancellation().cancelled() => Err(MEDIA_CANCELLED),
+            value = future => Ok(value),
+        }
+    }
+
+    /// Fetch the decrypted original within a network slot and TIMEOUT.
+    async fn fetch(&self, timeout: Duration, timeout_error: RpcError) -> Result<Vec<u8>> {
+        let _slot = self.while_live(self.slots.acquire()).await?.map_err(|_| MEDIA_CANCELLED)?;
+        self.lease.validate(self.timelines).await?;
+        // SDK cache identities need not include the encryption metadata.
+        // Our complete-source cache is authoritative; also avoid its Vec clone.
+        self.while_live(tokio::time::timeout(
+            timeout,
+            self.client.media().get_media_content(&self.lease.request, false),
+        )).await?.map_err(|_| timeout_error)?.map_err(|_| NETWORK)
     }
 }
 
-/// Await FUTURE unless the account, transport or LEASE's subscription closes first.
-async fn while_live<T>(
-    lease: &MediaLease,
-    cancel: &CancellationToken,
-    transport: &CancellationToken,
-    future: impl Future<Output = T>,
-) -> Result<T> {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(MEDIA_CANCELLED),
-        _ = transport.cancelled() => Err(MEDIA_CANCELLED),
-        _ = lease.cancellation().cancelled() => Err(MEDIA_CANCELLED),
-        value = future => Ok(value),
-    }
-}
-
-pub async fn image(
-    store: Arc<Store>,
-    client: Client,
-    generation: String,
-    timelines: &Timelines,
-    lease: &MediaLease,
-    cancel: CancellationToken,
-    transport: CancellationToken,
-    slots: &Semaphore,
-) -> Result<PathBuf> {
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
+pub async fn image(store: Arc<Store>, generation: String, download: Download<'_>) -> Result<PathBuf> {
+    download.validate().await?;
     let cache_store = store.clone();
     let cache_generation = generation.clone();
-    let cache_source = lease.source_id.clone();
+    let cache_source = download.lease.source_id.clone();
     let cached = tokio::task::spawn_blocking(move || {
         cache_store.cached_image(&cache_generation, &cache_source)
     }).await.map_err(|_| CACHE_WORKER)??;
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
-    check_image_live(lease, &cancel, &transport)?;
+    download.validate().await?;
     if let Some(path) = cached {
         return Ok(path);
     }
-    let _slot = while_live(lease, &cancel, &transport, slots.acquire()).await?
-        .map_err(|_| MEDIA_CANCELLED)?;
-    lease.validate(timelines).await?;
-    let media = client.media();
-    let bytes = while_live(lease, &cancel, &transport, tokio::time::timeout(
-        Duration::from_secs(60),
-        // SDK cache identities need not include the encryption metadata.
-        // Our complete-source cache is authoritative; also avoid its Vec clone.
-        media.get_media_content(&lease.request, false),
-    )).await?.map_err(|_| IMAGE_TIMEOUT)?.map_err(|_| NETWORK)?;
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
+    let bytes = download.fetch(Duration::from_secs(60), IMAGE_TIMEOUT).await?;
+    download.validate().await?;
     if !valid_image(&bytes) {
         return Err(INVALID_IMAGE);
     }
-    let source_id = lease.source_id.clone();
-    let cache_cancel = cancel.clone();
-    let cache_transport = transport.clone();
-    let subscription_cancel = lease.cancellation().clone();
+    let source_id = download.lease.source_id.clone();
+    let tokens = download.tokens();
     let path = tokio::task::spawn_blocking(move || {
-        if cache_cancel.is_cancelled() || cache_transport.is_cancelled() || subscription_cancel.is_cancelled() {
+        if tokens.iter().any(CancellationToken::is_cancelled) {
             return Err(MEDIA_CANCELLED);
         }
         store.cache_image(&generation, &source_id, &bytes)
     }).await.map_err(|_| CACHE_WORKER)??;
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
-    check_image_live(lease, &cancel, &transport)?;
+    download.validate().await?;
     Ok(path)
 }
 
-/// Download LEASE's decrypted attachment to a new DESTINATION outside ROOT.
-pub async fn save(
-    root: PathBuf,
-    client: Client,
-    timelines: &Timelines,
-    lease: &MediaLease,
-    destination: PathBuf,
-    cancel: CancellationToken,
-    transport: CancellationToken,
-    slots: &Semaphore,
-) -> Result<()> {
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
-    if lease.size.is_some_and(|size| size > MAX_FILE_BYTES) {
+/// Download the attachment to a new DESTINATION outside account storage ROOT.
+pub async fn save(root: PathBuf, destination: PathBuf, download: Download<'_>) -> Result<()> {
+    download.validate().await?;
+    if download.lease.size.is_some_and(|size| size > MAX_FILE_BYTES) {
         return Err(FILE_TOO_LARGE);
     }
     let file = tokio::task::spawn_blocking(move || NewFile::reserve(&root, &destination, SAVE_FAILED))
         .await.map_err(|_| CACHE_WORKER)??;
-    let _slot = while_live(lease, &cancel, &transport, slots.acquire()).await?
-        .map_err(|_| MEDIA_CANCELLED)?;
-    lease.validate(timelines).await?;
     // The SDK buffers whole responses; the declared size bounds honest senders.
-    let bytes = while_live(lease, &cancel, &transport, tokio::time::timeout(
-        Duration::from_secs(600),
-        client.media().get_media_content(&lease.request, false),
-    )).await?.map_err(|_| FILE_TIMEOUT)?.map_err(|_| NETWORK)?;
+    let bytes = download.fetch(Duration::from_secs(600), FILE_TIMEOUT).await?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(FILE_TOO_LARGE);
     }
-    check_image_live(lease, &cancel, &transport)?;
-    lease.validate(timelines).await?;
+    download.validate().await?;
     tokio::task::spawn_blocking(move || {
         std::fs::write(file.staged(), &bytes).map_err(|_| SAVE_FAILED)?;
         file.publish()

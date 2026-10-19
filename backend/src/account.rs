@@ -158,20 +158,13 @@ struct AvatarParam {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ImageParam {
+/// An event's media source; media.save also names its destination.
+struct MediaParam {
     room_id: OwnedRoomId,
     subscription_id: String,
     event_id: OwnedEventId,
     source_id: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SaveParam {
-    room_id: OwnedRoomId,
-    subscription_id: String,
-    event_id: OwnedEventId,
-    source_id: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -304,11 +297,10 @@ impl Backend {
                 empty(value)?;
                 let mut slot = self.account.write().await;
                 let account = slot.as_ref().ok_or(no_session())?;
-                if let Err(error) = account.client.matrix_auth().logout().await {
-                    if !unknown_token(error.client_api_error_kind()) {
+                if let Err(error) = account.client.matrix_auth().logout().await
+                    && !unknown_token(error.client_api_error_kind()) {
                         return Err(NETWORK);
                     }
-                }
                 account.shutdown().await;
                 *slot = None;
                 self.store.logout()?;
@@ -392,8 +384,11 @@ impl Backend {
                     .await?;
                     return Ok(json!({"path":path}));
                 }
-                if method == "media.image" {
-                    let args: ImageParam = params(value)?;
+                if matches!(method, "media.image" | "media.save") {
+                    let args: MediaParam = params(value)?;
+                    if args.path.is_some() != (method == "media.save") {
+                        return Err(INVALID);
+                    }
                     let client = account.client.clone();
                     let generation = account.generation.clone();
                     let cancel = account.cancel.clone();
@@ -403,39 +398,24 @@ impl Backend {
                     let lease = timelines.media_lease(
                         &args.room_id, &args.subscription_id, &args.event_id, args.source_id,
                     ).await?;
-                    let path = media::image(
-                        self.store.clone(),
+                    let download = media::Download {
                         client,
-                        generation,
-                        &timelines,
-                        &lease,
+                        timelines: &timelines,
+                        lease: &lease,
                         cancel,
-                        self.timeline_cancel.clone(),
-                        &self.avatar_slots,
-                    ).await?;
-                    return Ok(json!({"path":path}));
-                }
-                if method == "media.save" {
-                    let args: SaveParam = params(value)?;
-                    let client = account.client.clone();
-                    let cancel = account.cancel.clone();
-                    let timelines = account.timelines.clone();
-                    let _operation = account.tasks.token();
-                    drop(slot);
-                    let lease = timelines.media_lease(
-                        &args.room_id, &args.subscription_id, &args.event_id, args.source_id,
-                    ).await?;
-                    media::save(
-                        self.store.root().to_owned(),
-                        client,
-                        &timelines,
-                        &lease,
-                        args.path,
-                        cancel,
-                        self.timeline_cancel.clone(),
-                        &self.avatar_slots,
-                    ).await?;
-                    return Ok(json!({}));
+                        transport: self.timeline_cancel.clone(),
+                        slots: &self.avatar_slots,
+                    };
+                    return match args.path {
+                        Some(path) => {
+                            media::save(self.store.root().to_owned(), path, download).await?;
+                            Ok(json!({}))
+                        }
+                        None => {
+                            let path = media::image(self.store.clone(), generation, download).await?;
+                            Ok(json!({"path":path}))
+                        }
+                    };
                 }
                 account.dispatch(&self.store, method, value).await
             }
@@ -1243,12 +1223,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_rpc_accepts_only_timeline_scoped_identity_not_media_urls_or_keys() {
+    fn media_rpc_accepts_only_timeline_scoped_identity_not_media_urls_or_keys() {
         let value = json!({
             "room_id":"!room:example.org", "subscription_id":"active",
             "event_id":"$image", "source_id":"0".repeat(64)
         });
-        let args: ImageParam = params(value.clone()).unwrap();
+        let args: MediaParam = params(value.clone()).unwrap();
+        assert!(args.path.is_none());
         assert_eq!(args.event_id.as_str(), "$image");
         for (field, content) in [
             ("uri", json!("mxc://example.org/image")),
@@ -1257,12 +1238,12 @@ mod tests {
         ] {
             let mut extra = value.clone();
             extra[field] = content;
-            assert!(params::<ImageParam>(extra).is_err());
+            assert!(params::<MediaParam>(extra).is_err());
         }
         for field in ["room_id", "subscription_id", "event_id", "source_id"] {
             let mut missing = value.clone();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(params::<ImageParam>(missing).is_err());
+            assert!(params::<MediaParam>(missing).is_err());
         }
     }
 
