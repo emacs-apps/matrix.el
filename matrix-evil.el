@@ -20,6 +20,9 @@
 (declare-function matrix-room-next-message "matrix-room" ())
 (declare-function matrix-room-previous-message "matrix-room" ())
 (declare-function matrix-room-return "matrix-room" ())
+(declare-function matrix-room-open-user-at-point "matrix-room" ())
+(declare-function matrix-user-message "matrix-user" ())
+(declare-function matrix-user-copy-id "matrix-user" ())
 
 
 (defcustom matrix-evil-enable-integration t
@@ -31,20 +34,28 @@
   :type '(choice (const nil) (const normal) (const motion) (const emacs) symbol)
   :group 'matrix)
 
-(defconst matrix-evil--modes '(matrix-root-mode matrix-room-mode matrix-verify-mode))
+(defconst matrix-evil--modes
+  '(matrix-root-mode matrix-room-mode matrix-verify-mode matrix-user-mode))
 
 (defun matrix-evil-setup ()
   "Project Matrix's semantic capabilities without promoting native letters."
   (interactive)
   (when (and (featurep 'matrix) (featurep 'evil) matrix-evil-enable-integration)
     (appkit-evil-set-initial-states matrix-evil--modes matrix-evil-initial-state)
-    (dolist (map '(matrix-root-mode-map matrix-verify-mode-map
+    (dolist (map '(matrix-root-mode-map matrix-verify-mode-map matrix-user-mode-map
                   matrix-room-mode-map matrix-room-timeline-mode-map))
       (appkit-bindings-enable-evil map))
+    ;; Point-sensitive and page actions, as QQ projects them.
+    (appkit-evil-map
+      :map matrix-room-timeline-mode-map
+      :nm "g u" #'matrix-room-open-user-at-point
+      :map matrix-user-mode-map
+      :nm "m" #'matrix-user-message "Z y" #'matrix-user-copy-id)
     (appkit-evil-normalize-buffers matrix-evil--modes)))
 
 (with-eval-after-load 'matrix (matrix-evil-setup))
 (with-eval-after-load 'matrix-room (matrix-evil-setup))
+(with-eval-after-load 'matrix-user (matrix-evil-setup))
 (with-eval-after-load 'evil (matrix-evil-setup))
 
 

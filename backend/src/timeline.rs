@@ -1424,11 +1424,12 @@ fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> 
             value["kind"] = json!("encrypted");
             value["body"] =
                 json!("Encrypted message — keys unavailable or sender trust requirements not met");
-        } else if let Some((state_type, text)) = describe::state(event) {
+        } else if let Some(notice) = describe::state(event) {
             value["kind"] = json!("state");
-            value["state_type"] = json!(state_type);
+            value["state_type"] = json!(notice.state_type);
             value["described"] = json!(true);
-            value["body"] = json!(text);
+            value["body"] = json!(notice.body());
+            value["parts"] = notice.parts();
         } else {
             value["kind"] = json!("state");
             value["body"] = json!(
@@ -2024,8 +2025,12 @@ mod tests {
         let row = snapshot_row(&timelines, event_id!("$join")).await;
         assert_eq!((&row["kind"], &row["described"], &row["state_type"], &row["body"]),
             (&json!("state"), &json!(true), &json!("m.room.member"), &json!("Newcomer joined")));
-        assert_eq!(snapshot_row(&timelines, event_id!("$kick")).await["body"],
-            "@me:example.org removed Newcomer: spam");
+        let kick = snapshot_row(&timelines, event_id!("$kick")).await;
+        assert_eq!(kick["body"], "@me:example.org removed Newcomer: spam");
+        assert_eq!(kick["parts"], json!([
+            {"user_id":"@me:example.org", "name":"@me:example.org"}, {"text":" removed "},
+            {"user_id":"@new:example.org", "name":"Newcomer"}, {"text":": spam"},
+        ]));
         assert_eq!(snapshot_row(&timelines, event_id!("$rename")).await["body"],
             "Rob changed their name to Robin");
         assert_eq!(snapshot_row(&timelines, event_id!("$topic")).await["body"],

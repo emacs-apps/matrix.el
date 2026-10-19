@@ -97,6 +97,13 @@
     (kill-new event-id)
     (message "Event ID copied")))
 
+(defun matrix-message-open-sender (scope)
+  "Open the page of the sender of SCOPE's exact message."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (let ((surface (matrix-menu--surface scope)))
+    (matrix-user-open (appkit-surface-app surface)
+                      (plist-get (matrix-menu--message scope) :sender) t)))
+
 (defun matrix-message-copy-link (scope)
   "Copy a Matrix permalink to SCOPE's exact server event."
   (interactive (list (transient-scope 'matrix-message-transient)))
@@ -508,7 +515,8 @@
     ("x" "Discard unsent message" matrix-message-discard-send
      :inapt-if (lambda () (matrix-menu--capability-inapt-p :can_discard)))
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
-    ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
+    ("i" "User page" matrix-message-open-sender)
+    ("I" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
     ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]
   (interactive)
   (setq scope (matrix-menu--capture 'room t scope))

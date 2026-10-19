@@ -15,6 +15,7 @@ use matrix_sdk::{
     latest_events::LatestEventValue,
     ruma::{
         OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
+        UserId,
         api::{
             client::{room::create_room, session::get_login_types::v3::LoginType},
             error::ErrorKind,
@@ -22,7 +23,10 @@ use matrix_sdk::{
         events::{
             AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             InitialStateEvent, SyncMessageLikeEvent,
-            room::{encryption::RoomEncryptionEventContent, message::Relation},
+            room::{
+                encryption::RoomEncryptionEventContent, member::MembershipState,
+                message::Relation,
+            },
         },
     },
 };
@@ -791,6 +795,10 @@ impl Account {
                 }
                 Ok(json!({}))
             }
+            "user.profile" => {
+                let args: UserParam = params(value)?;
+                self.user_profile(&args.user_id).await
+            }
             "dm.open" => {
                 let args: UserParam = params(value)?;
                 if Some(args.user_id.as_ref()) == self.client.user_id() {
@@ -981,6 +989,55 @@ impl Account {
                 "Unknown Matrix RPC method",
             )),
         }
+    }
+
+    /// Describe USER as this account sees them: their profile, the rooms we
+    /// share, our direct chat with them and how far their keys are trusted.
+    async fn user_profile(&self, user: &UserId) -> Result<Value> {
+        const ROOMS_LIMIT: usize = 64;
+        let mut profile = json!({"user_id":user, "self":Some(user) == self.client.user_id()});
+        // Servers may withhold profiles of users we share no room with.
+        if let Ok(response) = self.client.account().fetch_user_profile_of(user).await {
+            for (field, key) in [("displayname", "display_name"), ("avatar_url", "avatar_url"),
+                                 ("m.tz", "time_zone")] {
+                if let Some(text) = response.get(field).and_then(Value::as_str) {
+                    profile[key] = json!(summary_text(text));
+                }
+            }
+        }
+        let mut rooms = Vec::new();
+        for room in self.client.joined_rooms() {
+            if rooms.len() == ROOMS_LIMIT {
+                break;
+            }
+            let Ok(Some(member)) = room.get_member_no_sync(user).await else { continue };
+            if *member.membership() != MembershipState::Join {
+                continue;
+            }
+            if profile.get("display_name").is_none()
+                && let Some(name) = member.display_name()
+            {
+                profile["display_name"] = json!(summary_text(name));
+            }
+            if profile.get("avatar_url").is_none()
+                && let Some(uri) = member.avatar_url()
+            {
+                profile["avatar_url"] = json!(uri);
+            }
+            rooms.push(json!({"room_id":room.room_id(), "name":summary_text(&room_title(&room))}));
+        }
+        profile["rooms"] = json!(rooms);
+        if let Some(room) = self.client.get_dm_room(user) {
+            profile["direct_room"] = json!(room.room_id());
+        }
+        let encryption = self.client.encryption();
+        if let Ok(Some(identity)) = encryption.get_user_identity(user).await {
+            profile["verified"] = json!(identity.is_verified());
+        }
+        if let Ok(devices) = encryption.get_user_devices(user).await {
+            profile["devices"] = json!(devices.devices().count());
+        }
+        Ok(profile)
     }
 
     async fn export_keys(&self, store: &Store, path: &Path, passphrase: &str) -> Result<Value> {
