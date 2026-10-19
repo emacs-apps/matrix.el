@@ -683,8 +683,14 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
              (plist-get (appkit-chat-history-window-slice
                          (plist-get timeline :items) (lambda (item) (plist-get item :id)))
                         :entries)))
-           (header (if (appkit-chat-history-older-loaded-p) "Beginning of history\n" "")))
+           (header ""))
       (setq matrix-room--width (matrix--width surface))
+      (when (appkit-chat-history-older-loaded-p)
+        (let ((width matrix-room--width))
+          (setq header (with-temp-buffer
+                         (appkit-chat-ins-insert-divider-row
+                          "Beginning of history" 'shadow width)
+                         (buffer-string)))))
       (setq matrix-room--unread-key
             (appkit-chat-read-update
              (mapcar (lambda (item) (plist-get item :id)) items)
