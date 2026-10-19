@@ -35,7 +35,7 @@ use zeroize::Zeroizing;
 use crate::{
     media, notification,
     protocol::{INVALID, NETWORK, Output, Result, RpcError, params},
-    storage::{SavedSession, Store},
+    storage::{NewFile, SavedSession, Store},
     timeline::{Attachment, Timelines},
     verification::Verifications,
 };
@@ -124,6 +124,15 @@ struct ImageParam {
     subscription_id: String,
     event_id: OwnedEventId,
     source_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    event_id: OwnedEventId,
+    source_id: String,
+    path: PathBuf,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -343,7 +352,7 @@ impl Backend {
                     let timelines = account.timelines.clone();
                     let _operation = account.tasks.token();
                     drop(slot);
-                    let lease = timelines.image_lease(
+                    let lease = timelines.media_lease(
                         &args.room_id, &args.subscription_id, &args.event_id, args.source_id,
                     ).await?;
                     let path = media::image(
@@ -357,6 +366,28 @@ impl Backend {
                         &self.avatar_slots,
                     ).await?;
                     return Ok(json!({"path":path}));
+                }
+                if method == "media.save" {
+                    let args: SaveParam = params(value)?;
+                    let client = account.client.clone();
+                    let cancel = account.cancel.clone();
+                    let timelines = account.timelines.clone();
+                    let _operation = account.tasks.token();
+                    drop(slot);
+                    let lease = timelines.media_lease(
+                        &args.room_id, &args.subscription_id, &args.event_id, args.source_id,
+                    ).await?;
+                    media::save(
+                        self.store.root().to_owned(),
+                        client,
+                        &timelines,
+                        &lease,
+                        args.path,
+                        cancel,
+                        self.timeline_cancel.clone(),
+                        &self.avatar_slots,
+                    ).await?;
+                    return Ok(json!({}));
                 }
                 account.dispatch(&self.store, method, value).await
             }
@@ -830,32 +861,13 @@ impl Account {
             "key_export_failed",
             "Cannot export keys; select a new file outside account storage",
         );
-        let parent = path
-            .parent()
-            .ok_or(INVALID)?
-            .canonicalize()
-            .map_err(|_| error)?;
-        if parent.starts_with(store.root().canonicalize().map_err(|_| error)?) || path.exists() {
-            return Err(error);
-        }
-        let temp = tempfile::Builder::new()
-            .prefix(".matrix-keys-")
-            .tempdir_in(&parent)
-            .map_err(|_| error)?;
-        let encrypted = temp.path().join("encrypted.keys");
+        let file = NewFile::reserve(store.root(), path, error)?;
         self.client
             .encryption()
-            .export_room_keys(encrypted.clone(), passphrase, |_| true)
+            .export_room_keys(file.staged().to_owned(), passphrase, |_| true)
             .await
             .map_err(|_| error)?;
-        std::fs::File::open(&encrypted)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| error)?;
-        // Atomic, no-clobber publication: existing destinations (including symlinks) are never replaced.
-        std::fs::hard_link(&encrypted, path).map_err(|_| error)?;
-        std::fs::File::open(&parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|_| error)?;
+        file.publish()?;
         Ok(json!({}))
     }
 

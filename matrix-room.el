@@ -363,17 +363,57 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
      (lambda (reaction)
        (if (eq (plist-get reaction :own) t) "Remove your reaction" "Add this reaction")))))
 
+(defun matrix-room--item (surface row-key)
+  "Return SURFACE's current SDK row ROW-KEY, or signal that it is gone."
+  (or (seq-find (lambda (item) (equal row-key (plist-get item :id)))
+                (matrix-runtime-room-items (appkit-surface-app surface)
+                                           (cadr (appkit-surface-identity surface))))
+      (user-error "The message is no longer available")))
+
 (defun matrix-room-toggle-reaction (row-key reaction)
   "Toggle REACTION on this room's message whose SDK row is ROW-KEY."
   (let* ((surface (matrix--current-surface 'room))
-         (item (seq-find (lambda (item) (equal row-key (plist-get item :id)))
-                         (matrix-runtime-room-items
-                          (appkit-surface-app surface)
-                          (cadr (appkit-surface-identity surface))))))
-    (unless item (user-error "The message is no longer available"))
+         (item (matrix-room--item surface row-key)))
     (matrix--request surface "message.react"
                      (append (matrix-room--mutation-params surface item :can_react)
                              (list :key reaction)))))
+
+(defun matrix-room--save-attachment (surface item path on-saved)
+  "Download SURFACE's ITEM attachment to PATH, then call ON-SAVED with PATH."
+  (let* ((app (appkit-surface-app surface))
+         (room (cadr (appkit-surface-identity surface))))
+    (matrix-media-save app room
+                       (plist-get (matrix-room--timeline (matrix-runtime-state app) room)
+                                  :subscription_id)
+                       item path on-saved)))
+
+(defun matrix-room-open-attachment (row-key)
+  "Download a private copy of the attachment of SDK row ROW-KEY and open it."
+  (let* ((surface (matrix--current-surface 'room))
+         (item (matrix-room--item surface row-key)))
+    (pcase-let ((`(,kind ,_source ,name)
+                 (or (matrix-media-attachment item)
+                     (user-error "This message has no downloadable attachment"))))
+      (matrix-room--save-attachment
+       surface item (matrix-media--open-path name)
+       (lambda (path) (funcall matrix-attachment-open-function path kind))))))
+
+(defun matrix-room--insert-attachment (item prefix)
+  "Insert ITEM's file, audio or video card with PREFIX; activating it opens it."
+  (when-let* ((attachment (plist-get item :attachment)))
+    (let ((row-key (plist-get item :id))
+          (size (plist-get attachment :size))
+          (duration (plist-get attachment :duration_ms)))
+      (appkit-chat-ins-insert-media-card
+       :kind (intern (or (plist-get attachment :kind) "file"))
+       :title (matrix--one-line (plist-get attachment :filename))
+       :details (delq nil (list (when (natnump duration)
+                                  (appkit-chat-ins-format-duration (/ duration 1000.0)))
+                                (when (natnump size) (file-size-human-readable size))))
+       :prefix prefix
+       :open-action (when (stringp (plist-get item :event_id))
+                      (lambda (&rest _) (matrix-room-open-attachment row-key)))
+       :open-help-echo "Download and open this attachment"))))
 
 (defun matrix-room--shown-p (item)
   "Whether the timeline presents SDK row ITEM."
@@ -445,12 +485,20 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
            (matrix-reply-insert item body-prefix)
            (setq body-text-start (point))
            ;; Never interpret formatted_body as HTML or executable markup.
-           (insert (if (equal kind "encrypted")
-                       (propertize "[Unable to decrypt encrypted event]" 'face 'warning)
-                     (substring-no-properties (or (plist-get item :body) ""))))
-           (when (or (= body-start (point)) (not (bolp))) (insert "\n"))
+           ;; An attachment's card already names it; show only a real caption.
+           (insert (cond
+                    ((equal kind "encrypted")
+                     (propertize "[Unable to decrypt encrypted event]" 'face 'warning))
+                    ((equal (plist-get item :body)
+                            (plist-get (plist-get item :attachment) :filename))
+                     "")
+                    (t (substring-no-properties (or (plist-get item :body) "")))))
+           (unless (bolp) (insert "\n"))
+           (when (and (= body-start (point)) (not (plist-get item :attachment)))
+             (insert "\n"))
            (when (equal kind "message")
-             (matrix-room--insert-image item prefixes))
+             (matrix-room--insert-image item prefixes)
+             (matrix-room--insert-attachment item body-prefix))
            (matrix-room--insert-reactions item body-prefix)
            (when compact
              (save-excursion

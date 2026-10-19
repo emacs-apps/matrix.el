@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     protocol::{NETWORK, Result, RpcError},
-    storage::{INVALID_AVATAR, INVALID_IMAGE, Store, valid_avatar, valid_image},
-    timeline::{ImageLease, Timelines},
+    storage::{INVALID_AVATAR, INVALID_IMAGE, NewFile, Store, valid_avatar, valid_image},
+    timeline::{MediaLease, Timelines},
 };
 
 const CANCELLED: RpcError = RpcError::new(
@@ -25,15 +25,23 @@ const CANCELLED: RpcError = RpcError::new(
 const CACHE_WORKER: RpcError =
     RpcError::new("store_io", "Unable to access private account storage");
 const TIMEOUT: RpcError = RpcError::new("avatar_timeout", "Avatar thumbnail request timed out");
-pub const STALE_IMAGE: RpcError = RpcError::new(
-    "stale_image",
-    "The target event no longer contains this image source",
+pub const STALE_MEDIA: RpcError = RpcError::new(
+    "stale_media",
+    "The target event no longer contains this attachment source",
 );
-const IMAGE_CANCELLED: RpcError = RpcError::new(
-    "image_cancelled",
-    "Image request was cancelled because its account, subscription, or transport closed",
+const MEDIA_CANCELLED: RpcError = RpcError::new(
+    "media_cancelled",
+    "Attachment request was cancelled because its account, subscription, or transport closed",
 );
 const IMAGE_TIMEOUT: RpcError = RpcError::new("image_timeout", "Image download timed out");
+const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const FILE_TOO_LARGE: RpcError =
+    RpcError::new("media_too_large", "Attachments over 512 MiB cannot be downloaded");
+const FILE_TIMEOUT: RpcError = RpcError::new("media_timeout", "Attachment download timed out");
+const SAVE_FAILED: RpcError = RpcError::new(
+    "media_save_failed",
+    "Cannot save the attachment; select a new file outside account storage",
+);
 
 // Stream the SDK's complete source representation into the digest, including
 // the key, IV, protocol version and ordered ciphertext hashes. Never allocate
@@ -56,14 +64,30 @@ pub fn source_id(source: &MediaSource) -> String {
 }
 
 fn check_image_live(
-    lease: &ImageLease,
+    lease: &MediaLease,
     cancel: &CancellationToken,
     transport: &CancellationToken,
 ) -> Result<()> {
     if lease.cancellation().is_cancelled() || cancel.is_cancelled() || transport.is_cancelled() {
-        Err(IMAGE_CANCELLED)
+        Err(MEDIA_CANCELLED)
     } else {
         Ok(())
+    }
+}
+
+/// Await FUTURE unless the account, transport or LEASE's subscription closes first.
+async fn while_live<T>(
+    lease: &MediaLease,
+    cancel: &CancellationToken,
+    transport: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(MEDIA_CANCELLED),
+        _ = transport.cancelled() => Err(MEDIA_CANCELLED),
+        _ = lease.cancellation().cancelled() => Err(MEDIA_CANCELLED),
+        value = future => Ok(value),
     }
 }
 
@@ -72,7 +96,7 @@ pub async fn image(
     client: Client,
     generation: String,
     timelines: &Timelines,
-    lease: &ImageLease,
+    lease: &MediaLease,
     cancel: CancellationToken,
     transport: CancellationToken,
     slots: &Semaphore,
@@ -91,27 +115,16 @@ pub async fn image(
     if let Some(path) = cached {
         return Ok(path);
     }
-    let _slot = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(IMAGE_CANCELLED),
-        _ = transport.cancelled() => return Err(IMAGE_CANCELLED),
-        _ = lease.cancellation().cancelled() => return Err(IMAGE_CANCELLED),
-        slot = slots.acquire() => slot.map_err(|_| IMAGE_CANCELLED)?,
-    };
+    let _slot = while_live(lease, &cancel, &transport, slots.acquire()).await?
+        .map_err(|_| MEDIA_CANCELLED)?;
     lease.validate(timelines).await?;
     let media = client.media();
-    let bytes = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(IMAGE_CANCELLED),
-        _ = transport.cancelled() => return Err(IMAGE_CANCELLED),
-        _ = lease.cancellation().cancelled() => return Err(IMAGE_CANCELLED),
-        result = tokio::time::timeout(
-            Duration::from_secs(60),
-            // SDK cache identities need not include the encryption metadata.
-            // Our complete-source cache is authoritative; also avoid its Vec clone.
-            media.get_media_content(&lease.request, false),
-        ) => result.map_err(|_| IMAGE_TIMEOUT)?.map_err(|_| NETWORK)?,
-    };
+    let bytes = while_live(lease, &cancel, &transport, tokio::time::timeout(
+        Duration::from_secs(60),
+        // SDK cache identities need not include the encryption metadata.
+        // Our complete-source cache is authoritative; also avoid its Vec clone.
+        media.get_media_content(&lease.request, false),
+    )).await?.map_err(|_| IMAGE_TIMEOUT)?.map_err(|_| NETWORK)?;
     check_image_live(lease, &cancel, &transport)?;
     lease.validate(timelines).await?;
     if !valid_image(&bytes) {
@@ -123,7 +136,7 @@ pub async fn image(
     let subscription_cancel = lease.cancellation().clone();
     let path = tokio::task::spawn_blocking(move || {
         if cache_cancel.is_cancelled() || cache_transport.is_cancelled() || subscription_cancel.is_cancelled() {
-            return Err(IMAGE_CANCELLED);
+            return Err(MEDIA_CANCELLED);
         }
         store.cache_image(&generation, &source_id, &bytes)
     }).await.map_err(|_| CACHE_WORKER)??;
@@ -131,6 +144,43 @@ pub async fn image(
     lease.validate(timelines).await?;
     check_image_live(lease, &cancel, &transport)?;
     Ok(path)
+}
+
+/// Download LEASE's decrypted attachment to a new DESTINATION outside ROOT.
+pub async fn save(
+    root: PathBuf,
+    client: Client,
+    timelines: &Timelines,
+    lease: &MediaLease,
+    destination: PathBuf,
+    cancel: CancellationToken,
+    transport: CancellationToken,
+    slots: &Semaphore,
+) -> Result<()> {
+    check_image_live(lease, &cancel, &transport)?;
+    lease.validate(timelines).await?;
+    if lease.size.is_some_and(|size| size > MAX_FILE_BYTES) {
+        return Err(FILE_TOO_LARGE);
+    }
+    let file = tokio::task::spawn_blocking(move || NewFile::reserve(&root, &destination, SAVE_FAILED))
+        .await.map_err(|_| CACHE_WORKER)??;
+    let _slot = while_live(lease, &cancel, &transport, slots.acquire()).await?
+        .map_err(|_| MEDIA_CANCELLED)?;
+    lease.validate(timelines).await?;
+    // The SDK buffers whole responses; the declared size bounds honest senders.
+    let bytes = while_live(lease, &cancel, &transport, tokio::time::timeout(
+        Duration::from_secs(600),
+        client.media().get_media_content(&lease.request, false),
+    )).await?.map_err(|_| FILE_TIMEOUT)?.map_err(|_| NETWORK)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(FILE_TOO_LARGE);
+    }
+    check_image_live(lease, &cancel, &transport)?;
+    lease.validate(timelines).await?;
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(file.staged(), &bytes).map_err(|_| SAVE_FAILED)?;
+        file.publish()
+    }).await.map_err(|_| CACHE_WORKER)?
 }
 
 fn check_live(cancel: &CancellationToken, transport: &CancellationToken) -> Result<()> {

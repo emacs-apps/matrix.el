@@ -159,6 +159,36 @@
       (with-current-buffer (appkit-surface-buffer (matrix-menu--surface scope))
         (matrix-room-toggle-reaction (plist-get item :id) key)))))
 
+(defun matrix-message-open-attachment (scope)
+  "Download and open a private copy of SCOPE's exact message attachment."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (let ((surface (matrix-menu--surface scope)))
+    (with-current-buffer (appkit-surface-buffer surface)
+      (matrix-room-open-attachment (plist-get (matrix-menu--message scope) :id)))))
+
+(defun matrix-message-save-attachment (scope)
+  "Download SCOPE's exact message attachment to a new file."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (let* ((surface (matrix-menu--surface scope))
+         (item (matrix-menu--message scope))
+         (name (nth 2 (or (matrix-media-attachment item)
+                          (user-error "This message has no downloadable attachment"))))
+         (path (read-file-name "Save attachment to: " matrix-download-directory nil nil name)))
+    (when (file-directory-p path)
+      (setq path (expand-file-name name path)))
+    (when (file-exists-p path)
+      (user-error "%s already exists" (abbreviate-file-name path)))
+    (matrix-room--save-attachment
+     surface (matrix-menu--message scope) path
+     (lambda (path) (message "Matrix: saved %s" (abbreviate-file-name path))))))
+
+(defun matrix-menu--download-inapt-p ()
+  "Return whether the captured message has no downloadable attachment."
+  (condition-case nil
+      (or (matrix-menu--request-inapt-p)
+          (not (matrix-media-attachment (matrix-menu--message (matrix-menu--scope)))))
+    (user-error t)))
+
 (defun matrix-menu--mutation-inapt-p (capability)
   "Return non-nil when the captured message cannot perform CAPABILITY."
   (condition-case nil
@@ -443,6 +473,10 @@
     ("e" "Edit message" matrix-message-edit :inapt-if matrix-menu--edit-inapt-p)
     ("d" "Delete message" matrix-message-delete :inapt-if matrix-menu--delete-inapt-p)
     ("!" "React / toggle reaction" matrix-message-react :inapt-if matrix-menu--react-inapt-p)
+    ("o" "Open attachment" matrix-message-open-attachment
+     :inapt-if matrix-menu--download-inapt-p)
+    ("s" "Save attachment as" matrix-message-save-attachment
+     :inapt-if matrix-menu--download-inapt-p)
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
     ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
     ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]
