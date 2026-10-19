@@ -10,6 +10,8 @@
 (require 'appkit-directory)
 (require 'appkit-presentation)
 (require 'appkit-chat-avatar)
+(require 'appkit-chat-ins)
+(require 'appkit-name-color)
 
 (declare-function matrix-room-open "matrix-room" (app room-id &optional select))
 
@@ -136,17 +138,33 @@
    " · "))
 
 (defun matrix-root--preview (room user-id)
-  "Project actual ROOM activity, preserving exact sender identity."
-  (let* ((body (appkit-ui-one-line-text (plist-get room :preview)))
+  "Project ROOM's latest message as telega's chat list does.
+The sender's title, in their colour, precedes the text unless the message is
+an incoming one in a direct chat, whose title already names the peer.  Media
+show their caption, or a dim kind word, and audio and video their length."
+  (let* ((media (plist-get room :preview_media))
+         (body (appkit-ui-one-line-text (plist-get room :preview)))
+         (duration (plist-get room :preview_duration_ms))
+         (text (concat
+                (if (and (stringp media) (string-empty-p body))
+                    (propertize (pcase media ("image" "Photo") ("video" "Video")
+                                       ("audio" "Audio") (_ "File"))
+                                'face 'shadow)
+                  body)
+                (when (natnump duration)
+                  (propertize (format " (%s)" (appkit-chat-ins-format-duration
+                                               (/ duration 1000.0)))
+                              'face 'shadow))))
          (sender (plist-get room :preview_sender))
-         (self-p (and (stringp user-id)
-                      (equal user-id sender))))
+         (label (when (and (stringp sender) (not (string-empty-p text))
+                           (or (equal sender user-id)
+                               (not (eq (plist-get room :direct) t))))
+                  (appkit-ui-one-line-text
+                   (or (plist-get room :preview_sender_name) sender)))))
     (appkit-ui-one-line-preview-create
-     :text (if (or (string-empty-p body) self-p (not sender))
-               body
-             (concat body " — " (appkit-ui-one-line-text sender)))
-     :label (when (and self-p (not (string-empty-p body))) "You")
-     :separator ":" :label-face 'shadow)))
+     :text text :label label
+     :separator (and label appkit-ui-sender-text-delimiter)
+     :label-face (and label (delq nil (list (appkit-name-color-face sender) 'bold))))))
 
 (defun matrix-root--insert-compact-context (title trail width face)
   "Insert TITLE and unread TRAIL in FACE within WIDTH without activity slots."

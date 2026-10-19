@@ -695,6 +695,9 @@
       (appkit-surface-send surface '(matrix-update timeline "!room:test"))
       (should (equal (appkit-chat-timeline-keys) '("join" "topic" "hello")))
       (should (string-match-p "─( Newcomer joined )─" (buffer-string)))
+      (with-temp-buffer
+        (appkit-chat-ins-insert-tip-row "Robin left" 'shadow 40 :time "12:00")
+        (should (string-match-p "─ ( Robin left ) ─.* 12:00\n\\'" (buffer-string))))
       (should-not (string-match-p "join_rules" (buffer-string)))
       (let ((matrix-room-state-events 'no-membership))
         (appkit-surface-send surface '(matrix-update timeline "!room:test"))

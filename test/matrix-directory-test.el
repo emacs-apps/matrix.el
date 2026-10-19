@@ -48,6 +48,24 @@
             (should (string-match-p "123" visible))
             (should-not (string-match-p "Optional" visible))))))))
 
+(ert-deftest matrix-directory-preview-follows-telega-sender-and-media ()
+  (let ((group (matrix-root--preview
+                '(:preview "hi" :preview_sender "@a:test" :preview_sender_name "Alice")
+                "@me:test"))
+        (incoming (matrix-root--preview
+                   '(:direct t :preview "hi" :preview_sender "@a:test") "@me:test"))
+        (outgoing (matrix-root--preview
+                   '(:direct t :preview "hi" :preview_sender "@me:test" :preview_sender_name "Me")
+                   "@me:test"))
+        (photo (matrix-root--preview
+                '(:preview "" :preview_media "image" :preview_sender "@a:test") "@me:test")))
+    (should (equal (list (appkit-ui-one-line-preview-label group)
+                         (appkit-ui-one-line-preview-separator group))
+                   '("Alice" ">")))
+    (should-not (appkit-ui-one-line-preview-label incoming))
+    (should (equal (appkit-ui-one-line-preview-label outgoing) "Me"))
+    (should (equal (appkit-ui-one-line-preview-text photo) "Photo"))))
+
 (ert-deftest matrix-directory-duplicate-titles-have-stable-order ()
   (let* ((a '(:room_id "!a:test" :name "Same" :membership "join" :timestamp 5))
          (b '(:room_id "!b:test" :name "Same" :membership "join" :timestamp 5))

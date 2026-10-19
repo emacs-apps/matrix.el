@@ -25,7 +25,7 @@ use matrix_sdk::{
             InitialStateEvent, SyncMessageLikeEvent,
             room::{
                 encryption::RoomEncryptionEventContent, member::MembershipState,
-                message::Relation,
+                message::{MessageType, Relation},
             },
         },
     },
@@ -1196,13 +1196,35 @@ async fn room_summaries(client: &Client) -> Value {
                 _ => None,
             };
             if let Some(content) = message {
-                let body = match &content.relates_to {
-                    Some(Relation::Replacement(replacement)) => {
-                        replacement.new_content.msgtype.body()
-                    }
-                    _ => content.msgtype.body(),
+                let msgtype = match &content.relates_to {
+                    Some(Relation::Replacement(replacement)) => &replacement.new_content.msgtype,
+                    _ => &content.msgtype,
                 };
-                summary["preview"] = json!(summary_text(body));
+                // Media previews carry their kind and a caption, not the
+                // filename fallback body; files keep their name, as in telega.
+                let (media, text, duration) = match msgtype {
+                    MessageType::Image(image) => (Some("image"), image.caption(), None),
+                    MessageType::Video(video) => (Some("video"), video.caption(),
+                        video.info.as_ref().and_then(|info| info.duration)),
+                    MessageType::Audio(audio) => (Some("audio"), audio.caption(),
+                        audio.info.as_ref().and_then(|info| info.duration)),
+                    MessageType::File(file) => (Some("file"), Some(file.filename()), None),
+                    other => (None, Some(other.body()), None),
+                };
+                if let Some(kind) = media {
+                    summary["preview_media"] = json!(kind);
+                }
+                if let Some(duration) = duration {
+                    summary["preview_duration_ms"] = json!(duration.as_millis() as u64);
+                }
+                summary["preview"] = json!(summary_text(text.unwrap_or_default()));
+                if let Some(sender) = summary["preview_sender"].as_str()
+                    .and_then(|sender| UserId::parse(sender).ok())
+                    && let Ok(Some(member)) = room.get_member_no_sync(&sender).await
+                    && let Some(name) = member.display_name()
+                {
+                    summary["preview_sender_name"] = json!(summary_text(name));
+                }
             }
         }
         rooms.push(summary);

@@ -648,23 +648,20 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
       (buffer-string))))
 
 (defun matrix-room--notice-label (item width)
-  "Return state ITEM's sentence and time within WIDTH columns.
+  "Return state ITEM's sentence within WIDTH columns.
 Its people show in their colours beside their avatars; a sentence too wide
 for that is plain text, elided."
   (let* ((app (appkit-surface-app (appkit-current-surface)))
-         (time (matrix-room--time-label item))
-         (suffix (unless (string-empty-p time) (concat " · " time)))
          (label (concat (mapconcat
                          (lambda (part)
                            (if (stringp (plist-get part :user_id))
                                (matrix-room--notice-user app part)
                              (matrix--one-line (or (plist-get part :text) ""))))
-                         (append (plist-get item :parts) nil) "")
-                        suffix)))
+                         (append (plist-get item :parts) nil) ""))))
     (if (and (plist-get item :parts) (<= (string-width label) width))
         label
       (appkit-presentation-elide-string-for-columns
-       (concat (matrix--one-line (plist-get item :body)) suffix) width 'shadow))))
+       (matrix--one-line (plist-get item :body)) width 'shadow))))
 
 (defun matrix-room-open-user-at-point ()
   "Open the page of the user at point: a notice's person, else the sender."
@@ -688,10 +685,12 @@ for that is plain text, elided."
     (setq start (point))
     (pcase kind
       ("state"
-       ;; AppKit's gray-tip row, as QQ gray tips and other clients' notices.
-       (appkit-chat-ins-insert-divider-row
-        (matrix-room--notice-label item (max 10 (- matrix-room--width 8)))
-        'shadow matrix-room--width))
+       ;; AppKit's gray-tip row with the time at the right edge, as QQ's.
+       (let ((time (matrix-room--time-label item)))
+         (appkit-chat-ins-insert-tip-row
+          (matrix-room--notice-label
+           item (max 10 (- matrix-room--width (string-width time) 12)))
+          'shadow matrix-room--width :time time)))
       ("day"
        (appkit-chat-ins-insert-divider-row
         (if (numberp timestamp)
