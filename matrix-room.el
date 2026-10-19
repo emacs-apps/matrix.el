@@ -329,57 +329,104 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
        reject))
     nil))
 
-(defun matrix-room--insert-image (item prefixes)
-  "Insert ITEM's committed Canvas image or video poster below its caption.
-PREFIXES size it to the body column."
-  (when-let* ((image (matrix-media-poster item)))
-    (let* ((surface (appkit-current-surface))
-           (app (appkit-surface-app surface))
-           (room (cadr (appkit-surface-identity surface)))
-           (timeline (matrix-room--timeline (matrix-runtime-state app) room))
-           (key (matrix-media-resource-key app room (plist-get timeline :subscription_id) item))
-           (state (and key (appkit-resource-state surface key)))
-           (width (max 1 (floor
-                          (min appkit-media-preview-max-width
-                               (/ (* (max 1 (- matrix-room--width
-                                               (string-width (plist-get prefixes :rest-body))))
-                                     (appkit-media--char-pixel-width)
-                                     (appkit-media--base-char-pixel-height))
-                                  (float (appkit-media--char-pixel-height)))))))
-           (video (when (plist-get image :video)
-                    (append (list :resolve (matrix-room--video-resolver app room item))
-                            image)))
-           (noun (if video "Video" "Image"))
-           (poster (and key (matrix-media-cached-poster app key width video))))
-      (cond
-       ((and poster (not (stringp poster)))
+(defun matrix-room--insert-poster (item prefixes open)
+  "Insert ITEM's Canvas image or video poster, sized by PREFIXES.
+Until it is ready, insert a status line that runs OPEN when activated."
+  (let* ((image (matrix-media-poster item))
+         (surface (appkit-current-surface))
+         (app (appkit-surface-app surface))
+         (room (cadr (appkit-surface-identity surface)))
+         (timeline (matrix-room--timeline (matrix-runtime-state app) room))
+         (key (matrix-media-resource-key app room (plist-get timeline :subscription_id) item))
+         (state (and key (appkit-resource-state surface key)))
+         (width (max 1 (floor
+                        (min appkit-media-preview-max-width
+                             (/ (* (max 1 (- matrix-room--width
+                                             (string-width (plist-get prefixes :rest-body))))
+                                   (appkit-media--char-pixel-width)
+                                   (appkit-media--base-char-pixel-height))
+                                (float (appkit-media--char-pixel-height)))))))
+         (video (when (plist-get image :video)
+                  (append (list :resolve (matrix-room--video-resolver app room item))
+                          image)))
+         (poster (and key (matrix-media-cached-poster app key width video))))
+    (if (and poster (not (stringp poster)))
         ;; Each call authors a fresh occurrence; committed Surface mounting
         ;; supplies viewer actions and distinct animated playback leases.
         (let ((rows (appkit-media-image-slice-rows poster)))
           (while rows
             (insert (pop rows))
-            (if rows (appkit-media-insert-slice-newline) (insert "\n")))))
-       (t
-        (insert
-         (propertize
-          (concat
-           (cond
-            ((not (matrix-media-rendering-available-p))
-             (format "[%s: Canvas display required" noun))
-            ((not key) (format "[%s unavailable: missing event identity" noun))
-            ((stringp poster) (substring poster 0 -1))
-            ((and state (eq (appkit-resource-state-status state) 'failed))
-             (format "[%s unavailable: acquisition failed" noun))
-            (t (format "[%s loading" noun)))
-           ;; A video's card below already names it.
-           (when-let* (((not video))
-                       (filename (plist-get (plist-get item :image) :filename))
-                       ((stringp filename)))
-             (concat " · " (matrix--one-line filename)))
-           "]\n")
-          'face (if (or (stringp poster)
-                        (and state (eq (appkit-resource-state-status state) 'failed)))
-                    'error 'shadow))))))))
+            (if rows (appkit-media-insert-slice-newline) (insert "\n"))))
+      (let ((failed (or (stringp poster)
+                        (and state (eq (appkit-resource-state-status state) 'failed)))))
+        (appkit-chat-ins-insert-prefixed-line
+         (cond
+          ((not (matrix-media-rendering-available-p)) "Preview needs a graphical display")
+          ((not key) "Preview unavailable: missing event identity")
+          ((stringp poster) (string-trim poster "\\[" "\\]\n*"))
+          (failed "Preview unavailable: download failed")
+          (t "Loading preview…"))
+         :prefix "" :face (if failed 'error 'shadow)
+         :action open :help-echo "Open this attachment")))))
+
+(defun matrix-room--media (item)
+  "Return ITEM's media card as (:kind KIND :title TITLE :details DETAILS), or nil."
+  (when (equal (plist-get item :kind) "message")
+    (if-let* ((image (plist-get item :image)))
+        (let ((width (plist-get image :width))
+              (height (plist-get image :height))
+              (size (plist-get image :size)))
+          (list :kind 'image :title (plist-get image :filename)
+                :details (delq nil (list (when (and (natnump width) (natnump height))
+                                           (format "%d×%d" width height))
+                                         (when (natnump size) (file-size-human-readable size))))))
+      (when-let* ((attachment (plist-get item :attachment)))
+        (let ((size (plist-get attachment :size))
+              (duration (plist-get attachment :duration_ms)))
+          (list :kind (intern (or (plist-get attachment :kind) "file"))
+                :title (plist-get attachment :filename)
+                :details (delq nil (list (when (natnump duration)
+                                           (appkit-chat-ins-format-duration (/ duration 1000.0)))
+                                         (when (natnump size)
+                                           (file-size-human-readable size))))))))))
+
+(defun matrix-room--open-media (row-key preview)
+  "Open SDK row ROW-KEY's media: play or view its PREVIEW, else download it."
+  (if-let* (((marker-buffer preview))
+            ((fboundp 'appkit-media-inline-host-at-point))
+            (host (appkit-media-inline-host-at-point (marker-position preview))))
+      (appkit-media-inline-host-activate host)
+    (matrix-room-open-attachment row-key)))
+
+(defun matrix-room--insert-media-card (item body-prefix prefixes)
+  "Insert ITEM's image, video, audio or file as one AppKit media card.
+Its border continues BODY-PREFIX; PREFIXES size an image or video poster."
+  (when-let* ((media (matrix-room--media item)))
+    (let* ((row-key (plist-get item :id))
+           (preview (make-marker))
+           (downloadable (stringp (plist-get item :event_id)))
+           (open (when downloadable (lambda () (matrix-room--open-media row-key preview))))
+           (card-prefix (let ((appkit-ui-card-indent-prefix-state body-prefix))
+                          (appkit-ui-card-prefix-state))))
+      (appkit-chat-ins-insert-media-card
+       :kind (plist-get media :kind)
+       :title (matrix--one-line (or (plist-get media :title) ""))
+       :details (plist-get media :details)
+       :prefix card-prefix :title-face 'bold :meta-face 'shadow
+       :context (appkit-media-card-context-create
+                 :payload (list :row-key row-key)
+                 :kind (plist-get media :kind) :title (plist-get media :title)
+                 :open-action open
+                 :save-as-action (when downloadable
+                                   (lambda () (matrix-room-save-attachment row-key))))
+       :open-help-echo "Open this attachment"
+       :body-inserter
+       (when (matrix-media-poster item)
+         (lambda (card-prefix-state)
+           (let ((start (point)))
+             (set-marker preview start)
+             (matrix-room--insert-poster item prefixes open)
+             (appkit-ui-apply-line-prefix start (point) card-prefix-state))))))))
 
 (defun matrix-room--insert-reactions (item)
   "Insert ITEM's SDK reaction chips; a chip toggles its reaction.
@@ -509,6 +556,20 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
                                   :subscription_id)
                        item path on-saved)))
 
+(defun matrix-room-save-attachment (row-key)
+  "Download the attachment of SDK row ROW-KEY to a new file."
+  (let* ((surface (matrix--current-surface 'room))
+         (name (nth 2 (or (matrix-media-attachment (matrix-room--item surface row-key))
+                          (user-error "This message has no downloadable attachment"))))
+         (path (read-file-name "Save attachment to: " matrix-download-directory nil nil name)))
+    (when (file-directory-p path)
+      (setq path (expand-file-name name path)))
+    (when (file-exists-p path)
+      (user-error "%s already exists" (abbreviate-file-name path)))
+    (matrix-room--save-attachment
+     surface (matrix-room--item surface row-key) path
+     (lambda (path) (message "Matrix: saved %s" (abbreviate-file-name path))))))
+
 (defun matrix-room-open-attachment (row-key)
   "Download a private copy of the attachment of SDK row ROW-KEY and open it."
   (let* ((surface (matrix--current-surface 'room))
@@ -519,24 +580,6 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
       (matrix-room--save-attachment
        surface item (matrix-media--open-path name)
        (lambda (path) (funcall matrix-attachment-open-function path kind))))))
-
-(defun matrix-room--insert-attachment (item)
-  "Insert ITEM's file, audio or video card; activating it opens it.
-The row's body prefix is applied over it afterwards, so add none here."
-  (when-let* ((attachment (plist-get item :attachment)))
-    (let ((row-key (plist-get item :id))
-          (size (plist-get attachment :size))
-          (duration (plist-get attachment :duration_ms)))
-      (appkit-chat-ins-insert-media-card
-       :kind (intern (or (plist-get attachment :kind) "file"))
-       :title (matrix--one-line (plist-get attachment :filename))
-       :details (delq nil (list (when (natnump duration)
-                                  (appkit-chat-ins-format-duration (/ duration 1000.0)))
-                                (when (natnump size) (file-size-human-readable size))))
-       :prefix ""
-       :open-action (when (stringp (plist-get item :event_id))
-                      (lambda (&rest _) (matrix-room-open-attachment row-key)))
-       :open-help-echo "Download and open this attachment"))))
 
 (defun matrix-room--typing-text (names)
   "Describe who of NAMES is typing."
@@ -700,23 +743,27 @@ for that is plain text, elided."
            (unless (bolp) (insert "\n"))
            (when (eq (plist-get item :highlighted) t)
              (add-face-text-property body-text-start (point) 'matrix-highlight t))
-           (when (and (= body-start (point)) (not (plist-get item :attachment)))
-             (insert "\n"))
-           (when (equal kind "message")
-             (matrix-room--insert-image item prefixes)
-             (matrix-room--insert-attachment item))
-           (matrix-room--insert-reactions item)
-           (when compact
-             (save-excursion
-               (goto-char body-text-start)
-               (end-of-line)
-               (matrix-room--insert-time item (plist-get prefixes :rest-body))))
-           (when-let* ((error (plist-get item :error)))
-             (insert (propertize error 'face (if (eq (plist-get item :can_retry) t)
-                                                 'error 'warning))
-                     "\n"))
-           (matrix-room--insert-send-actions item)
-           (appkit-ui-apply-line-prefix body-text-start (point) body-prefix)))))
+           (let ((media (matrix-room--media item)))
+             (when (and (= body-start (point)) (not media))
+               (insert "\n"))
+             (let ((text-end (point)) tail)
+               (appkit-ui-apply-line-prefix body-text-start text-end body-prefix)
+               ;; The card draws its own border from the body prefix.
+               (when media (matrix-room--insert-media-card item body-prefix prefixes))
+               (setq tail (point))
+               (matrix-room--insert-reactions item)
+               (when-let* ((error (plist-get item :error)))
+                 (insert (propertize error 'face (if (eq (plist-get item :can_retry) t)
+                                                     'error 'warning))
+                         "\n"))
+               (matrix-room--insert-send-actions item)
+               (appkit-ui-apply-line-prefix tail (point) body-prefix)
+               (when compact
+                 ;; The clock ends the first text line, or the card's title.
+                 (save-excursion
+                   (goto-char (if (< body-text-start text-end) body-text-start text-end))
+                   (end-of-line)
+                   (matrix-room--insert-time item (plist-get prefixes :rest-body))))))))))
     (add-text-properties start (point)
                          (list matrix-room-message-key-property
                                (appkit-chat-timeline-row-key row)

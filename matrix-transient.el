@@ -176,18 +176,8 @@
 (defun matrix-message-save-attachment (scope)
   "Download SCOPE's exact message attachment to a new file."
   (interactive (list (matrix-menu--capture 'room t)))
-  (let* ((surface (matrix-menu--surface scope))
-         (item (matrix-menu--message scope))
-         (name (nth 2 (or (matrix-media-attachment item)
-                          (user-error "This message has no downloadable attachment"))))
-         (path (read-file-name "Save attachment to: " matrix-download-directory nil nil name)))
-    (when (file-directory-p path)
-      (setq path (expand-file-name name path)))
-    (when (file-exists-p path)
-      (user-error "%s already exists" (abbreviate-file-name path)))
-    (matrix-room--save-attachment
-     surface (matrix-menu--message scope) path
-     (lambda (path) (message "Matrix: saved %s" (abbreviate-file-name path))))))
+  (with-current-buffer (appkit-surface-buffer (matrix-menu--surface scope))
+    (matrix-room-save-attachment (plist-get (matrix-menu--message scope) :id))))
 
 (defun matrix-message-retry-send (scope)
   "Send SCOPE's exact failed message again."
