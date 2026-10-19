@@ -59,16 +59,14 @@ joins, leaves and profile changes (busy bridged rooms), nil hides them all."
 (defvar-local matrix-room--unread-key nil
   "Stable reading-session boundary returned by the shared read projection.")
 
-(defvar matrix-room-navigation-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "r") #'matrix-room-read-all)
-    (define-key map (kbd ">") #'matrix-room-read-all)
-    (define-key map (kbd "u") #'matrix-room-goto-unread)
-    (define-key map (kbd "m") #'matrix-room-next-mention)
-    (define-key map (kbd "@") #'matrix-room-next-mention)
-    (define-key map (kbd "o") #'matrix-room-next-outgoing)
-    map)
-  "Fast navigation under `M-g', after telega's chatbuf fastnav keys.")
+(defvar-keymap matrix-room-navigation-map
+  :doc "Fast navigation under `M-g', after telega's chatbuf fastnav keys."
+  "r" #'matrix-room-read-all
+  ">" #'matrix-room-read-all
+  "u" #'matrix-room-goto-unread
+  "m" #'matrix-room-next-mention
+  "@" #'matrix-room-next-mention
+  "o" #'matrix-room-next-outgoing)
 
 (defconst matrix-room-message-key-property 'matrix-message-id
   "Stable SDK timeline identity attached to generated rows.")
