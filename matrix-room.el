@@ -380,6 +380,44 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                      (append (matrix-room--mutation-params surface item :can_react)
                              (list :key reaction)))))
 
+(defun matrix-room--request (method &rest params)
+  "Request room METHOD with PARAMS for the current room view."
+  (let ((surface (matrix--current-surface 'room)))
+    (matrix--request surface method
+                     (append (list :room_id (cadr (appkit-surface-identity surface))) params))))
+
+(defun matrix-room--summary ()
+  "Return the current room's ID and summary as (ROOM-ID . SUMMARY)."
+  (let* ((surface (matrix--current-surface 'room))
+         (room-id (cadr (appkit-surface-identity surface))))
+    (cons room-id (matrix-runtime-room (appkit-surface-app surface) room-id))))
+
+(defun matrix-room--name ()
+  "Return the current room's name, or its ID."
+  (pcase-let ((`(,room-id . ,summary) (matrix-room--summary)))
+    (or (plist-get summary :name) room-id)))
+
+(defun matrix-room-invite (user-id)
+  "Invite USER-ID to the current room."
+  (interactive (list (matrix--read-user-id "Invite user ID: ")))
+  (matrix-room--request "room.invite" :user_id user-id))
+
+(defun matrix-room-rename (name)
+  "Rename the current room to NAME."
+  (interactive (list (read-string "Room name: " (matrix-room--name))))
+  (matrix-room--request "room.set_name" :text (string-trim name)))
+
+(defun matrix-room-set-topic (topic)
+  "Set the current room's TOPIC; an empty topic removes it."
+  (interactive (list (read-string "Room topic: " (plist-get (cdr (matrix-room--summary)) :topic))))
+  (matrix-room--request "room.set_topic" :text (string-trim topic)))
+
+(defun matrix-room-leave ()
+  "Leave the current room after confirming."
+  (interactive)
+  (when (yes-or-no-p (format "Leave %s? " (matrix-room--name)))
+    (matrix-room--request "room.leave")))
+
 (defun matrix-room--local-echo-params (surface item capability)
   "Capture SURFACE's unsent ITEM for an SDK send-queue CAPABILITY.
 CAPABILITY is the backend's `:can_retry' or `:can_discard'."
@@ -609,7 +647,7 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
              :unread-count (plist-get (plist-get timeline :read_state) :unread_messages)
              :all-read-p (eq (plist-get (plist-get timeline :read_state) :all_read) t)))
       (matrix--frame
-       state nil nil
+       state (or (plist-get room :name) room-id) (plist-get room :topic)
        (pcase (plist-get room :encrypted)
          ('t (propertize "[E2EE]" 'face 'success
                          'help-echo "Encrypted room; Matrix SDK enforces device trust."))
@@ -813,6 +851,10 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
                ("message.react" (if (eq (plist-get result :added) t)
                                     "Reaction added." "Reaction removed."))
                ("message.retry" "Message queued to send again.")
+               ("room.invite" "Invitation sent.")
+               ("room.set_name" "Room renamed.")
+               ("room.set_topic" "Topic changed.")
+               ("room.leave" "You left the room.")
                ("message.discard" (if (eq (plist-get result :discarded) t)
                                       "Unsent message discarded."
                                     "The message was already sent."))

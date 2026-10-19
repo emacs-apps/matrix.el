@@ -52,6 +52,21 @@ const CORRUPT: RpcError = RpcError::new(
 // Bound one member snapshot so a pathological room cannot exceed the frame
 // limit and tear down the transport; the response reports truncation.
 const MEMBERS_LIMIT: usize = 4096;
+const ROOM_FORBIDDEN: RpcError =
+    RpcError::new("room_forbidden", "Room permissions do not allow this change");
+
+/// Report a refused room change as such, anything else as a network failure.
+fn room_error(error: matrix_sdk::Error) -> RpcError {
+    if error.client_api_error_kind().is_some_and(|kind| matches!(kind, ErrorKind::Forbidden)) {
+        ROOM_FORBIDDEN
+    } else {
+        NETWORK
+    }
+}
+
+fn known_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Room> {
+    client.get_room(room_id).ok_or(RpcError::new("room_missing", "Room is not known"))
+}
 
 pub struct Backend {
     store: Arc<Store>,
@@ -87,6 +102,23 @@ struct Login {
 #[serde(deny_unknown_fields)]
 struct RoomParam {
     room_id: OwnedRoomId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserParam {
+    user_id: OwnedUserId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoomUserParam {
+    room_id: OwnedRoomId,
+    user_id: OwnedUserId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoomTextParam {
+    room_id: OwnedRoomId,
+    text: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -744,12 +776,39 @@ impl Account {
             }
             "room.leave" => {
                 let args: RoomParam = params(value)?;
-                let room = self
-                    .client
-                    .get_room(&args.room_id)
-                    .ok_or(RpcError::new("room_missing", "Room is not known"))?;
-                room.leave().await.map_err(|_| NETWORK)?;
+                known_room(&self.client, &args.room_id)?.leave().await.map_err(room_error)?;
                 Ok(json!({}))
+            }
+            "room.invite" => {
+                let args: RoomUserParam = params(value)?;
+                known_room(&self.client, &args.room_id)?
+                    .invite_user_by_id(&args.user_id).await.map_err(room_error)?;
+                Ok(json!({}))
+            }
+            "room.set_name" | "room.set_topic" => {
+                let args: RoomTextParam = params(value)?;
+                if args.text.len() > 4096 || (method == "room.set_name" && args.text.contains('\n')) {
+                    return Err(INVALID);
+                }
+                let room = known_room(&self.client, &args.room_id)?;
+                if method == "room.set_name" {
+                    room.set_name(args.text).await.map_err(room_error)?;
+                } else {
+                    room.set_room_topic(&args.text).await.map_err(room_error)?;
+                }
+                Ok(json!({}))
+            }
+            "dm.open" => {
+                let args: UserParam = params(value)?;
+                if Some(args.user_id.as_ref()) == self.client.user_id() {
+                    return Err(INVALID);
+                }
+                // Reuse an existing direct chat rather than starting another.
+                let room = match self.client.get_dm_room(&args.user_id) {
+                    Some(room) => room,
+                    None => self.client.create_dm(&args.user_id).await.map_err(room_error)?,
+                };
+                Ok(json!({"room_id":room.room_id()}))
             }
             "room.members" => {
                 let args: MembersParam = params(value)?;
@@ -1029,8 +1088,15 @@ async fn room_summaries(client: &Client) -> Value {
         });
         // The SDK room avatar wins. For a direct room with one other hero,
         // use that member's SDK profile without fetching membership or media.
+        let direct = room.is_direct().await.unwrap_or(false);
+        if direct {
+            summary["direct"] = json!(true);
+        }
+        if let Some(topic) = room.topic().filter(|topic| !topic.trim().is_empty()) {
+            summary["topic"] = json!(summary_text(&topic));
+        }
         let mut avatar_url = room.avatar_url();
-        if avatar_url.is_none() && room.is_direct().await.unwrap_or(false) {
+        if avatar_url.is_none() && direct {
             let heroes = room.heroes().await;
             let mut others = heroes
                 .iter()
