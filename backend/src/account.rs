@@ -145,10 +145,18 @@ struct EditParam {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RedactParam {
+struct EventParam {
     room_id: OwnedRoomId,
     subscription_id: String,
     event_id: OwnedEventId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReactParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    event_id: OwnedEventId,
+    key: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,7 +297,7 @@ impl Backend {
                     return Ok(json!({}));
                 }
                 if method == "timeline.read" {
-                    let args: RedactParam = params(value)?;
+                    let args: EventParam = params(value)?;
                     let timelines = account.timelines.clone();
                     drop(slot);
                     timelines.read_through(&args.room_id, &args.subscription_id, &args.event_id)
@@ -706,11 +714,18 @@ impl Account {
                 Ok(json!({}))
             }
             "message.redact" => {
-                let args: RedactParam = params(value)?;
+                let args: EventParam = params(value)?;
                 self.timelines
                     .redact(&args.room_id, &args.subscription_id, &args.event_id)
                     .await?;
                 Ok(json!({}))
+            }
+            "message.react" => {
+                let args: ReactParam = params(value)?;
+                let added = self.timelines
+                    .react(&args.room_id, &args.subscription_id, &args.event_id, &args.key)
+                    .await?;
+                Ok(json!({"added":added}))
             }
             "devices.list" => {
                 empty(value)?;

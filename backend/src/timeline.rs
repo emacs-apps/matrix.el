@@ -148,10 +148,16 @@ const REDACT_FORBIDDEN: RpcError = RpcError::new(
 );
 const ALREADY_REDACTED: RpcError =
     RpcError::new("already_redacted", "This event is already redacted");
+const REACT_FORBIDDEN: RpcError =
+    RpcError::new("reaction_forbidden", "Room permissions do not allow reacting to this event");
+// Keys are arbitrary text; bound what one event can project.
+const MAX_REACTION_KEY: usize = 256;
+const MAX_REACTION_KEYS: usize = 32;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct MutationPermissions {
     send_message: bool,
+    react: bool,
     redact_own: bool,
     redact_other: bool,
 }
@@ -160,6 +166,7 @@ impl MutationPermissions {
     fn from_power_levels(levels: &RoomPowerLevels, user: &UserId) -> Self {
         Self {
             send_message: levels.user_can_send_message(user, MessageLikeEventType::RoomMessage),
+            react: levels.user_can_send_message(user, MessageLikeEventType::Reaction),
             redact_own: levels.user_can_redact_own_event(user),
             redact_other: levels.user_can_redact_event_of_other(user),
         }
@@ -170,6 +177,13 @@ impl MutationPermissions {
             && event.is_own()
             && event.content().as_message().is_some_and(body_editable)
             && self.send_message
+    }
+
+    fn can_react(self, event: &EventTimelineItem) -> bool {
+        event.event_id().is_some()
+            && event.content().reactions().is_some()
+            && !is_redacted(event)
+            && self.react
     }
 
     fn can_redact(self, event: &EventTimelineItem) -> bool {
@@ -465,13 +479,15 @@ impl Timelines {
                     let mut room_info = task_sdk_room.subscribe_info();
                     let receipt_updates = timeline.subscribe_own_user_read_receipts_changed().await;
                     let mut permissions = mutation_permissions(&task_sdk_room).await.unwrap_or_default();
+                    let own_user = task_sdk_room.own_user_id().to_owned();
+                    let own = &*own_user;
                     let (mut items, stream) = timeline.subscribe().await;
                     let mut reading = read_state(&timeline, items.iter()).await;
                     if !output
                         .event(json!({
                             "type":"timeline_reset", "room_id":room_id,
                             "subscription_id":subscription.id, "revision":0,
-                            "items":items.iter().map(|i| item(i, permissions)).collect::<Vec<_>>(),
+                            "items":items.iter().map(|i| item(i, permissions, own)).collect::<Vec<_>>(),
                             "read_state":reading
                         }))
                         .await
@@ -483,6 +499,7 @@ impl Timelines {
                     let task_id = subscription.id.clone();
                     let task_timeline = timeline.clone();
                     self.tasks.spawn(subscription.tasks.track_future(async move {
+                        let own = &*own_user;
                         futures_util::pin_mut!(stream);
                         futures_util::pin_mut!(receipt_updates);
                         let mut revision = 0u64;
@@ -554,7 +571,7 @@ impl Timelines {
                                         "subscription_id":task_id, "revision":revision,
                                         "read_state":reading,
                                         "changes":[{"op":"reset", "items":items.iter()
-                                            .map(|i| item(i, permissions)).collect::<Vec<_>>()}]
+                                            .map(|i| item(i, permissions, own)).collect::<Vec<_>>()}]
                                     });
                                     tokio::select! {
                                         biased;
@@ -576,7 +593,7 @@ impl Timelines {
                                     let mut event = json!({
                                         "type":"timeline_diff", "room_id":task_room,
                                         "subscription_id":task_id, "revision":revision,
-                                        "changes":diffs.iter().map(|diff| change(diff, permissions)).collect::<Vec<_>>()
+                                        "changes":diffs.iter().map(|diff| change(diff, permissions, own)).collect::<Vec<_>>()
                                     });
                                     for diff in diffs {
                                         diff.apply(&mut items);
@@ -790,8 +807,7 @@ impl Timelines {
         let request = {
             let timeline = mutation_timeline(&subscription)?;
             let items = timeline.items().await;
-            let event = items.iter().filter_map(|item| item.as_event())
-                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            let event = find_event(&items, event_id)?;
             let image = event_image(event).ok_or(media::STALE_IMAGE)?;
             if media::source_id(&image.source) != source_id {
                 return Err(media::STALE_IMAGE);
@@ -854,6 +870,27 @@ impl Timelines {
         }
     }
 
+    /// Run OPERATION on the subscription's timeline in this room's mutation order.
+    async fn mutate<T>(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        operation: impl AsyncFnOnce(&Timeline) -> Result<T>,
+    ) -> Result<T> {
+        let _operation = self.tasks.token();
+        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
+        let _mutation = subscription.mutations.lock().await;
+        if !self.is_current(room_id, &subscription).await {
+            return Err(STALE_SUBSCRIPTION);
+        }
+        let timeline = mutation_timeline(&subscription)?;
+        tokio::select! {
+            biased;
+            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
+            result = operation(timeline) => result,
+        }
+    }
+
     pub async fn edit(
         &self,
         room_id: &OwnedRoomId,
@@ -864,17 +901,9 @@ impl Timelines {
         if body.trim().is_empty() || body.len() > 32 * 1024 {
             return Err(INVALID);
         }
-        let _operation = self.tasks.token();
-        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
-        let _mutation = subscription.mutations.lock().await;
-        if !self.is_current(room_id, &subscription).await {
-            return Err(STALE_SUBSCRIPTION);
-        }
-        let timeline = mutation_timeline(&subscription)?;
-        let operation = async {
+        self.mutate(room_id, id, async |timeline| {
             let items = timeline.items().await;
-            let event = items.iter().filter_map(|item| item.as_event())
-                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            let event = find_event(&items, event_id)?;
             if !event.is_own() {
                 return Err(EDIT_FORBIDDEN);
             }
@@ -886,12 +915,7 @@ impl Timelines {
             }
             timeline.edit(&event.identifier(), edited_content(message, body)?).await
                 .map_err(edit_error)
-        };
-        tokio::select! {
-            biased;
-            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
-            result = operation => result,
-        }
+        }).await
     }
 
     pub async fn redact(
@@ -900,17 +924,9 @@ impl Timelines {
         id: &str,
         event_id: &EventId,
     ) -> Result<()> {
-        let _operation = self.tasks.token();
-        let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
-        let _mutation = subscription.mutations.lock().await;
-        if !self.is_current(room_id, &subscription).await {
-            return Err(STALE_SUBSCRIPTION);
-        }
-        let timeline = mutation_timeline(&subscription)?;
-        let operation = async {
+        self.mutate(room_id, id, async |timeline| {
             let items = timeline.items().await;
-            let event = items.iter().filter_map(|item| item.as_event())
-                .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)?;
+            let event = find_event(&items, event_id)?;
             if is_redacted(event) || event.redaction_send_state().is_some() {
                 return Err(ALREADY_REDACTED);
             }
@@ -918,12 +934,34 @@ impl Timelines {
                 return Err(REDACT_FORBIDDEN);
             }
             timeline.redact(&event.identifier(), None).await.map_err(redact_error)
-        };
-        tokio::select! {
-            biased;
-            _ = subscription.cancel.cancelled() => Err(STALE_SUBSCRIPTION),
-            result = operation => result,
+        }).await
+    }
+
+    /// Add KEY to the event's reactions, or remove our own; return whether added.
+    pub async fn react(
+        &self,
+        room_id: &OwnedRoomId,
+        id: &str,
+        event_id: &EventId,
+        key: &str,
+    ) -> Result<bool> {
+        if key.trim().is_empty() || key.len() > MAX_REACTION_KEY {
+            return Err(INVALID);
         }
+        self.mutate(room_id, id, async |timeline| {
+            let items = timeline.items().await;
+            let event = find_event(&items, event_id)?;
+            if !mutation_permissions(timeline.room()).await?.can_react(event) {
+                return Err(REACT_FORBIDDEN);
+            }
+            timeline.toggle_reaction(&event.identifier(), key).await.map_err(|error| match error {
+                TimelineError::EventNotInTimeline(_) => EVENT_MISSING,
+                _ => RpcError::new(
+                    "reaction_failed",
+                    "SDK could not queue this reaction; check room access and connection",
+                ),
+            })
+        }).await
     }
 
     pub async fn retry_decryption(&self, sessions: &[String]) {
@@ -955,6 +993,14 @@ impl Timelines {
         self.tasks.close();
         self.tasks.wait().await;
     }
+}
+
+fn find_event<'a>(
+    items: impl IntoIterator<Item = &'a Arc<TimelineItem>>,
+    event_id: &EventId,
+) -> Result<&'a EventTimelineItem> {
+    items.into_iter().filter_map(|item| item.as_event())
+        .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)
 }
 
 fn mutation_timeline(subscription: &Subscription) -> Result<&Arc<Timeline>> {
@@ -1119,7 +1165,18 @@ fn read_capable(event: &EventTimelineItem) -> bool {
             || event.content().is_redacted())
 }
 
-fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
+fn reactions(event: &EventTimelineItem, own: &UserId) -> Option<Value> {
+    let reactions = event.content().reactions().filter(|reactions| !reactions.is_empty())?;
+    Some(reactions.iter()
+        .filter(|(key, senders)| key.len() <= MAX_REACTION_KEY && !senders.is_empty())
+        .take(MAX_REACTION_KEYS)
+        .map(|(key, senders)| json!({
+            "key":key, "count":senders.len(), "own":senders.contains_key(own),
+        }))
+        .collect())
+}
+
+fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> Value {
     let mut value = json!({"id": item.unique_id().0, "can_edit":false, "can_redact":false, "can_reply":false, "can_read":false});
     if let Some(event) = item.as_event() {
         value["event_id"] = json!(event.event_id());
@@ -1137,6 +1194,10 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
         value["own"] = json!(event.is_own());
         value["can_edit"] = json!(permissions.can_edit(event));
         value["can_redact"] = json!(permissions.can_redact(event));
+        value["can_react"] = json!(permissions.can_react(event));
+        if let Some(reactions) = reactions(event, own) {
+            value["reactions"] = reactions;
+        }
         value["can_reply"] = json!(event.can_be_replied_to());
         value["can_read"] = json!(read_capable(event));
         if let Some(reply) = event.content().in_reply_to() {
@@ -1196,24 +1257,24 @@ fn item(item: &TimelineItem, permissions: MutationPermissions) -> Value {
     value
 }
 
-fn change(diff: &VectorDiff<Arc<TimelineItem>>, permissions: MutationPermissions) -> Value {
+fn change(diff: &VectorDiff<Arc<TimelineItem>>, permissions: MutationPermissions, own: &UserId) -> Value {
     match diff {
         VectorDiff::Append { values } => {
-            json!({"op":"append", "items":values.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()})
+            json!({"op":"append", "items":values.iter().map(|i| item(i, permissions, own)).collect::<Vec<_>>()})
         }
         VectorDiff::Clear => json!({"op":"clear"}),
-        VectorDiff::PushFront { value } => json!({"op":"push_front", "item":item(value, permissions)}),
-        VectorDiff::PushBack { value } => json!({"op":"push_back", "item":item(value, permissions)}),
+        VectorDiff::PushFront { value } => json!({"op":"push_front", "item":item(value, permissions, own)}),
+        VectorDiff::PushBack { value } => json!({"op":"push_back", "item":item(value, permissions, own)}),
         VectorDiff::PopFront => json!({"op":"pop_front"}),
         VectorDiff::PopBack => json!({"op":"pop_back"}),
         VectorDiff::Insert { index, value } => {
-            json!({"op":"insert", "index":index, "item":item(value, permissions)})
+            json!({"op":"insert", "index":index, "item":item(value, permissions, own)})
         }
-        VectorDiff::Set { index, value } => json!({"op":"set", "index":index, "item":item(value, permissions)}),
+        VectorDiff::Set { index, value } => json!({"op":"set", "index":index, "item":item(value, permissions, own)}),
         VectorDiff::Remove { index } => json!({"op":"remove", "index":index}),
         VectorDiff::Truncate { length } => json!({"op":"truncate", "length":length}),
         VectorDiff::Reset { values } => {
-            json!({"op":"reset", "items":values.iter().map(|i| item(i, permissions)).collect::<Vec<_>>()})
+            json!({"op":"reset", "items":values.iter().map(|i| item(i, permissions, own)).collect::<Vec<_>>()})
         }
     }
 }
@@ -1451,7 +1512,7 @@ mod tests {
         let items = timeline.items().await;
         let row = items.iter().find(|item| item.as_event()
             .is_some_and(|event| event.event_id() == Some(event_id))).unwrap();
-        let value = item(row, permissions);
+        let value = item(row, permissions, timeline.room().own_user_id());
         drop(operation);
         value
     }
@@ -1680,6 +1741,46 @@ mod tests {
         timelines.shutdown().await;
     }
 
+    fn reaction(event_id: &str, sender: &str, target: &str, key: &str) -> Value {
+        json!({
+            "type":"m.reaction", "event_id":event_id, "sender":sender, "origin_server_ts":1100,
+            "content":{"m.relates_to":{"rel_type":"m.annotation", "event_id":target, "key":key}}
+        })
+    }
+
+    #[tokio::test]
+    async fn sdk_reactions_project_counts_and_own_keys_and_toggle_through_the_queue() {
+        let (server, _client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$target", "@other:example.org", json!({"msgtype":"m.text", "body":"hi"})),
+            reaction("$r1", "@other:example.org", "$target", "👍"),
+            reaction("$r2", "@me:example.org", "$target", "👍"),
+            reaction("$r3", "@other:example.org", "$target", "🎉"),
+        ]).await;
+        let room = owned_room_id!("!room:example.org");
+        let row = snapshot_row(&timelines, event_id!("$target")).await;
+        assert_eq!(row["can_react"], true);
+        assert_eq!(row["reactions"], json!([
+            {"key":"👍", "count":2, "own":true}, {"key":"🎉", "count":1, "own":false},
+        ]));
+        // Removing a remote reaction redacts it directly; adding one is queued.
+        Mock::given(method("PUT"))
+            .and(path_regex(r"/rooms/.*/redact/\$r2/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id":"$undo"})))
+            .expect(1)
+            .mount(&server).await;
+        assert!(timelines.react(&room, "active", event_id!("$target"), "🎉").await.unwrap());
+        assert!(!timelines.react(&room, "active", event_id!("$target"), "👍").await.unwrap());
+        let row = snapshot_row(&timelines, event_id!("$target")).await;
+        assert_eq!(row["reactions"], json!([
+            {"key":"👍", "count":1, "own":false}, {"key":"🎉", "count":2, "own":true},
+        ]));
+        assert_eq!(timelines.react(&room, "active", event_id!("$target"), " ")
+            .await.unwrap_err().code, "invalid_params");
+        assert_eq!(timelines.react(&room, "active", event_id!("$missing"), "👍")
+            .await.unwrap_err().code, "event_missing");
+        timelines.shutdown().await;
+    }
+
     #[tokio::test]
     async fn sdk_mutation_permissions_distinguish_author_moderator_and_missing_plaintext() {
         let mut gone = message("$gone", "@me:example.org", json!({}));
@@ -1739,7 +1840,8 @@ mod tests {
             loop {
                 if let Some(local) = local_items.iter().find(|item| item.as_event()
                     .is_some_and(|event| event.event_id().is_none())) {
-                    let flags = item(local, mutation_permissions(timeline.room()).await.unwrap());
+                    let flags = item(local, mutation_permissions(timeline.room()).await.unwrap(),
+                        timeline.room().own_user_id());
                     assert_eq!(flags["can_edit"], false);
                     assert_eq!(flags["can_redact"], false);
                     assert_eq!(flags["can_read"], false);

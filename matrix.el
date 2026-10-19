@@ -43,6 +43,7 @@
 (autoload 'matrix-message-edit "matrix-transient" nil t)
 (autoload 'matrix-message-delete "matrix-transient" nil t)
 (autoload 'matrix-message-reply "matrix-transient" nil t)
+(autoload 'matrix-message-react "matrix-transient" nil t)
 
 (defvar matrix-navigation-map
   (let ((map (make-sparse-keymap)))

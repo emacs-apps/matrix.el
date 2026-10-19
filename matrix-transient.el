@@ -8,6 +8,7 @@
 
 (require 'transient)
 (require 'url-util)
+(require 'appkit-chat-emoji)
 (require 'matrix-root)
 (require 'matrix-room)
 (require 'matrix-verify)
@@ -145,6 +146,19 @@
       (matrix--request surface "message.redact" params
                        (list :event-id (plist-get params :event_id))))))
 
+(defun matrix-message-react (scope)
+  "Toggle a reaction on SCOPE's exact message, offering its reactions first."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (let* ((surface (matrix-menu--surface scope))
+         (item (matrix-menu--message scope)))
+    (matrix-room--mutation-params surface item :can_react)
+    (let ((key (appkit-chat-emoji-read
+                "React with: "
+                (mapcar (lambda (reaction) (plist-get reaction :key))
+                        (plist-get item :reactions)))))
+      (with-current-buffer (appkit-surface-buffer (matrix-menu--surface scope))
+        (matrix-room-toggle-reaction (plist-get item :id) key)))))
+
 (defun matrix-menu--mutation-inapt-p (capability)
   "Return non-nil when the captured message cannot perform CAPABILITY."
   (condition-case nil
@@ -164,6 +178,10 @@
 (defun matrix-menu--delete-inapt-p ()
   "Return whether redacting the captured message is unavailable."
   (matrix-menu--mutation-inapt-p :can_redact))
+
+(defun matrix-menu--react-inapt-p ()
+  "Return whether reacting to the captured message is unavailable."
+  (matrix-menu--mutation-inapt-p :can_react))
 
 (defun matrix-menu--reply-inapt-p ()
   "Return whether replying to the captured SDK message is unavailable."
@@ -424,6 +442,7 @@
     ("r" "Reply to message" matrix-message-reply :inapt-if matrix-menu--reply-inapt-p)
     ("e" "Edit message" matrix-message-edit :inapt-if matrix-menu--edit-inapt-p)
     ("d" "Delete message" matrix-message-delete :inapt-if matrix-menu--delete-inapt-p)
+    ("!" "React / toggle reaction" matrix-message-react :inapt-if matrix-menu--react-inapt-p)
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
     ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
     ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]

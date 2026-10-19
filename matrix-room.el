@@ -62,6 +62,7 @@
   'reply #'matrix-message-reply
   'edit #'matrix-message-edit
   'delete #'matrix-message-delete
+  'react #'matrix-message-react
   'history-older #'matrix-room-load-older
   'latest #'matrix-room-latest
   'quit #'quit-window
@@ -112,7 +113,7 @@ Closing this buffer does not stop account sync."
 
 (defun matrix-room--mutation-params (surface item capability)
   "Capture ITEM's server event in SURFACE's current SDK subscription.
-CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
+CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
   (let* ((app (appkit-surface-app surface))
          (state (matrix-runtime-state app))
          (room-id (cadr (appkit-surface-identity surface)))
@@ -128,7 +129,8 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                  (stringp event-id) (not (string-empty-p event-id))
                  (eq (plist-get item capability) t))
       (user-error "The selected message cannot be %s"
-                  (if (eq capability :can_edit) "edited" "deleted")))
+                  (pcase capability
+                    (:can_edit "edited") (:can_react "reacted to") (_ "deleted"))))
     (list :room_id room-id :subscription_id subscription :event_id event-id)))
 
 (defun matrix-room-begin-edit (surface item)
@@ -333,6 +335,36 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
                         (and state (eq (appkit-resource-state-status state) 'failed)))
                     'error 'shadow))))))))
 
+(defun matrix-room--insert-reactions (item prefix)
+  "Insert ITEM's SDK reaction chips with PREFIX; a chip toggles its reaction."
+  (let ((row-key (plist-get item :id)))
+    (appkit-chat-ins-insert-reaction-line
+     (append (plist-get item :reactions) nil)
+     :prefix prefix
+     :label-function
+     (lambda (reaction)
+       (format "[%s %d]" (matrix--one-line (plist-get reaction :key))
+               (plist-get reaction :count)))
+     :selected-p-function (lambda (reaction) (eq (plist-get reaction :own) t))
+     :action-function
+     (when (eq (plist-get item :can_react) t)
+       (lambda (reaction) (matrix-room-toggle-reaction row-key (plist-get reaction :key))))
+     :help-echo-function
+     (lambda (reaction)
+       (if (eq (plist-get reaction :own) t) "Remove your reaction" "Add this reaction")))))
+
+(defun matrix-room-toggle-reaction (row-key reaction)
+  "Toggle REACTION on this room's message whose SDK row is ROW-KEY."
+  (let* ((surface (matrix--current-surface 'room))
+         (item (seq-find (lambda (item) (equal row-key (plist-get item :id)))
+                         (matrix-runtime-room-items
+                          (appkit-surface-app surface)
+                          (cadr (appkit-surface-identity surface))))))
+    (unless item (user-error "The message is no longer available"))
+    (matrix--request surface "message.react"
+                     (append (matrix-room--mutation-params surface item :can_react)
+                             (list :key reaction)))))
+
 (defun matrix-room--print-row (row)
   "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
   (let* ((item (appkit-chat-timeline-row-payload row))
@@ -390,6 +422,7 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
            (when (or (= body-start (point)) (not (bolp))) (insert "\n"))
            (when (equal kind "message")
              (matrix-room--insert-image item prefixes))
+           (matrix-room--insert-reactions item body-prefix)
            (when compact
              (save-excursion
                (goto-char body-text-start)
@@ -644,8 +677,11 @@ CAPABILITY is the SDK's `:can_edit' or `:can_redact' permission."
    ((not (equal method "message.send"))
     (matrix--feedback-next
      model (if error (matrix--error-text error)
-             (if (equal method "message.redact") "Redaction accepted by SDK."
-               (format "%s completed" method)))))
+             (pcase method
+               ("message.redact" "Redaction accepted by SDK.")
+               ("message.react" (if (eq (plist-get result :added) t)
+                                    "Reaction added." "Reaction removed."))
+               (_ (format "%s completed" method))))))
    (t (matrix-compose-result model result error context))))
 
 (defun matrix-room--read-capable-p (item)
