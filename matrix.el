@@ -29,6 +29,7 @@
 
 (autoload 'matrix-join-room "matrix-root" nil t)
 (autoload 'matrix-create-room "matrix-root" nil t)
+(autoload 'matrix-direct-chat "matrix-root" nil t)
 (autoload 'matrix-verification-request "matrix-verify" nil t)
 (autoload 'matrix-keys-export "matrix-verify" nil t)
 (autoload 'matrix-keys-import "matrix-verify" nil t)
@@ -156,6 +157,13 @@ RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
    :label (matrix--one-line label) :item-p t
    :payload payload :stamp (list label payload)
    :help-echo "Open this item"))
+
+(defun matrix--read-user-id (prompt)
+  "Read a full Matrix user ID with PROMPT."
+  (let ((id (string-trim (read-string prompt))))
+    (unless (string-match-p "\\`@[^:[:space:]]+:[^[:space:]]+\\'" id)
+      (user-error "Enter a full Matrix user ID such as @name:example.org"))
+    id))
 
 (defun matrix--error-text (error)
   "Return the safe user-visible message in a protocol ERROR."

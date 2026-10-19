@@ -331,5 +331,34 @@
     (matrix--request surface "room.create"
                      (list :name name :invite (vconcat invite)))))
 
+(defun matrix-root-decline-invitation ()
+  "Decline the invitation at point after confirming."
+  (interactive)
+  (let ((surface (matrix--current-surface 'root)))
+    (pcase (appkit-directory-entry-payload (appkit-directory-entry-at-point))
+      (`(room ,room-id "invite")
+       (when (yes-or-no-p (format "Decline the invitation to %s? "
+                                  (or (plist-get (matrix-runtime-room
+                                                  (appkit-surface-app surface) room-id)
+                                                 :name)
+                                      room-id)))
+         (matrix--request surface "room.leave" (list :room_id room-id))))
+      (_ (user-error "Point is not on an invitation")))))
+
+;;;###autoload
+(defun matrix-direct-chat (user-id)
+  "Open the direct chat with USER-ID, starting an encrypted one if none exists."
+  (interactive (list (matrix--read-user-id "Direct chat with user ID: ")))
+  (let ((app (matrix--current-app)))
+    (message "Matrix: opening a direct chat with %s..." user-id)
+    (matrix-runtime-resource-request
+     app "dm.open" (list :user_id user-id)
+     (lambda (result)
+       (require 'matrix-room)
+       (matrix-room-open app (plist-get result :room_id) t))
+     (lambda (error)
+       (message "Matrix: %s" (or (and (listp error) (plist-get error :message))
+                                 "The direct chat request was not sent"))))))
+
 (provide 'matrix-root)
 ;;; matrix-root.el ends here

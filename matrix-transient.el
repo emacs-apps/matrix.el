@@ -437,7 +437,10 @@
     ("/" "Filter directory" matrix-root-filter)
     ("g" "Refresh summaries" matrix-root-refresh :inapt-if matrix-menu--refresh-inapt-p)
     ("j" "Join room / alias" matrix-join-room :inapt-if matrix-menu--request-inapt-p)
-    ("c" "Create encrypted room" matrix-create-room :inapt-if matrix-menu--request-inapt-p)]
+    ("c" "Create encrypted room" matrix-create-room :inapt-if matrix-menu--request-inapt-p)
+    ("d" "Direct chat" matrix-direct-chat :inapt-if matrix-menu--request-inapt-p)
+    ("x" "Decline invitation" matrix-root-decline-invitation
+     :inapt-if matrix-menu--request-inapt-p)]
    ["Account" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("v" "Devices and trust" matrix-devices)
     ("a" "Account / keys" matrix-account-transient)]]
@@ -472,6 +475,11 @@
     ("<" "Load older" matrix-room-load-older :inapt-if matrix-menu--history-inapt-p)
     (">" "Latest / input" matrix-room-latest :advice* matrix-menu--focus-command)
     ("g" "Refresh room summary" matrix-room-refresh :inapt-if matrix-menu--refresh-inapt-p)]
+   ["Room" :advice* matrix-menu--command :inapt-if matrix-menu--request-inapt-p
+    ("i" "Invite user" matrix-room-invite)
+    ("n" "Rename" matrix-room-rename)
+    ("t" "Change topic" matrix-room-set-topic)
+    ("L" "Leave" matrix-room-leave)]
    ["Navigate" :advice* matrix-menu--command :inapt-if matrix-menu--view-inapt-p
     ("r" "Room directory" matrix-accounts)
     ("s" "Switch room" matrix-switch-room)
