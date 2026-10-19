@@ -651,6 +651,37 @@
           (should (equal (appkit-chatbuf-input-string) "Unsent draft"))
           (should (equal (appkit-chat-timeline-keys) '("stable-row"))))))))
 
+(ert-deftest matrix-ui-reaction-chips-and-command-toggle-the-exact-event ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let ((requests nil))
+      (appkit-app-send
+       app (plist-put
+            (matrix-ui-test--items-state
+             (list (list :id "stable-row" :kind "message" :event_id "$e:test"
+                         :sender "@other:test" :body "Hello" :can_react t
+                         :reactions [(:key "👍" :count 2 :own t)
+                                     (:key "🎉" :count 1 :own :json-false)])))
+            :backend-active t))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (goto-char (point-min))
+      (search-forward "[👍 2]")
+      (should (eq (get-text-property (match-beginning 0) 'face)
+                  'appkit-chat-reaction-selected))
+      (cl-letf (((symbol-function 'matrix-runtime-request)
+                 (lambda (_app method params _owned) (push (list method params) requests) 1)))
+        (push-button (match-beginning 0))
+        (appkit-surface-send surface (list 'matrix-result 1 "message.react" '(:added :json-false)
+                                           nil (plist-get (appkit-surface-model surface) :operation)))
+        (goto-char (appkit-chat-timeline-key-position "stable-row"))
+        (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "🎉")))
+          (matrix-message-react (matrix-menu--capture 'room t))))
+      (should (equal (nreverse requests)
+                     '(("message.react" (:room_id "!room:test" :subscription_id "subscription"
+                                         :event_id "$e:test" :key "👍"))
+                       ("message.react" (:room_id "!room:test" :subscription_id "subscription"
+                                         :event_id "$e:test" :key "🎉"))))))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)
