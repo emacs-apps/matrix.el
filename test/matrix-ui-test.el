@@ -733,6 +733,36 @@
         (should (equal (plist-get (cadr request) :source_id) source))
         (should (equal opened (list path "file")))))))
 
+(ert-deftest matrix-ui-failed-send-offers-retry-and-confirmed-discard ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let (requests)
+      (appkit-app-send
+       app (plist-put
+            (matrix-ui-test--items-state
+             (list (list :id "local" :kind "message" :transaction_id "txn-1" :own t
+                         :sender "@me:test" :body "Hello" :send_state "failed"
+                         :error "Not sent: some recipients have unverified devices"
+                         :can_retry t :can_discard t)))
+            :backend-active t))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (string-match-p "unverified devices\n\\[Retry\\] \\[Discard\\]" (buffer-string)))
+      (cl-letf (((symbol-function 'matrix-runtime-request)
+                 (lambda (_app method params owned)
+                   (push (list method params) requests)
+                   (appkit-surface-send surface (list 'matrix-result 1 method nil nil owned))
+                   1))
+                ((symbol-function 'yes-or-no-p) (lambda (&rest _) nil)))
+        (goto-char (point-min))
+        (search-forward "[Discard]")
+        (push-button (match-beginning 0))
+        (should-not requests)
+        (search-backward "[Retry]")
+        (push-button (point)))
+      (should (equal requests '(("message.retry" (:room_id "!room:test"
+                                                  :subscription_id "subscription"
+                                                  :transaction_id "txn-1"))))))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)

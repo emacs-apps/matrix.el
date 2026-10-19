@@ -378,6 +378,53 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                      (append (matrix-room--mutation-params surface item :can_react)
                              (list :key reaction)))))
 
+(defun matrix-room--local-echo-params (surface item capability)
+  "Capture SURFACE's unsent ITEM for an SDK send-queue CAPABILITY.
+CAPABILITY is the backend's `:can_retry' or `:can_discard'."
+  (let* ((app (appkit-surface-app surface))
+         (state (matrix-runtime-state app))
+         (room-id (cadr (appkit-surface-identity surface)))
+         (subscription (plist-get (matrix-room--timeline state room-id) :subscription_id))
+         (transaction (plist-get item :transaction_id)))
+    (unless (and (plist-get state :backend-active) (plist-get state :session)
+                 (stringp subscription) (stringp transaction)
+                 (eq (plist-get item capability) t))
+      (user-error "This message cannot be %s"
+                  (if (eq capability :can_retry) "retried" "discarded")))
+    (list :room_id room-id :subscription_id subscription :transaction_id transaction)))
+
+(defun matrix-room-retry-send (row-key)
+  "Send this room's failed message with SDK row ROW-KEY again."
+  (let* ((surface (matrix--current-surface 'room))
+         (item (matrix-room--item surface row-key)))
+    (matrix--request surface "message.retry"
+                     (matrix-room--local-echo-params surface item :can_retry))))
+
+(defun matrix-room-discard-send (row-key)
+  "Withdraw this room's unsent message with SDK row ROW-KEY after confirming."
+  (let* ((surface (matrix--current-surface 'room))
+         (params (matrix-room--local-echo-params
+                  surface (matrix-room--item surface row-key) :can_discard)))
+    (when (yes-or-no-p "Discard this unsent Matrix message? ")
+      (matrix--request surface "message.discard"
+                       (matrix-room--local-echo-params
+                        surface (matrix-room--item surface row-key) :can_discard)
+                       (list :transaction-id (plist-get params :transaction_id))))))
+
+(defun matrix-room--insert-send-actions (item)
+  "Insert retry and discard buttons under ITEM when its sending failed."
+  (when (equal (plist-get item :send_state) "failed")
+    (let ((row-key (plist-get item :id))
+          (start (point)))
+      (when (eq (plist-get item :can_retry) t)
+        (insert-text-button "[Retry]" 'follow-link t 'help-echo "Send this message again"
+                            'action (lambda (_) (matrix-room-retry-send row-key)))
+        (insert " "))
+      (when (eq (plist-get item :can_discard) t)
+        (insert-text-button "[Discard]" 'follow-link t 'help-echo "Withdraw this message"
+                            'action (lambda (_) (matrix-room-discard-send row-key))))
+      (unless (= start (point)) (insert "\n")))))
+
 (defun matrix-room--save-attachment (surface item path on-saved)
   "Download SURFACE's ITEM attachment to PATH, then call ON-SAVED with PATH."
   (let* ((app (appkit-surface-app surface))
@@ -506,7 +553,10 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                (end-of-line)
                (matrix-room--insert-time item (plist-get prefixes :rest-body))))
            (when-let* ((error (plist-get item :error)))
-             (insert (propertize (format "Error: %s\n" error) 'face 'error)))
+             (insert (propertize error 'face (if (eq (plist-get item :can_retry) t)
+                                                 'error 'warning))
+                     "\n"))
+           (matrix-room--insert-send-actions item)
            (appkit-ui-apply-line-prefix body-text-start (point) body-prefix)))))
     (add-text-properties start (point)
                          (list matrix-room-message-key-property
@@ -758,6 +808,10 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                ("message.redact" "Redaction accepted by SDK.")
                ("message.react" (if (eq (plist-get result :added) t)
                                     "Reaction added." "Reaction removed."))
+               ("message.retry" "Message queued to send again.")
+               ("message.discard" (if (eq (plist-get result :discarded) t)
+                                      "Unsent message discarded."
+                                    "The message was already sent."))
                (_ (format "%s completed" method))))))
    (t (matrix-compose-result model result error context))))
 

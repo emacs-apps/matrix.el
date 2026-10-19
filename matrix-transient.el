@@ -182,6 +182,25 @@
      surface (matrix-menu--message scope) path
      (lambda (path) (message "Matrix: saved %s" (abbreviate-file-name path))))))
 
+(defun matrix-message-retry-send (scope)
+  "Send SCOPE's exact failed message again."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (with-current-buffer (appkit-surface-buffer (matrix-menu--surface scope))
+    (matrix-room-retry-send (plist-get (matrix-menu--message scope) :id))))
+
+(defun matrix-message-discard-send (scope)
+  "Withdraw SCOPE's exact unsent message after confirming."
+  (interactive (list (matrix-menu--capture 'room t)))
+  (with-current-buffer (appkit-surface-buffer (matrix-menu--surface scope))
+    (matrix-room-discard-send (plist-get (matrix-menu--message scope) :id))))
+
+(defun matrix-menu--capability-inapt-p (capability)
+  "Return whether the captured message lacks CAPABILITY or the room is busy."
+  (condition-case nil
+      (or (matrix-menu--request-inapt-p)
+          (not (eq (plist-get (matrix-menu--message (matrix-menu--scope)) capability) t)))
+    (user-error t)))
+
 (defun matrix-menu--download-inapt-p ()
   "Return whether the captured message has no downloadable attachment."
   (condition-case nil
@@ -190,12 +209,11 @@
     (user-error t)))
 
 (defun matrix-menu--mutation-inapt-p (capability)
-  "Return non-nil when the captured message cannot perform CAPABILITY."
-  (condition-case nil
-      (or (matrix-menu--request-inapt-p)
+  "Return non-nil when the captured server event cannot perform CAPABILITY."
+  (or (matrix-menu--capability-inapt-p capability)
+      (condition-case nil
           (not (matrix-menu--server-id-p (matrix-menu--message (matrix-menu--scope))))
-          (not (eq (plist-get (matrix-menu--message (matrix-menu--scope)) capability) t)))
-    (user-error t)))
+        (user-error t))))
 
 (defun matrix-menu--edit-inapt-p ()
   "Return whether editing the captured message is unavailable."
@@ -477,6 +495,10 @@
      :inapt-if matrix-menu--download-inapt-p)
     ("s" "Save attachment as" matrix-message-save-attachment
      :inapt-if matrix-menu--download-inapt-p)
+    ("R" "Retry sending" matrix-message-retry-send
+     :inapt-if (lambda () (matrix-menu--capability-inapt-p :can_retry)))
+    ("x" "Discard unsent message" matrix-message-discard-send
+     :inapt-if (lambda () (matrix-menu--capability-inapt-p :can_discard)))
     ("w" "Copy text" matrix-message-copy-text :inapt-if matrix-menu--text-inapt-p)
     ("i" "Copy event ID" matrix-message-copy-id :inapt-if matrix-menu--id-inapt-p)
     ("l" "Copy link" matrix-message-copy-link :inapt-if matrix-menu--id-inapt-p)]]
