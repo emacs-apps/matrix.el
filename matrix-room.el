@@ -569,13 +569,15 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
     (setq start (point))
     (pcase kind
       ("state"
-       (insert (propertize
-                (concat "  · " (appkit-presentation-elide-string-for-columns
-                                (matrix--one-line (plist-get item :body))
-                                (max 10 (- matrix-room--width 14)) 'shadow))
-                'face 'shadow))
-       (matrix-room--insert-time item "")
-       (insert "\n"))
+       ;; AppKit's gray-tip row, as QQ gray tips and other clients' notices.
+       (appkit-chat-ins-insert-divider-row
+        (appkit-presentation-elide-string-for-columns
+         (string-join (delq nil (list (matrix--one-line (plist-get item :body))
+                                      (let ((time (matrix-room--time-label item)))
+                                        (unless (string-empty-p time) time))))
+                      " · ")
+         (max 10 (- matrix-room--width 8)) 'shadow)
+        'shadow matrix-room--width))
       ("day"
        (appkit-chat-ins-insert-divider-row
         (if (numberp timestamp)

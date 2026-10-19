@@ -694,7 +694,7 @@
       (appkit-app-send app (matrix-ui-test--items-state items))
       (appkit-surface-send surface '(matrix-update timeline "!room:test"))
       (should (equal (appkit-chat-timeline-keys) '("join" "topic" "hello")))
-      (should (string-match-p "· Newcomer joined" (buffer-string)))
+      (should (string-match-p "─( Newcomer joined )─" (buffer-string)))
       (should-not (string-match-p "join_rules" (buffer-string)))
       (let ((matrix-room-state-events 'no-membership))
         (appkit-surface-send surface '(matrix-update timeline "!room:test"))
