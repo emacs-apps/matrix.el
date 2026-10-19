@@ -42,6 +42,17 @@ joins, leaves and profile changes (busy bridged rooms), nil hides them all."
                  (const :tag "None" nil))
   :group 'matrix)
 
+(defcustom matrix-send-typing-notices t
+  "Whether rooms are told while you compose a message."
+  :type 'boolean
+  :group 'matrix)
+
+(defvar-local matrix-room--typing-revision nil
+  "Composer revision last considered for a typing notice.")
+
+(defvar-local matrix-room--typing-sent nil
+  "Last typing notice sent from this room, as (TYPING-P . TIME).")
+
 (defvar-local matrix-room--width 80
   "Width of the last committed room presentation.")
 
@@ -116,6 +127,7 @@ Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (matrix-compose-setup)
   (matrix-mention-setup)
+  (add-hook 'post-command-hook #'matrix-room--notice-typing nil t)
   (appkit-chatbuf-use-timeline-mode #'matrix-room-timeline-mode))
 
 (defun matrix-room--edit-state ()
@@ -502,6 +514,37 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
                       (lambda (&rest _) (matrix-room-open-attachment row-key)))
        :open-help-echo "Download and open this attachment"))))
 
+(defun matrix-room--typing-text (names)
+  "Describe who of NAMES is typing."
+  (pcase names
+    (`(,one) (format "%s is typing…" one))
+    (`(,one ,two) (format "%s and %s are typing…" one two))
+    (`(,one . ,rest) (format "%s and %d others are typing…" one (length rest)))))
+
+(defun matrix-room--notice-typing ()
+  "Tell the room whether the composer holds a draft, at most every 2 seconds.
+The SDK debounces further and lets a notice lapse 4 seconds after the last."
+  (when-let* ((matrix-send-typing-notices)
+              (surface (appkit-current-surface))
+              ((eq surface matrix--registered-surface))
+              (revision (appkit-chatbuf-composer-revision))
+              ((not (eql revision matrix-room--typing-revision)))
+              (app (appkit-surface-app surface))
+              ((plist-get (matrix-runtime-state app) :session)))
+    (setq matrix-room--typing-revision revision)
+    (let ((typing (not (string-blank-p (appkit-chatbuf-input-string))))
+          (now (float-time)))
+      (when (if typing
+                (or (not (car matrix-room--typing-sent))
+                    (> (- now (cdr matrix-room--typing-sent)) 2))
+              (car matrix-room--typing-sent))
+        (setq matrix-room--typing-sent (cons typing now))
+        (matrix-runtime-resource-request
+         app "room.typing"
+         (list :room_id (cadr (appkit-surface-identity surface))
+               :typing (if typing t :json-false))
+         #'ignore #'ignore)))))
+
 (defun matrix-room--shown-p (item)
   "Whether the timeline presents SDK row ITEM."
   (pcase (plist-get item :kind)
@@ -656,6 +699,9 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
       (when-let* ((count (appkit-chat-read-count-text
                          (plist-get (plist-get timeline :read_state) :unread_messages))))
         (setq matrix--header-line (concat matrix--header-line "  " count)))
+      (when-let* ((typing (matrix-room--typing-text (plist-get timeline :typing))))
+        (setq matrix--header-line
+              (concat matrix--header-line "  " (propertize typing 'face 'shadow))))
       (let ((footer (matrix-room--footer state timeline model)))
         (appkit-chat-timeline-ensure
          :printer #'matrix-room--print-row

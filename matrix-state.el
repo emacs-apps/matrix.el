@@ -163,6 +163,13 @@ the latest such event; sender and text fields are optional strings."
           (signal 'matrix-protocol-error '("Invalid room notification")))))
     rooms))
 
+(defun matrix-state-typing (value)
+  "Return the display names of users typing, from VALUE."
+  (let ((names (matrix-state--array value)))
+    (unless (seq-every-p #'stringp names)
+      (signal 'matrix-protocol-error '("Invalid typing users")))
+    names))
+
 (defun matrix-state-members (value)
   "Return joined members with unique, nonempty user identities from VALUE.
 A member's `:display_name' and `:avatar_url' are optional strings."

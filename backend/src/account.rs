@@ -116,6 +116,12 @@ struct RoomUserParam {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TypingParam {
+    room_id: OwnedRoomId,
+    typing: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RoomTextParam {
     room_id: OwnedRoomId,
     text: String,
@@ -777,6 +783,13 @@ impl Account {
             "room.leave" => {
                 let args: RoomParam = params(value)?;
                 known_room(&self.client, &args.room_id)?.leave().await.map_err(room_error)?;
+                Ok(json!({}))
+            }
+            "room.typing" => {
+                // The SDK debounces notices and lets each one lapse after 4 s.
+                let args: TypingParam = params(value)?;
+                known_room(&self.client, &args.room_id)?
+                    .typing_notice(args.typing).await.map_err(room_error)?;
                 Ok(json!({}))
             }
             "room.invite" => {

@@ -276,6 +276,9 @@ Register ROOM-ID's timeline when provided; retain the reading position."
          (state (appkit-app-read-view-model
                  (appkit-transition-context-app-read-view context))))
     (pcase message
+      (`(matrix-update typing ,_room-id)
+       ;; Only the room header names who is typing.
+       (appkit-next :model model :render (appkit-projection-change-create :frame-p t)))
       (`(matrix-update ,kind ,room-id)
        (if (and room-p room-id
                 (not (equal room-id (cadr (plist-get model :identity)))))
