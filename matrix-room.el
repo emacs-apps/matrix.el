@@ -61,11 +61,14 @@ joins, leaves and profile changes (busy bridged rooms), nil hides them all."
 
 (defvar matrix-room-navigation-map
   (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map matrix-navigation-map)
-    (define-key map (kbd "<") #'matrix-room-load-older)
-    (define-key map (kbd ">") #'matrix-room-latest)
+    (define-key map (kbd "r") #'matrix-room-read-all)
+    (define-key map (kbd ">") #'matrix-room-read-all)
+    (define-key map (kbd "u") #'matrix-room-goto-unread)
+    (define-key map (kbd "m") #'matrix-room-next-mention)
+    (define-key map (kbd "@") #'matrix-room-next-mention)
+    (define-key map (kbd "o") #'matrix-room-next-outgoing)
     map)
-  "Native navigation prefix, also reused by optional Evil integration.")
+  "Fast navigation under `M-g', after telega's chatbuf fastnav keys.")
 
 (defconst matrix-room-message-key-property 'matrix-message-id
   "Stable SDK timeline identity attached to generated rows.")
@@ -827,24 +830,60 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
       (appkit-media-inline-host-activate host)
     (appkit-chatbuf-dispatch-return #'matrix-room-send)))
 
-(defun matrix-room--move-message (backward)
-  "Move to the next semantic message, or previous when BACKWARD."
+(defun matrix-room--move-message (backward &optional predicate what wrap)
+  "Move to the next rendered message, or previous when BACKWARD.
+PREDICATE, given a row's SDK item, restricts the target; WHAT names it when
+there is none.  WRAP continues from the other end of the loaded history."
   (matrix--current-surface 'room)
   (let* ((key (get-text-property (point) matrix-room-message-key-property))
          (position (or (and key (appkit-chat-timeline-key-position key)) (point)))
          (keys (appkit-chat-timeline-keys))
-         (target
-          (seq-find
+         (matches
+          (seq-filter
            (lambda (candidate)
-             (and (not (member (plist-get (appkit-chat-timeline-row-payload
-                                          (appkit-chat-timeline-row candidate)) :kind)
-                               '("day")))
-                  (funcall (if backward #'< #'>)
-                           (appkit-chat-timeline-key-position candidate) position)))
-           (if backward (reverse keys) keys))))
-    (unless target (user-error "No %s message" (if backward "previous" "next")))
+             (let ((item (appkit-chat-timeline-row-payload
+                          (appkit-chat-timeline-row candidate))))
+               (and (not (equal (plist-get item :kind) "day"))
+                    (or (null predicate) (funcall predicate item)))))
+           (if backward (reverse keys) keys)))
+         (target
+          (or (seq-find (lambda (candidate)
+                          (funcall (if backward #'< #'>)
+                                   (appkit-chat-timeline-key-position candidate) position))
+                        matches)
+              (and wrap (car matches)))))
+    (unless target
+      (user-error "No %s" (or what (if backward "previous message" "next message"))))
     (goto-char (appkit-chat-timeline-key-position target))
     (appkit-chatbuf-update-context-mode)))
+
+(defun matrix-room-next-mention ()
+  "Move to the next loaded message that mentions you."
+  (interactive)
+  (matrix-room--move-message
+   nil (lambda (item) (eq (plist-get item :highlighted) t)) "message mentioning you" t))
+
+(defun matrix-room-next-outgoing ()
+  "Move to the next loaded message you sent."
+  (interactive)
+  (matrix-room--move-message
+   nil (lambda (item) (eq (plist-get item :own) t)) "message of yours" t))
+
+(defun matrix-room-goto-unread ()
+  "Move to the first unread message."
+  (interactive)
+  (matrix--current-surface 'room)
+  (let ((position (and matrix-room--unread-key
+                       (appkit-chat-timeline-key-position matrix-room--unread-key))))
+    (unless position (user-error "No unread messages in the loaded history"))
+    (goto-char position)
+    (appkit-chatbuf-update-context-mode)))
+
+(defun matrix-room-read-all ()
+  "Mark the room read through its newest message and return to the composer."
+  (interactive)
+  (matrix-room-latest)
+  (matrix-room-read-through))
 
 (defun matrix-room-next-message ()
   "Move to the next rendered message."

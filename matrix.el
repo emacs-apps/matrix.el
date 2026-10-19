@@ -55,14 +55,6 @@
   "Face of message text that mentions you or matches your keywords."
   :group 'matrix)
 
-(defvar matrix-navigation-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "r") #'matrix-accounts)
-    (define-key map (kbd "s") #'matrix-switch-room)
-    (define-key map (kbd "v") #'matrix-devices)
-    map)
-  "Common native navigation prefix for Matrix destinations.")
-
 (defvar matrix--request-token 0
   "Monotonic UI operation identity, independent of transport request IDs.")
 (defvar-local matrix--registered-surface nil

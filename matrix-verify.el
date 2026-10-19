@@ -22,7 +22,6 @@
 
 (appkit-bindings-define 'matrix-verify-mode-map 'read-only
   'app-menu #'matrix-verify-transient
-  'navigation matrix-navigation-map
   'refresh #'matrix-verify-refresh)
 
 (define-derived-mode matrix-verify-mode appkit-directory-mode "Matrix-Verify"

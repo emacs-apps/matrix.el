@@ -21,8 +21,6 @@
 (declare-function matrix-room-previous-message "matrix-room" ())
 (declare-function matrix-room-return "matrix-room" ())
 
-(defvar matrix-navigation-map)
-(defvar matrix-room-navigation-map)
 
 (defcustom matrix-evil-enable-integration t
   "Whether to install Matrix bindings when Evil is available."
