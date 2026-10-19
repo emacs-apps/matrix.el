@@ -317,9 +317,22 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                             (plist-get item :send_state)))
                 " · ")))))))
 
+(defun matrix-room--video-resolver (app room item)
+  "Return a resolver fetching APP's ROOM ITEM video for inline playback."
+  (lambda (resolve reject)
+    (pcase-let ((`(,_kind ,_source ,name) (matrix-media-attachment item)))
+      (matrix-media-save
+       app room (plist-get (matrix-room--timeline (matrix-runtime-state app) room)
+                           :subscription_id)
+       item (matrix-media--open-path name)
+       (lambda (path) (funcall resolve `((file . ,path) (name . ,name))))
+       reject))
+    nil))
+
 (defun matrix-room--insert-image (item prefixes)
-  "Insert ITEM's committed Canvas image below its caption with PREFIXES."
-  (when-let* ((image (plist-get item :image)))
+  "Insert ITEM's committed Canvas image or video poster below its caption.
+PREFIXES size it to the body column."
+  (when-let* ((image (matrix-media-poster item)))
     (let* ((surface (appkit-current-surface))
            (app (appkit-surface-app surface))
            (room (cadr (appkit-surface-identity surface)))
@@ -333,7 +346,11 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                                      (appkit-media--char-pixel-width)
                                      (appkit-media--base-char-pixel-height))
                                   (float (appkit-media--char-pixel-height)))))))
-           (poster (and key (matrix-media-cached-poster app key width))))
+           (video (when (plist-get image :video)
+                    (append (list :resolve (matrix-room--video-resolver app room item))
+                            image)))
+           (noun (if video "Video" "Image"))
+           (poster (and key (matrix-media-cached-poster app key width video))))
       (cond
        ((and poster (not (stringp poster)))
         ;; Each call authors a fresh occurrence; committed Surface mounting
@@ -347,26 +364,30 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
          (propertize
           (concat
            (cond
-            ((not (matrix-media-rendering-available-p)) "[Image: Canvas display required")
-            ((not key) "[Image unavailable: missing event identity")
+            ((not (matrix-media-rendering-available-p))
+             (format "[%s: Canvas display required" noun))
+            ((not key) (format "[%s unavailable: missing event identity" noun))
             ((stringp poster) (substring poster 0 -1))
             ((and state (eq (appkit-resource-state-status state) 'failed))
-             "[Image unavailable: acquisition failed")
-            (t "[Image loading"))
-           (when-let* ((filename (plist-get image :filename))
-                        ((stringp filename)))
+             (format "[%s unavailable: acquisition failed" noun))
+            (t (format "[%s loading" noun)))
+           ;; A video's card below already names it.
+           (when-let* (((not video))
+                       (filename (plist-get (plist-get item :image) :filename))
+                       ((stringp filename)))
              (concat " · " (matrix--one-line filename)))
            "]\n")
           'face (if (or (stringp poster)
                         (and state (eq (appkit-resource-state-status state) 'failed)))
                     'error 'shadow))))))))
 
-(defun matrix-room--insert-reactions (item prefix)
-  "Insert ITEM's SDK reaction chips with PREFIX; a chip toggles its reaction."
+(defun matrix-room--insert-reactions (item)
+  "Insert ITEM's SDK reaction chips; a chip toggles its reaction.
+The row's body prefix is applied over them afterwards, so add none here."
   (let ((row-key (plist-get item :id)))
     (appkit-chat-ins-insert-reaction-line
      (append (plist-get item :reactions) nil)
-     :prefix prefix
+     :prefix ""
      :label-function
      (lambda (reaction)
        (format "[%s %d]" (matrix--one-line (plist-get reaction :key))
@@ -499,8 +520,9 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
        surface item (matrix-media--open-path name)
        (lambda (path) (funcall matrix-attachment-open-function path kind))))))
 
-(defun matrix-room--insert-attachment (item prefix)
-  "Insert ITEM's file, audio or video card with PREFIX; activating it opens it."
+(defun matrix-room--insert-attachment (item)
+  "Insert ITEM's file, audio or video card; activating it opens it.
+The row's body prefix is applied over it afterwards, so add none here."
   (when-let* ((attachment (plist-get item :attachment)))
     (let ((row-key (plist-get item :id))
           (size (plist-get attachment :size))
@@ -511,7 +533,7 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
        :details (delq nil (list (when (natnump duration)
                                   (appkit-chat-ins-format-duration (/ duration 1000.0)))
                                 (when (natnump size) (file-size-human-readable size))))
-       :prefix prefix
+       :prefix ""
        :open-action (when (stringp (plist-get item :event_id))
                       (lambda (&rest _) (matrix-room-open-attachment row-key)))
        :open-help-echo "Download and open this attachment"))))
@@ -682,8 +704,8 @@ for that is plain text, elided."
              (insert "\n"))
            (when (equal kind "message")
              (matrix-room--insert-image item prefixes)
-             (matrix-room--insert-attachment item body-prefix))
-           (matrix-room--insert-reactions item body-prefix)
+             (matrix-room--insert-attachment item))
+           (matrix-room--insert-reactions item)
            (when compact
              (save-excursion
                (goto-char body-text-start)

@@ -27,9 +27,21 @@
     (and (display-graphic-p frame) (display-images-p frame)
          (image-type-available-p 'canvas))))
 
+(defun matrix-media-poster (item)
+  "Return ITEM's inline poster plist, or nil.
+It has the poster's :source_id; a video's also has :video t, :own, :width
+and :height.  An image is its own poster.  A video's poster is its
+thumbnail or, when :own, its own first frame, of declared size if any."
+  (if-let* ((image (plist-get item :image)))
+      (list :source_id (plist-get image :source_id))
+    (when-let* ((poster (plist-get (plist-get item :attachment) :poster)))
+      (list :source_id (plist-get poster :source_id) :video t
+            :own (eq (plist-get poster :own) t)
+            :width (plist-get poster :width) :height (plist-get poster :height)))))
+
 (defun matrix-media-resource-key (app room subscription item)
-  "Identify APP's exact ROOM/SUBSCRIPTION image event in ITEM."
-  (let ((source (plist-get (plist-get item :image) :source_id))
+  "Identify APP's exact ROOM/SUBSCRIPTION poster source in ITEM."
+  (let ((source (plist-get (matrix-media-poster item) :source_id))
         (event (plist-get item :event_id)))
     (when (and (appkit-app-p app) (equal (plist-get item :kind) "message")
                (stringp room) (not (string-empty-p room))
@@ -50,7 +62,7 @@
      :key key :input (list app (matrix-rpc-transport-store transport)
                            (list :room_id room :subscription_id subscription
                                  :event_id (plist-get item :event_id)
-                                 :source_id (plist-get (plist-get item :image) :source_id)))
+                                 :source_id (plist-get (matrix-media-poster item) :source_id)))
      :loader #'matrix-media--load :acquisition-identity key
      :sharing-policy 'app-private :cache-policy 'while-interested)))
 
@@ -65,9 +77,15 @@
          (seq-some (lambda (item)
                      (and (equal (plist-get item :kind) "message")
                           (equal (plist-get item :event_id) (plist-get params :event_id))
-                          (equal (plist-get (plist-get item :image) :source_id)
+                          (equal (plist-get (matrix-media-poster item) :source_id)
                                  (plist-get params :source_id))))
                    (plist-get timeline :items)))))
+
+(defun matrix-media--poster-bytes-p (bytes)
+  "Whether leading BYTES start an image, or a video whose first frame posters it."
+  (or (appkit-media--known-image-signature-at-p bytes 0)
+      (string-prefix-p "\x1a\x45\xdf\xa3" bytes)
+      (and (>= (length bytes) 8) (equal (substring bytes 4 8) "ftyp"))))
 
 (defun matrix-media--source (store source-id result)
   "Admit RESULT only as SOURCE-ID's private immutable raster in STORE."
@@ -95,7 +113,7 @@
                      (with-temp-buffer
                        (set-buffer-multibyte nil)
                        (insert-file-contents-literally file nil 0 16)
-                       (appkit-media--known-image-signature-at-p (buffer-string) 0)))
+                       (matrix-media--poster-bytes-p (buffer-string))))
             (list file (list (file-attribute-modification-time attributes)
                              (file-attribute-status-change-time attributes)
                              (file-attribute-size attributes)
@@ -116,11 +134,16 @@
          (funcall reject 'invalid-or-retired-image-source)))
      reject)))
 
-(defun matrix-media--poster (source max-width)
-  "Draw SOURCE within a default-scale budget; display slices follow font zoom."
+(defun matrix-media--poster (source max-width &optional video)
+  "Draw SOURCE within a default-scale budget; display slices follow font zoom.
+VIDEO, for a video's poster, is ITEM's `matrix-media-poster' plus :resolve,
+a function acquiring the playable video when the poster is only a thumbnail."
   (require 'appkit-media-resource)
   (let* ((file (car source))
-         (size (appkit-media--image-file-size-pixels file))
+         (size (or (appkit-media--image-file-size-pixels file)
+                   ;; A video posting its own first frame has no image header.
+                   (and video (cons (or (plist-get video :width) 16)
+                                    (or (plist-get video :height) 9)))))
          (line-height (appkit-media--base-char-pixel-height))
          (height-limit (max 1 appkit-media-preview-max-height)))
     (unless (and (consp size) (> (car size) 0) (> (cdr size) 0))
@@ -140,10 +163,20 @@
            (poster (appkit-media-resource-poster
                     `((file . ,file)) width height :fit 'contain)))
       (plist-put (cdr poster) :appkit-media-nslices rows)
-      (appkit-media-image-with-resource poster `((file . ,file)) :interaction 'media))))
+      (cond
+       ((not video)
+        (appkit-media-image-with-resource poster `((file . ,file)) :interaction 'media))
+       ((plist-get video :own)
+        (appkit-media-image-with-resource poster `((file . ,file)) :kind 'video
+                                          :label "matrix" :interaction 'media))
+       (t
+        (appkit-media-image-with-resource poster nil :kind 'video :label "matrix"
+                                          :interaction 'media
+                                          :resolve-function (plist-get video :resolve)))))))
 
-(defun matrix-media-cached-poster (app key max-width)
+(defun matrix-media-cached-poster (app key max-width &optional video)
   "Return ready KEY's immutable Canvas poster, or a visible failure string.
+VIDEO describes a video's poster as for `matrix-media--poster'.
 Cache only the latest geometry for each event; insertion copies occurrence
 geometry, and video.el owns independent mutable playback targets."
   (when-let* ((surface (appkit-current-surface))
@@ -167,8 +200,9 @@ geometry, and video.el owns independent mutable playback targets."
       (unless (equal (car entry) geometry)
         (setq entry
               (list geometry
-                    (condition-case nil (matrix-media--poster source max-width)
-                      (error "[Image unavailable: native decoder failed]"))))
+                    (condition-case nil (matrix-media--poster source max-width video)
+                      (error (format "[%s unavailable: native decoder failed]"
+                                     (if video "Video" "Image"))))))
         (puthash key entry cache))
       (cadr entry))))
 
@@ -237,9 +271,10 @@ The kind is \"file\", \"audio\", \"video\" or \"image\"."
       (video-open file)
     (find-file file)))
 
-(defun matrix-media-save (app room subscription item path on-saved)
+(defun matrix-media-save (app room subscription item path on-saved &optional on-failed)
   "Download APP's ROOM/SUBSCRIPTION ITEM attachment to new PATH.
-Call ON-SAVED with PATH once the decrypted file is in place."
+Call ON-SAVED with PATH once the decrypted file is in place, or ON-FAILED
+with a message; without ON-FAILED, the message is shown."
   (let ((source (nth 1 (or (matrix-media-attachment item)
                            (user-error "This message has no downloadable attachment")))))
     (unless (and (stringp subscription) (not (string-empty-p subscription)))
@@ -252,8 +287,9 @@ Call ON-SAVED with PATH once the decrypted file is in place."
            :path (expand-file-name path))
      (lambda (_result) (funcall on-saved path))
      (lambda (error)
-       (message "Matrix: %s" (or (and (listp error) (plist-get error :message))
-                                 "Attachment download was not sent"))))))
+       (let ((text (or (and (listp error) (plist-get error :message))
+                       "Attachment download was not sent")))
+         (if on-failed (funcall on-failed text) (message "Matrix: %s" text)))))))
 
 (defun matrix-media-clear-cache (app)
   "Discard APP's immutable posters on account shutdown."

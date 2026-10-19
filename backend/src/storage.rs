@@ -338,8 +338,18 @@ pub fn valid_avatar(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.len() <= MAX_AVATAR_BYTES && raster_signature(bytes)
 }
 
+/// Whether BYTES may be cached as an inline poster: a raster image, or a
+/// video whose first frame stands in for a missing thumbnail.
 pub fn valid_image(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && bytes.len() <= MAX_IMAGE_BYTES && raster_signature(bytes)
+    !bytes.is_empty()
+        && bytes.len() <= MAX_IMAGE_BYTES
+        && (raster_signature(bytes) || video_signature(bytes))
+}
+
+fn video_signature(bytes: &[u8]) -> bool {
+    // Matroska/WebM's EBML header, or an ISO media file's ftyp box (MP4, MOV).
+    (bytes.len() >= 4 && bytes.starts_with(b"\x1a\x45\xdf\xa3"))
+        || (bytes.len() >= 12 && &bytes[4..8] == b"ftyp")
 }
 
 pub fn valid_source_id(source_id: &str) -> bool {
