@@ -23,13 +23,11 @@
     map)
   "Keymap for `matrix-root-mode'.")
 
-(defvar matrix-root-navigation-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "u") #'matrix-root-next-unread)
-    (define-key map (kbd "m") #'matrix-root-next-mention)
-    (define-key map (kbd "@") #'matrix-root-next-mention)
-    map)
-  "Fast navigation between rooms, after telega's root `M-g' map.")
+(defvar-keymap matrix-root-navigation-map
+  :doc "Fast navigation between rooms, after telega's root `M-g' map."
+  "u" #'matrix-root-next-unread
+  "m" #'matrix-root-next-mention
+  "@" #'matrix-root-next-mention)
 
 (appkit-bindings-define 'matrix-root-mode-map 'read-only
   'app-menu #'matrix-root-transient
