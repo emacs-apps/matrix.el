@@ -835,6 +835,27 @@
                      '(("room.typing" (:room_id "!room:test" :typing t))
                        ("room.typing" (:room_id "!room:test" :typing :json-false))))))))
 
+(ert-deftest matrix-ui-fastnav-follows-telega-keys ()
+  (dolist (binding '(("M-g r" . matrix-room-read-all) ("M-g >" . matrix-room-read-all)
+                     ("M-g u" . matrix-room-goto-unread) ("M-g @" . matrix-room-next-mention)
+                     ("M-g m" . matrix-room-next-mention) ("M-g o" . matrix-room-next-outgoing)))
+    (should (eq (keymap-lookup matrix-room-mode-map (car binding)) (cdr binding))))
+  (should (eq (keymap-lookup matrix-root-mode-map "M-g u") #'matrix-root-next-unread))
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (appkit-app-send
+     app (matrix-ui-test--items-state
+          (list '(:id "a" :kind "message" :sender "@other:test" :body "A")
+                '(:id "mine" :kind "message" :sender "@me:test" :own t :body "Mine")
+                '(:id "ping" :kind "message" :sender "@other:test" :highlighted t :body "@me")
+                '(:id "z" :kind "message" :sender "@other:test" :body "Z"))))
+    (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+    (goto-char (appkit-chat-timeline-key-position "a"))
+    (matrix-room-next-mention)
+    (should (equal (get-text-property (point) matrix-room-message-key-property) "ping"))
+    (matrix-room-next-outgoing)
+    (should (equal (get-text-property (point) matrix-room-message-key-property) "mine"))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)

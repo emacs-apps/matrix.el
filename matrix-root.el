@@ -23,9 +23,17 @@
     map)
   "Keymap for `matrix-root-mode'.")
 
+(defvar matrix-root-navigation-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "u") #'matrix-root-next-unread)
+    (define-key map (kbd "m") #'matrix-root-next-mention)
+    (define-key map (kbd "@") #'matrix-root-next-mention)
+    map)
+  "Fast navigation between rooms, after telega's root `M-g' map.")
+
 (appkit-bindings-define 'matrix-root-mode-map 'read-only
   'app-menu #'matrix-root-transient
-  'navigation matrix-navigation-map
+  'navigation matrix-root-navigation-map
   'refresh #'matrix-root-refresh
   'search #'matrix-root-filter)
 
@@ -330,6 +338,37 @@
                                "[ \t\n,]+" t)))
     (matrix--request surface "room.create"
                      (list :name name :invite (vconcat invite)))))
+
+(defun matrix-root--goto-room (predicate what)
+  "Move to the next room row whose summary satisfies PREDICATE, wrapping.
+WHAT names the rooms sought when there is none."
+  (let ((app (appkit-surface-app (matrix--current-surface 'root)))
+        (after (line-end-position))
+        positions)
+    (save-excursion
+      (goto-char (point-min))
+      (while (not (eobp))
+        (pcase (appkit-directory-entry-payload (appkit-directory-entry-at-point))
+          (`(room ,room-id ,_)
+           (when (funcall predicate (matrix-runtime-room app room-id))
+             (push (point) positions))))
+        (forward-line 1)))
+    (setq positions (nreverse positions))
+    (goto-char (or (seq-find (lambda (position) (> position after)) positions)
+                   (car positions)
+                   (user-error "No %s" what)))))
+
+(defun matrix-root-next-unread ()
+  "Move to the next room with unread messages."
+  (interactive)
+  (matrix-root--goto-room (lambda (room) (> (or (plist-get room :unread) 0) 0))
+                          "room with unread messages"))
+
+(defun matrix-root-next-mention ()
+  "Move to the next room with unread mentions."
+  (interactive)
+  (matrix-root--goto-room (lambda (room) (> (or (plist-get room :mentions) 0) 0))
+                          "room with unread mentions"))
 
 (defun matrix-root-decline-invitation ()
   "Decline the invitation at point after confirming."
