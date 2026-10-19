@@ -22,6 +22,7 @@
 (require 'appkit-chat-avatar)
 (require 'appkit-name-color)
 (require 'appkit-ui)
+(require 'appkit-presentation)
 (require 'matrix-media)
 (require 'matrix-compose)
 (require 'matrix-reply)
@@ -30,6 +31,15 @@
                   (&optional position))
 (declare-function appkit-media-inline-host-activate "appkit-media-inline"
                   (host &optional presentation))
+
+(defcustom matrix-room-state-events 'all
+  "Which room state changes the timeline shows as one-line notices.
+`all' shows every change the backend describes, `no-membership' hides
+joins, leaves and profile changes (busy bridged rooms), nil hides them all."
+  :type '(choice (const :tag "All described changes" all)
+                 (const :tag "All but membership and profile changes" no-membership)
+                 (const :tag "None" nil))
+  :group 'matrix)
 
 (defvar-local matrix-room--width 80
   "Width of the last committed room presentation.")
@@ -365,6 +375,17 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
                      (append (matrix-room--mutation-params surface item :can_react)
                              (list :key reaction)))))
 
+(defun matrix-room--shown-p (item)
+  "Whether the timeline presents SDK row ITEM."
+  (pcase (plist-get item :kind)
+    ("read_marker" nil)
+    ("state" (and (eq (plist-get item :described) t)
+                  (pcase matrix-room-state-events
+                    ('all t)
+                    ('no-membership
+                     (not (equal (plist-get item :state_type) "m.room.member"))))))
+    (_ t)))
+
 (defun matrix-room--print-row (row)
   "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
   (let* ((item (appkit-chat-timeline-row-payload row))
@@ -376,6 +397,14 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
       (appkit-chat-read-insert-divider matrix-room--width))
     (setq start (point))
     (pcase kind
+      ("state"
+       (insert (propertize
+                (concat "  · " (appkit-presentation-elide-string-for-columns
+                                (matrix--one-line (plist-get item :body))
+                                (max 10 (- matrix-room--width 14)) 'shadow))
+                'face 'shadow))
+       (matrix-room--insert-time item "")
+       (insert "\n"))
       ("day"
        (appkit-chat-ins-insert-divider-row
         (if (numberp timestamp)
@@ -463,8 +492,8 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
            (app (appkit-surface-app surface))
            (items
             ;; Bounds refer to raw SDK rows, including protocol-only entries.
-            (seq-remove
-             (lambda (item) (member (plist-get item :kind) '("state" "read_marker")))
+            (seq-filter
+             #'matrix-room--shown-p
              (plist-get (appkit-chat-history-window-slice
                          (plist-get timeline :items) (lambda (item) (plist-get item :id)))
                         :entries)))
@@ -688,7 +717,7 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
   "Whether ITEM is a canonical remote SDK event that can be acknowledged."
   (and (eq (plist-get item :can_read) t)
        (stringp (plist-get item :event_id))
-       (not (member (plist-get item :kind) '("state" "day" "read_marker")))))
+       (matrix-state-event-row-p item)))
 
 (defun matrix-room--first-unread-key (timeline)
   "Resolve TIMELINE's SDK-derived unread index in its exact revision.

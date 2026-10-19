@@ -212,7 +212,7 @@
       ;; A canonical loaded event may be outside the exact history window.
       ;; Reveal that loaded window, then resolve its key again after projection.
       (when (and target (not position)
-                 (not (member (plist-get target :kind) '("state" "day" "read_marker"))))
+                 (matrix-state-event-row-p target))
         (appkit-chat-history-window-set key nil)
         (appkit-surface-send surface
                              (list 'matrix-update 'timeline (plist-get context :room-id)))
