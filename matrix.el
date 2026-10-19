@@ -22,6 +22,7 @@
 (declare-function matrix-verify-open "matrix-verify" (app &optional select no-refresh))
 (declare-function matrix-verify--result "matrix-verify" (model method result error context))
 (declare-function matrix-room--sync-history "matrix-room" (model state))
+(declare-function matrix-room--timeline "matrix-room" (state room-id))
 (declare-function matrix-room--history-complete "matrix-room" (model state result error context))
 (declare-function matrix-room--observe-command "matrix-room" ())
 (declare-function matrix-compose-complete-command "matrix-compose" (context &optional id))
@@ -44,6 +45,14 @@
 (autoload 'matrix-message-delete "matrix-transient" nil t)
 (autoload 'matrix-message-reply "matrix-transient" nil t)
 (autoload 'matrix-message-react "matrix-transient" nil t)
+
+(defface matrix-mention '((t :inherit (bold warning)))
+  "Face of a room's unread count when it holds unread mentions."
+  :group 'matrix)
+
+(defface matrix-highlight '((t :inherit warning))
+  "Face of message text that mentions you or matches your keywords."
+  :group 'matrix)
 
 (defvar matrix-navigation-map
   (let ((map (make-sparse-keymap)))

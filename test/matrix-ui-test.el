@@ -763,6 +763,31 @@
                                                   :subscription_id "subscription"
                                                   :transaction_id "txn-1"))))))))
 
+(ert-deftest matrix-ui-mention-completion-sends-a-pill-segment ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (setq matrix-mention--members
+          (cons (float-time) '((:user_id "@alice:test" :display_name "Alice")
+                               (:user_id "@me:test" :display_name "Me"))))
+    (appkit-chatbuf-input-replace "hi @Al")
+    (goto-char (point-max))
+    (let* ((capf (matrix-mention-capf))
+           (labels (all-completions "@" (nth 2 capf))))
+      (should (member "@Alice" labels))
+      (should-not (member "@Me" labels))
+      (should (member "@other:test" labels))
+      (delete-region (nth 0 capf) (nth 1 capf))
+      (insert "@Alice")
+      (funcall (plist-get (nthcdr 3 capf) :exit-function) "@Alice" 'finished))
+    (goto-char (point-max))
+    (insert "!")
+    (appkit-chatbuf-input-state-sync)
+    (let ((params (plist-get (matrix-compose-capture surface) :params)))
+      (should (equal (plist-get params :body) "hi Alice !"))
+      (should (equal (plist-get params :segments)
+                     [(:text "hi ") (:text "Alice" :user_id "@alice:test")
+                      (:text " ") (:text "!")])))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)
