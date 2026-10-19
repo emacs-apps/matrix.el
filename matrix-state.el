@@ -124,6 +124,11 @@ A skipped revision signals `matrix-timeline-gap'.  Neither input is mutated."
                       (plist-get timeline :items) (plist-get event :changes))))
        (t (signal 'matrix-protocol-error '("Unknown timeline notification")))))))
 
+(defun matrix-state-event-row-p (item)
+  "Whether timeline ITEM is an SDK message-like event.
+State changes and virtual day or read-marker rows cannot be acted on."
+  (not (member (plist-get item :kind) '("state" "day" "read_marker"))))
+
 (defun matrix-state-rooms (value)
   "Return a room list with unique, nonempty room identities from VALUE."
   (let ((rooms (matrix-state--array value))

@@ -682,6 +682,27 @@
                        ("message.react" (:room_id "!room:test" :subscription_id "subscription"
                                          :event_id "$e:test" :key "🎉"))))))))
 
+(ert-deftest matrix-ui-described-state-changes-render-as-notices ()
+  (matrix-ui-test--with-room
+    (let ((items (list '(:id "join" :kind "state" :described t :state_type "m.room.member"
+                         :sender "@new:test" :body "Newcomer joined")
+                       '(:id "topic" :kind "state" :described t :state_type "m.room.topic"
+                         :sender "@other:test" :body "Robin changed the topic: Plans")
+                       '(:id "rules" :kind "state" :sender "@other:test"
+                         :body "m.room.join_rules")
+                       '(:id "hello" :kind "message" :sender "@other:test" :body "Hello"))))
+      (appkit-app-send app (matrix-ui-test--items-state items))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (equal (appkit-chat-timeline-keys) '("join" "topic" "hello")))
+      (should (string-match-p "· Newcomer joined" (buffer-string)))
+      (should-not (string-match-p "join_rules" (buffer-string)))
+      (let ((matrix-room-state-events 'no-membership))
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (should (equal (appkit-chat-timeline-keys) '("topic" "hello"))))
+      (let ((matrix-room-state-events nil))
+        (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+        (should (equal (appkit-chat-timeline-keys) '("hello")))))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)

@@ -74,7 +74,7 @@
                     (seq-find
                      (lambda (item) (equal (plist-get item :id) (matrix-menu-scope-item-key scope)))
                      (matrix-runtime-room-items (appkit-surface-app surface) (cadr identity))))))
-    (unless (and item (not (member (plist-get item :kind) '("state" "day" "read_marker"))))
+    (unless (and item (matrix-state-event-row-p item))
       (user-error "The captured message is no longer available"))
     item))
 

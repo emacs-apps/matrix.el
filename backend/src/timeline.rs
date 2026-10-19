@@ -31,6 +31,7 @@ use tokio_util::{
     task::{TaskTracker, task_tracker::TaskTrackerToken},
 };
 
+use crate::describe;
 use crate::protocol::{INVALID, NETWORK, Output, Result, RpcError};
 use crate::{media, storage::valid_source_id};
 
@@ -1217,6 +1218,11 @@ fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> 
             value["kind"] = json!("encrypted");
             value["body"] =
                 json!("Encrypted message — keys unavailable or sender trust requirements not met");
+        } else if let Some((state_type, text)) = describe::state(event) {
+            value["kind"] = json!("state");
+            value["state_type"] = json!(state_type);
+            value["described"] = json!(true);
+            value["body"] = json!(text);
         } else {
             value["kind"] = json!("state");
             value["body"] = json!(
@@ -1778,6 +1784,44 @@ mod tests {
             .await.unwrap_err().code, "invalid_params");
         assert_eq!(timelines.react(&room, "active", event_id!("$missing"), "👍")
             .await.unwrap_err().code, "event_missing");
+        timelines.shutdown().await;
+    }
+
+    fn state(event_id: &str, sender: &str, kind: &str, key: &str, content: Value) -> Value {
+        json!({
+            "type":kind, "event_id":event_id, "sender":sender, "state_key":key,
+            "origin_server_ts":1200, "content":content
+        })
+    }
+
+    #[tokio::test]
+    async fn sdk_state_changes_project_readable_sentences_and_hide_configuration() {
+        let mut renamed = state("$rename", "@other:example.org", "m.room.member",
+            "@other:example.org", json!({"membership":"join", "displayname":"Robin"}));
+        renamed["unsigned"] = json!({"prev_content":{"membership":"join", "displayname":"Rob"}});
+        let mut kick = state("$kick", "@me:example.org", "m.room.member", "@new:example.org",
+            json!({"membership":"leave", "reason":"spam"}));
+        kick["unsigned"] = json!({"prev_content":{"membership":"join", "displayname":"Newcomer"}});
+        let (_server, _client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            state("$join", "@new:example.org", "m.room.member", "@new:example.org",
+                json!({"membership":"join", "displayname":"Newcomer"})),
+            kick,
+            renamed,
+            state("$topic", "@other:example.org", "m.room.topic", "", json!({"topic":"Plans"})),
+            state("$rules", "@other:example.org", "m.room.join_rules", "",
+                json!({"join_rule":"public"})),
+        ]).await;
+        let row = snapshot_row(&timelines, event_id!("$join")).await;
+        assert_eq!((&row["kind"], &row["described"], &row["state_type"], &row["body"]),
+            (&json!("state"), &json!(true), &json!("m.room.member"), &json!("Newcomer joined")));
+        assert_eq!(snapshot_row(&timelines, event_id!("$kick")).await["body"],
+            "@me:example.org removed Newcomer: spam");
+        assert_eq!(snapshot_row(&timelines, event_id!("$rename")).await["body"],
+            "Rob changed their name to Robin");
+        assert_eq!(snapshot_row(&timelines, event_id!("$topic")).await["body"],
+            "Robin changed the topic: Plans");
+        let rules = snapshot_row(&timelines, event_id!("$rules")).await;
+        assert_eq!((&rules["kind"], &rules["described"]), (&json!("state"), &Value::Null));
         timelines.shutdown().await;
     }
 

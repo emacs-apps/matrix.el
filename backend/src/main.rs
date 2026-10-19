@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod account;
+mod describe;
 mod media;
 mod notification;
 mod protocol;
