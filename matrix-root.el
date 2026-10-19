@@ -32,6 +32,19 @@
 (define-derived-mode matrix-root-mode appkit-directory-mode "Matrix"
   "Matrix room directory.  RET opens a room; j joins and c creates a room.")
 
+(defface matrix-mention '((t :inherit (bold warning)))
+  "Face of a room's unread count when it holds unread mentions."
+  :group 'matrix)
+
+(defun matrix-root--unread (room)
+  "Return ROOM's unread trail and its face: @mentions before the count."
+  (let ((unread (or (plist-get room :unread) 0))
+        (mentions (or (plist-get room :mentions) 0)))
+    (cons (string-join (delq nil (list (when (> mentions 0) (format "@%d" mentions))
+                                       (when (> unread 0) (number-to-string unread))))
+                       " ")
+          (if (> mentions 0) 'matrix-mention 'bold))))
+
 
 (defun matrix-root--entries (state model)
   "Project room destinations and actionable account state, not a command manual."
@@ -100,7 +113,8 @@
             (push (appkit-directory-entry-create
                    :key (list 'room id) :role 'item :section-key section-key
                    :label (matrix--one-line (or (plist-get room :name) id))
-                   :item-p t :unread-p (> (or (plist-get room :unread) 0) 0)
+                   :item-p t
+                   :unread-p (not (string-empty-p (car (matrix-root--unread room))))
                    :payload (list 'room id (plist-get room :membership))
                    :stamp (list room (plist-get (plist-get state :session) :user_id))
                    :help-echo (matrix-root--room-help room))
@@ -132,8 +146,8 @@
      :label (when (and self-p (not (string-empty-p body))) "You")
      :separator ":" :label-face 'shadow)))
 
-(defun matrix-root--insert-compact-context (title trail width)
-  "Insert TITLE and unread TRAIL within WIDTH without optional activity slots."
+(defun matrix-root--insert-compact-context (title trail width face)
+  "Insert TITLE and unread TRAIL in FACE within WIDTH without activity slots."
   (let* ((inner (max 0 (- width 2)))
          (trail-width (min inner (string-width (or trail ""))))
          (title-width (max 0 (- inner trail-width (if trail 1 0)))))
@@ -143,8 +157,8 @@
     (when (> trail-width 0)
       (when (> title-width 0) (insert " "))
       (insert (propertize
-               (appkit-presentation-elide-string-for-columns trail trail-width 'bold)
-               'face 'bold)))
+               (appkit-presentation-elide-string-for-columns trail trail-width face)
+               'face face)))
     (when (> width 1) (insert "]"))))
 
 (defun matrix-root--insert-item (_directory entry)
@@ -157,8 +171,8 @@
       (let* ((surface (appkit-current-surface))
              (width (matrix--width surface))
              (timestamp (plist-get room :timestamp))
-             (unread (or (plist-get room :unread) 0))
-             (trail (when (> unread 0) (number-to-string unread)))
+             (unread (matrix-root--unread room))
+             (trail (unless (string-empty-p (car unread)) (car unread)))
              (pixel-size (when (appkit-media-inline-image-rendering-available-p)
                            (appkit-chat-avatar-line-pixel-height)))
              (avatar-width
@@ -188,13 +202,14 @@
             (progn
               (when (>= width 8) (insert icon " "))
               (matrix-root--insert-compact-context
-               title trail (max 0 (- width (if (>= width 8) icon-width 0))))
+               title trail (max 0 (- width (if (>= width 8) icon-width 0)))
+               (cdr unread))
               (insert "\n")
               (add-text-properties start (point) (list 'help-echo help)))
           (appkit-presentation-insert-one-line-row
            (appkit-presentation-one-line-row-create
             :icon-inserter (lambda () (insert icon))
-            :context title :context-trail trail :context-trail-face 'bold
+            :context title :context-trail trail :context-trail-face (cdr unread)
             :preview (matrix-root--preview room user-id)
             :time (when (and (>= width 60) (numberp timestamp) (> timestamp 0))
                     (format-time-string "%m-%d %H:%M"

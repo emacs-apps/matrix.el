@@ -137,6 +137,27 @@ A skipped revision signals `matrix-timeline-gap'.  Neither input is mutated."
         (puthash id t seen)))
     rooms))
 
+(defun matrix-state-notifications (value)
+  "Return per-room desktop notification candidates from VALUE.
+Each names a room, its notifying event :count and :highlight, and describes
+the latest such event; sender and text fields are optional strings."
+  (let ((rooms (matrix-state--array value)))
+    (dolist (room rooms)
+      (let ((id (plist-get room :room_id))
+            (count (plist-get room :count)))
+        (unless (and (stringp id) (not (string-empty-p id))
+                     (stringp (plist-get room :room_name))
+                     (natnump count) (> count 0)
+                     (memq (plist-get room :highlight) '(t :json-false))
+                     (member (plist-get room :kind)
+                             '("message" "encrypted" "invite" "other"))
+                     (cl-every (lambda (key)
+                                 (let ((text (plist-get room key)))
+                                   (or (null text) (stringp text))))
+                               '(:event_id :sender :sender_name :body)))
+          (signal 'matrix-protocol-error '("Invalid room notification")))))
+    rooms))
+
 (defun matrix-state-members (value)
   "Return joined members with unique, nonempty user identities from VALUE.
 A member's `:display_name' and `:avatar_url' are optional strings."

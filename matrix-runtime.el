@@ -23,6 +23,8 @@
 (declare-function matrix-avatar-clear-cache "matrix-avatar" (app))
 (declare-function matrix-compose-complete-command "matrix-compose" (context &optional id))
 (declare-function matrix-compose-release-capture "matrix-compose" (context))
+(declare-function matrix-notify-forget "matrix-notify" (store))
+(autoload 'matrix-notify-start "matrix-notify")
 
 (cl-defstruct (matrix-runtime-resource-call
                (:constructor matrix-runtime-resource-call-create))
@@ -95,6 +97,12 @@ Corrupt and incomplete profiles still require restore, not an implicit login."
     (sort accounts (lambda (left right)
                      (string< (plist-get (matrix-runtime-state left) :account)
                               (plist-get (matrix-runtime-state right) :account))))))
+
+(defun matrix-runtime-account (store)
+  "Return the live account App owning private STORE, or nil."
+  (when-let* ((app (gethash store matrix-runtime--accounts))
+              ((appkit-app-live-p app)))
+    app))
 
 (defun matrix-runtime-room (app room-id)
   "Return APP's room summary for ROOM-ID."
@@ -185,6 +193,31 @@ CONTEXT is local correlation only.  CALL may supply the external return handle."
      (plist-get model :watches))
     commands))
 
+(defun matrix-runtime--notify (model operation)
+  "Return a command presenting notification OPERATION after MODEL commits."
+  (appkit-command-start-effect
+   (appkit-effect-create
+    :key (list 'matrix-notify (car operation))
+    :input (list (matrix-rpc-transport-store (plist-get model :transport))
+                 (plist-get model :account) operation)
+    :start #'matrix-notify-start
+    :success (lambda (_input _value) '(matrix-notify-delivered))
+    :failure (lambda (_input _error) '(matrix-notify-delivered)))))
+
+(defun matrix-runtime--retire-read (model)
+  "Forget MODEL's notified rooms that are now read; return retiring commands."
+  (let (read unread)
+    (dolist (room-id (plist-get model :notified))
+      (let ((room (seq-find (lambda (room) (equal room-id (plist-get room :room_id)))
+                            (plist-get model :rooms))))
+        (if (and room (or (> (or (plist-get room :unread) 0) 0)
+                          (> (or (plist-get room :mentions) 0) 0)))
+            (push room-id unread)
+          (push room-id read))))
+    (when read
+      (setf (plist-get model :notified) (nreverse unread))
+      (list (matrix-runtime--notify model (list 'retire read))))))
+
 (defun matrix-runtime--finish-resource (call result error)
   "Settle CALL's live Resource gate after response commit."
   (when (and (matrix-runtime-resource-call-active call)
@@ -237,7 +270,8 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
         ("rooms.list"
          (unless error
            (setf (plist-get model :rooms)
-                 (matrix-state-rooms (plist-get result :rooms))))
+                 (matrix-state-rooms (plist-get result :rooms)))
+           (setq commands (nconc commands (matrix-runtime--retire-read model))))
          (setq commands (nconc commands (matrix-runtime--broadcast model 'rooms))))
         ((or "room.create" "room.join" "room.leave")
          (unless error
@@ -311,7 +345,21 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
     ("rooms"
      (setf (plist-get model :rooms)
            (matrix-state-rooms (plist-get event :rooms)))
-     (matrix-runtime--broadcast model 'rooms))
+     (nconc (matrix-runtime--retire-read model)
+            (matrix-runtime--broadcast model 'rooms)))
+    ("notifications"
+     (let ((rooms (matrix-state-notifications (plist-get event :rooms)))
+           (omitted (plist-get event :omitted)))
+       (unless (natnump omitted)
+         (signal 'matrix-protocol-error '("Invalid notification batch")))
+       ;; An invitation has no unread count to retire it by.
+       (setf (plist-get model :notified)
+             (seq-union (delq nil (mapcar (lambda (room)
+                                            (unless (equal (plist-get room :kind) "invite")
+                                              (plist-get room :room_id)))
+                                          rooms))
+                        (plist-get model :notified)))
+       (list (matrix-runtime--notify model (list 'present rooms omitted)))))
     ((or "timeline_reset" "timeline_diff")
      (let* ((room (plist-get event :room_id))
             (timeline (gethash room (plist-get model :timelines))))
@@ -444,6 +492,8 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
       (matrix-avatar-clear-cache app))
     (when (fboundp 'matrix-media-clear-cache)
       (matrix-media-clear-cache app))
+    (when (fboundp 'matrix-notify-forget)
+      (matrix-notify-forget store))
     (when (fboundp 'matrix-compose-release-capture)
       (maphash
        (lambda (_id operation)
@@ -493,7 +543,7 @@ the account's presentation model.  Normal reconnect must pass nil LOGIN."
       (let* ((transport (matrix-rpc-transport-create
                          :store store :program (matrix-rpc-program)))
              (model (list :account account :connection 'starting :session nil
-                          :rooms nil :last-error nil :next-id 0
+                          :rooms nil :notified nil :last-error nil :next-id 0
                           :backend-active t :transport transport
                           :pending (make-hash-table :test #'eql)
                           :watches (make-hash-table :test #'eq)
