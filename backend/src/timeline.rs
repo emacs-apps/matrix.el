@@ -9,10 +9,10 @@ use matrix_sdk::{
     room::reply::{EnforceThread, Reply},
     room::edit::{EditError as RoomEditError, EditedContent},
     ruma::{
-        EventId, OwnedEventId, OwnedRoomId, UInt, UserId,
+        EventId, OwnedEventId, OwnedRoomId, OwnedUserId, UInt, UserId,
         api::error::ErrorKind,
         events::{
-            MessageLikeEventType,
+            MessageLikeEventType, Mentions,
             room::{
                 MediaSource,
                 message::{AddMentions, MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation, TextMessageEventContent},
@@ -47,6 +47,59 @@ const SEND_FAILED: RpcError = RpcError::new(
 const REPLY_UNAVAILABLE: RpcError = RpcError::new(
     "reply_unavailable", "This event is no longer available for replies in this timeline",
 );
+
+/// A run of composer text; a mention names the user it pills.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Segment {
+    text: String,
+    user_id: Option<OwnedUserId>,
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\n' => escaped.push_str("<br>"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Message text for BODY: the composer SEGMENTS' mentions become pills in an
+/// HTML body and intentional m.mentions.  Mentions are always explicit, so a
+/// name typed as plain text never pings anyone through legacy push rules.
+fn compose_text(body: String, segments: &[Segment]) -> Result<(TextMessageEventContent, Mentions)> {
+    if !segments.iter().any(|segment| segment.user_id.is_some()) {
+        return Ok((TextMessageEventContent::plain(body), Mentions::new()));
+    }
+    if segments.len() > 1024
+        || segments.iter().map(|segment| segment.text.as_str()).collect::<String>() != body
+    {
+        return Err(INVALID);
+    }
+    let mut html = String::new();
+    let mut users = Vec::new();
+    for segment in segments {
+        match &segment.user_id {
+            Some(user) if !segment.text.is_empty() => {
+                html.push_str(&format!(
+                    "<a href=\"https://matrix.to/#/{}\">{}</a>",
+                    escape_html(user.as_str()), escape_html(&segment.text)
+                ));
+                users.push(user.clone());
+            }
+            Some(_) => return Err(INVALID),
+            None => html.push_str(&escape_html(&segment.text)),
+        }
+    }
+    Ok((TextMessageEventContent::html(body, html), Mentions::with_user_ids(users)))
+}
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -708,12 +761,15 @@ impl Timelines {
         room_id: &OwnedRoomId,
         id: &str,
         body: String,
+        segments: Vec<Segment>,
         attachments: Vec<Attachment>,
         reply_to: Option<OwnedEventId>,
     ) -> Result<Value> {
         if body.len() > 32 * 1024 || (body.trim().is_empty() && attachments.is_empty()) {
             return Err(INVALID);
         }
+        let caption_empty = body.is_empty();
+        let (text, mentions) = compose_text(body, &segments)?;
         let _operation = self.tasks.token();
         let (subscription, _subscription_operation) = self.mutation_subscription(room_id, id).await?;
         let mut prepared = Vec::with_capacity(attachments.len());
@@ -742,15 +798,20 @@ impl Timelines {
         if prepared.is_empty() {
             let result = match reply_to {
                 Some(target) => timeline.send_reply(
-                    RoomMessageEventContentWithoutRelation::text_plain(body), target,
+                    RoomMessageEventContentWithoutRelation::new(MessageType::Text(text))
+                        .add_mentions(mentions),
+                    target,
                 ).await,
-                None => timeline.send(RoomMessageEventContent::text_plain(body).into()).await,
+                None => timeline.send(
+                    RoomMessageEventContent::new(MessageType::Text(text)).add_mentions(mentions).into(),
+                ).await,
             };
             return send_outcome(usize::from(result.is_ok()), 1, result.err().map(|_| SEND_FAILED));
         }
         let total = prepared.len();
         let mut accepted = 0;
-        let mut caption = (!body.is_empty()).then(|| TextMessageEventContent::plain(body));
+        let mut caption = (!caption_empty).then_some(text);
+        let mut caption_mentions = Some(mentions);
         for mut attachment in prepared {
             if !self.is_current(room_id, &subscription).await {
                 return send_outcome(accepted, total, Some(STALE_SUBSCRIPTION));
@@ -764,7 +825,9 @@ impl Timelines {
                 Err(_) => return send_outcome(accepted, total, Some(INVALID)),
             };
             let config = AttachmentConfig::new().info(attachment.info(size))
-                .caption(caption.take()).reply(reply_to.as_ref().map(|target| Reply {
+                .caption(caption.take())
+                .mentions(Some(caption_mentions.take().unwrap_or_default()))
+                .reply(reply_to.as_ref().map(|target| Reply {
                     event_id: target.clone(), enforce_thread: EnforceThread::MaybeThreaded,
                     add_mentions: AddMentions::Yes,
                 }));
@@ -1307,6 +1370,9 @@ fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> 
         value["can_edit"] = json!(permissions.can_edit(event));
         value["can_redact"] = json!(permissions.can_redact(event));
         value["can_react"] = json!(permissions.can_react(event));
+        if event.is_highlighted() {
+            value["highlighted"] = json!(true);
+        }
         if let Some(reactions) = reactions(event, own) {
             value["reactions"] = reactions;
         }
@@ -2488,7 +2554,7 @@ mod tests {
         let mut image = attachment(&image_path, "image.png", "image/png");
         image.width = Some(1);
         image.height = Some(1);
-        assert_eq!(timelines.send(&room, "active", "caption".into(),
+        assert_eq!(timelines.send(&room, "active", "caption".into(), vec![],
             vec![image, attachment(&file_path, "document.bin", "application/octet-stream")],
             Some(event_id!("$target").to_owned())).await.unwrap(),
             json!({"accepted":2, "total":2}));
@@ -2516,7 +2582,7 @@ mod tests {
             };
             assert_eq!(client.media().get_media_content(&request, true).await.unwrap(), bytes);
         }
-        assert_eq!(timelines.send(&room, "active", "text reply".into(), vec![],
+        assert_eq!(timelines.send(&room, "active", "text reply".into(), vec![], vec![],
             Some(event_id!("$target").to_owned())).await.unwrap(),
             json!({"accepted":1, "total":1}));
         let content = queued_content(&client).await;
@@ -2525,13 +2591,39 @@ mod tests {
         assert_eq!(text["m.relates_to"]["m.in_reply_to"]["event_id"], "$target");
         let source = directory.path().join("only.png");
         std::fs::write(&source, IMAGE_PNG).unwrap();
-        assert_eq!(timelines.send(&room, "active", String::new(),
+        assert_eq!(timelines.send(&room, "active", String::new(), vec![],
             vec![attachment(&source, "only.png", "application/octet-stream")], None)
             .await.unwrap(), json!({"accepted":1, "total":1}));
         let content = queued_content(&client).await;
         let file = content.iter().find(|event| event["body"] == "only.png").unwrap();
         assert_eq!(file["msgtype"], "m.file");
         assert!(file.get("filename").is_none());
+        timelines.shutdown().await;
+    }
+
+    fn segment(text: &str, user_id: Option<&str>) -> Segment {
+        Segment { text: text.into(), user_id: user_id.map(|id| UserId::parse(id).unwrap()) }
+    }
+
+    #[tokio::test]
+    async fn sdk_mentions_become_pills_and_intentional_mentions() {
+        let (_server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        let room = owned_room_id!("!room:example.org");
+        timelines.send(&room, "active", "hi <Al>!\nok".into(), vec![
+            segment("hi ", None), segment("<Al>", Some("@al:example.org")), segment("!\nok", None),
+        ], vec![], None).await.unwrap();
+        timelines.send(&room, "active", "plain Al".into(), vec![], vec![], None).await.unwrap();
+        assert_eq!(timelines.send(&room, "active", "mismatch".into(), vec![
+            segment("other", Some("@al:example.org")),
+        ], vec![], None).await.unwrap_err().code, "invalid_params");
+        let queued = queued_content(&client).await;
+        assert_eq!(queued[0]["formatted_body"],
+            "hi <a href=\"https://matrix.to/#/@al:example.org\">&lt;Al&gt;</a>!<br>ok");
+        assert_eq!(queued[0]["format"], "org.matrix.custom.html");
+        assert_eq!(queued[0]["m.mentions"], json!({"user_ids":["@al:example.org"]}));
+        assert_eq!(queued[1]["m.mentions"], json!({}));
+        assert!(queued[1].get("formatted_body").is_none());
+        assert_eq!(queued.len(), 2);
         timelines.shutdown().await;
     }
 
@@ -2548,16 +2640,16 @@ mod tests {
             attachment(source.path().parent().unwrap(), "directory", "application/octet-stream"),
             Attachment { width: Some(0), ..attachment(source.path(), "bad.png", "image/png") },
         ] {
-            assert!(timelines.send(&room, "active", "caption".into(),
+            assert!(timelines.send(&room, "active", "caption".into(), vec![],
                 vec![attachment(source.path(), "good.png", "image/png"), invalid], None)
                 .await.is_err());
             assert!(queued_content(&client).await.is_empty());
         }
-        assert_eq!(timelines.send(&room, "active", String::new(), vec![], None)
+        assert_eq!(timelines.send(&room, "active", String::new(), vec![], vec![], None)
             .await.unwrap_err().code, "invalid_params");
-        assert_eq!(timelines.send(&room, "active", "x".repeat(32 * 1024 + 1), vec![], None)
+        assert_eq!(timelines.send(&room, "active", "x".repeat(32 * 1024 + 1), vec![], vec![], None)
             .await.unwrap_err().code, "invalid_params");
-        assert_eq!(timelines.send(&room, "active", "reply".into(), vec![],
+        assert_eq!(timelines.send(&room, "active", "reply".into(), vec![], vec![],
             Some(event_id!("$missing").to_owned())).await.unwrap_err().code, "reply_unavailable");
         let timelines = Arc::new(timelines);
         let (subscription, operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
@@ -2567,7 +2659,7 @@ mod tests {
             let timelines = timelines.clone();
             let room = room.clone();
             tokio::spawn(async move {
-                timelines.send(&room, "active", "must not publish".into(), vec![], None).await
+                timelines.send(&room, "active", "must not publish".into(), vec![], vec![], None).await
             })
         };
         // A stream/account cancellation revokes an admission waiting on the
@@ -2588,7 +2680,7 @@ mod tests {
         // Linux exposes a regular, openable file whose read at offset zero
         // genuinely fails. No fake SDK forwarding or injected queue result.
         let unreadable = std::path::Path::new("/proc/self/mem");
-        let result = timelines.send(&room, "active", "consumed caption".into(), vec![
+        let result = timelines.send(&room, "active", "consumed caption".into(), vec![], vec![
             attachment(source.path(), "accepted.png", "image/png"),
             attachment(unreadable, "memory.bin", "application/octet-stream"),
         ], None).await.unwrap();
@@ -2599,7 +2691,7 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["body"], "consumed caption");
         assert_eq!(content[0]["filename"], "accepted.png");
-        assert_eq!(timelines.send(&room, "active", String::new(),
+        assert_eq!(timelines.send(&room, "active", String::new(), vec![],
             vec![attachment(unreadable, "memory.bin", "application/octet-stream")], None)
             .await.unwrap_err().code, "attachment_read_failed");
         assert_eq!(queued_content(&client).await.len(), 1);
@@ -2745,7 +2837,7 @@ mod tests {
             .filter_map(|row| row.get("reply"))
             .all(|reply| reply["status"] != "pending"));
         assert_eq!(timelines.send(&owned_room_id!("!room:example.org"), "active",
-            "stale".into(), vec![], None).await.unwrap_err().code, "stale_subscription");
+            "stale".into(), vec![], vec![], None).await.unwrap_err().code, "stale_subscription");
         tokio::time::timeout(Duration::from_secs(10), async {
             let mut errors = HashSet::new();
             while errors.len() < 8 {
@@ -2784,7 +2876,7 @@ mod tests {
         assert!(room.encryption_state().is_encrypted());
         let source = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(source.path(), IMAGE_PNG).unwrap();
-        timelines.send(&room_id, "active", "encrypted caption".into(),
+        timelines.send(&room_id, "active", "encrypted caption".into(), vec![],
             vec![attachment(source.path(), "secret.png", "image/png")], None).await.unwrap();
         source.close().unwrap();
         let queue = room.send_queue();

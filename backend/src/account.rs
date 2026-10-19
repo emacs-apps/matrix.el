@@ -37,7 +37,7 @@ use crate::{
     media, notification,
     protocol::{INVALID, NETWORK, Output, Result, RpcError, params},
     storage::{NewFile, SavedSession, Store},
-    timeline::{Attachment, Timelines},
+    timeline::{Attachment, Segment, Timelines},
     verification::Verifications,
 };
 
@@ -141,6 +141,8 @@ struct SendParam {
     room_id: OwnedRoomId,
     subscription_id: String,
     body: String,
+    #[serde(default)]
+    segments: Vec<Segment>,
     #[serde(default)]
     attachments: Vec<Attachment>,
     reply_to: Option<OwnedEventId>,
@@ -792,7 +794,7 @@ impl Account {
             "message.send" => {
                 let args: SendParam = params(value)?;
                 self.timelines
-                    .send(&args.room_id, &args.subscription_id, args.body,
+                    .send(&args.room_id, &args.subscription_id, args.body, args.segments,
                         args.attachments, args.reply_to)
                     .await
             }

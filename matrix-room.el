@@ -25,6 +25,7 @@
 (require 'appkit-presentation)
 (require 'matrix-media)
 (require 'matrix-compose)
+(require 'matrix-mention)
 (require 'matrix-reply)
 
 (declare-function appkit-media-inline-host-at-point "appkit-media-inline"
@@ -114,6 +115,7 @@ loaded message from the composer, without changing the draft or session bar.
 Closing this buffer does not stop account sync."
   (setq-local appkit-chatbuf-input-sync-function #'appkit-chatbuf-input-state-sync)
   (matrix-compose-setup)
+  (matrix-mention-setup)
   (appkit-chatbuf-use-timeline-mode #'matrix-room-timeline-mode))
 
 (defun matrix-room--edit-state ()
@@ -541,6 +543,8 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
                      "")
                     (t (substring-no-properties (or (plist-get item :body) "")))))
            (unless (bolp) (insert "\n"))
+           (when (eq (plist-get item :highlighted) t)
+             (add-face-text-property body-text-start (point) 'matrix-highlight t))
            (when (and (= body-start (point)) (not (plist-get item :attachment)))
              (insert "\n"))
            (when (equal kind "message")

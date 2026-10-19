@@ -23,6 +23,7 @@
 (require 'appkit-media-image)
 (require 'matrix-runtime)
 (require 'matrix)
+(require 'matrix-mention)
 
 (declare-function matrix--current-surface "matrix" (&optional kind))
 (declare-function matrix--error-text "matrix" (error))
@@ -61,19 +62,36 @@
                       position value finish)))
     (nreverse attachments)))
 
-(defun matrix-compose-serialize (input)
-  "Return plain caption text from INPUT, omitting complete attachment spans."
-  (let ((position 0) (finish (length input)) pieces)
+(defun matrix-compose-runs (input)
+  "Return INPUT's caption as ordered (TEXT . USER-ID) runs.
+Attachment spans are omitted; a mention is its name, naming the USER-ID it
+pills, followed by its boundary space.  Plain runs have a nil USER-ID."
+  (let ((position 0) (finish (length input)) runs)
     (while (< position finish)
       (let* ((object (get-text-property
                       position appkit-chatbuf-input-object-property input))
              (next (appkit-chatbuf-next-input-object-change position input finish)))
         (cond
          ((matrix-compose--attachment-p object) nil)
+         ((matrix-mention-p object)
+          (push (cons (plist-get object :name) (plist-get object :user-id)) runs)
+          (push (cons " " nil) runs))
          (object (user-error "This Matrix draft contains an unsupported input object"))
-         (t (push (substring-no-properties input position next) pieces)))
+         (t (push (cons (substring-no-properties input position next) nil) runs)))
         (setq position next)))
-    (apply #'concat (nreverse pieces))))
+    (nreverse runs)))
+
+(defun matrix-compose-serialize (input)
+  "Return plain caption text from INPUT, omitting complete attachment spans."
+  (apply #'concat (mapcar #'car (matrix-compose-runs input))))
+
+(defun matrix-compose--wire-segments (runs)
+  "Return RUNS as wire segments when any mentions a user, else nil."
+  (when (seq-some #'cdr runs)
+    (vconcat (mapcar (lambda (run)
+                       (if (cdr run) (list :text (car run) :user_id (cdr run))
+                         (list :text (car run))))
+                     runs))))
 
 (defun matrix-compose--exact-surface-p (surface)
   "Whether SURFACE still owns its exact host and account registration."
@@ -355,7 +373,8 @@ This function retains no files and starts no request."
     (let* ((input (appkit-chatbuf-input-state))
            (aux (copy-tree (appkit-chatbuf-aux-state)))
            (attachments (matrix-compose-attachments input))
-           (body (matrix-compose-serialize input))
+           (runs (matrix-compose-runs input))
+           (body (apply #'concat (mapcar #'car runs)))
            (app (appkit-surface-app surface))
            (state (matrix-runtime-state app))
            (room-id (cadr (appkit-surface-identity surface)))
@@ -366,6 +385,8 @@ This function retains no files and starts no request."
         (user-error "Wait for the room's SDK timeline subscription"))
       (when (and (not attachments) (string-empty-p (string-trim body)))
         (user-error "The draft is empty"))
+      (when-let* ((segments (matrix-compose--wire-segments runs)))
+        (setq params (plist-put params :segments segments)))
       (when (eq (plist-get aux :aux-type) 'reply)
         (setq params (plist-put params :reply_to (matrix-reply-validate surface aux))))
       (list :input input :revision (appkit-chatbuf-composer-revision) :aux aux

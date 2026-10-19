@@ -32,10 +32,6 @@
 (define-derived-mode matrix-root-mode appkit-directory-mode "Matrix"
   "Matrix room directory.  RET opens a room; j joins and c creates a room.")
 
-(defface matrix-mention '((t :inherit (bold warning)))
-  "Face of a room's unread count when it holds unread mentions."
-  :group 'matrix)
-
 (defun matrix-root--unread (room)
   "Return ROOM's unread trail and its face: @mentions before the count."
   (let ((unread (or (plist-get room :unread) 0))
