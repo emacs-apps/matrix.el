@@ -384,6 +384,15 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                    (list :room_id room :subscription_id
                          (plist-get timeline :subscription_id)))
                   (matrix-runtime--broadcast model 'timeline room)))))))
+    ("typing"
+     (let* ((room (plist-get event :room_id))
+            (timeline (gethash room (plist-get model :timelines)))
+            (users (matrix-state-typing (plist-get event :users))))
+       (when (and timeline (equal (plist-get timeline :subscription_id)
+                                  (plist-get event :subscription_id)))
+         (puthash room (plist-put (copy-sequence timeline) :typing users)
+                  (plist-get model :timelines))
+         (matrix-runtime--broadcast model 'typing room))))
     ("verification"
      (puthash (cons (plist-get event :user_id) (plist-get event :flow_id))
               event (plist-get model :verifications))

@@ -555,7 +555,11 @@ impl Timelines {
                     let task_room = room_id.clone();
                     let task_id = subscription.id.clone();
                     let task_timeline = timeline.clone();
+                    let (_typing_guard, mut typing_updates) =
+                        task_sdk_room.subscribe_to_typing_notifications();
                     self.tasks.spawn(subscription.tasks.track_future(async move {
+                        let _typing_guard = _typing_guard;
+                        let mut typing_open = true;
                         let own = &*own_user;
                         futures_util::pin_mut!(stream);
                         futures_util::pin_mut!(receipt_updates);
@@ -604,6 +608,31 @@ impl Timelines {
                                         "type":"timeline_diff", "room_id":task_room,
                                         "subscription_id":task_id, "revision":revision,
                                         "changes":[], "read_state":reading
+                                    });
+                                    tokio::select! {
+                                        biased;
+                                        _ = task_cancel.cancelled() => break,
+                                        sent = output.event(event) => if !sent { break; },
+                                    }
+                                }
+                                typing = typing_updates.recv(), if typing_open => {
+                                    let users = match typing {
+                                        Ok(users) => users,
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                            typing_open = false;
+                                            continue;
+                                        }
+                                    };
+                                    let mut names = Vec::new();
+                                    for user in users.iter().filter(|user| *user != own).take(8) {
+                                        let member = task_sdk_room.get_member_no_sync(user).await.ok().flatten();
+                                        names.push(member.and_then(|member| member.display_name().map(str::to_owned))
+                                            .unwrap_or_else(|| user.to_string()));
+                                    }
+                                    let event = json!({
+                                        "type":"typing", "room_id":task_room,
+                                        "subscription_id":task_id, "users":names,
                                     });
                                     tokio::select! {
                                         biased;
@@ -2075,6 +2104,36 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }).await.expect("retried message was not sent");
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_typing_notifications_name_others_for_the_subscription() {
+        let (server, client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        let response = json!({
+            "next_batch":"typing",
+            "rooms":{"join":{"!room:example.org":{
+                "timeline":{"events":[], "limited":false},
+                "ephemeral":{"events":[{"type":"m.typing", "content":{
+                    "user_ids":["@other:example.org", "@me:example.org"]
+                }}]}
+            }}}
+        });
+        let _sync = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/(r0|v3)/sync$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount_as_scoped(&server).await;
+        client.sync_once(SyncSettings::default()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event: Value = serde_json::from_slice(&rx.recv().await.unwrap()).unwrap();
+                if event["params"]["type"] == "typing" {
+                    return event["params"].clone();
+                }
+            }
+        }).await.expect("no typing event");
+        assert_eq!((&event["subscription_id"], &event["users"]),
+            (&json!("active"), &json!(["@other:example.org"])));
         timelines.shutdown().await;
     }
 
