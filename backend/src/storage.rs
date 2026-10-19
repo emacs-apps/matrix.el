@@ -384,6 +384,52 @@ fn raster_signature(bytes: &[u8]) -> bool {
             && matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X"))
 }
 
+/// A file staged beside a new destination outside account storage, published
+/// atomically without ever replacing an existing path (including symlinks).
+pub struct NewFile {
+    _directory: tempfile::TempDir,
+    staged: PathBuf,
+    destination: PathBuf,
+    parent: PathBuf,
+    error: RpcError,
+}
+
+impl NewFile {
+    /// Reserve absolute DESTINATION, reporting any failure as ERROR.
+    pub fn reserve(root: &Path, destination: &Path, error: RpcError) -> Result<Self> {
+        if !destination.is_absolute() {
+            return Err(error);
+        }
+        let parent = destination.parent().ok_or(error)?.canonicalize().map_err(|_| error)?;
+        if parent.starts_with(root.canonicalize().map_err(|_| error)?)
+            || destination.symlink_metadata().is_ok()
+        {
+            return Err(error);
+        }
+        let directory = tempfile::Builder::new()
+            .prefix(".matrix-")
+            .tempdir_in(&parent)
+            .map_err(|_| error)?;
+        Ok(Self {
+            staged: directory.path().join("staged"),
+            _directory: directory,
+            destination: destination.to_owned(),
+            parent,
+            error,
+        })
+    }
+
+    pub fn staged(&self) -> &Path {
+        &self.staged
+    }
+
+    pub fn publish(self) -> Result<()> {
+        File::open(&self.staged).and_then(|file| file.sync_all()).map_err(|_| self.error)?;
+        fs::hard_link(&self.staged, &self.destination).map_err(|_| self.error)?;
+        File::open(&self.parent).and_then(|file| file.sync_all()).map_err(|_| self.error)
+    }
+}
+
 fn check_private(path: &Path, directory: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|_| PRIVATE)?;
     if metadata.file_type().is_symlink()

@@ -703,6 +703,36 @@
         (appkit-surface-send surface '(matrix-update timeline "!room:test"))
         (should (equal (appkit-chat-timeline-keys) '("hello")))))))
 
+(ert-deftest matrix-ui-attachment-card-opens-a-private-downloaded-copy ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let ((source (make-string 64 ?a))
+          request opened)
+      (appkit-app-send
+       app (matrix-ui-test--items-state
+            (list (list :id "file" :kind "message" :event_id "$f:test"
+                        :sender "@other:test" :body "../notes.txt"
+                        :attachment (list :kind "file" :source_id source
+                                          :filename "../notes.txt" :size 2048)))))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (string-match-p "\\[file\\] \\.\\./notes\\.txt (2k)" (buffer-string)))
+      (should-not (string-match-p "^\\.\\./notes\\.txt$" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "[file]")
+      (cl-letf (((symbol-function 'matrix-runtime-resource-request)
+                 (lambda (_app method params resolve _reject)
+                   (setq request (list method params))
+                   (funcall resolve nil)))
+                (matrix-attachment-open-function
+                 (lambda (file kind) (setq opened (list file kind)))))
+        (call-interactively (key-binding (kbd "RET"))))
+      (should (equal (car request) "media.save"))
+      (let ((path (plist-get (cadr request) :path)))
+        (should (equal (file-name-nondirectory path) "notes.txt"))
+        (should (string-prefix-p (file-name-as-directory matrix-media--open-directory) path))
+        (should (equal (plist-get (cadr request) :source_id) source))
+        (should (equal opened (list path "file")))))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)

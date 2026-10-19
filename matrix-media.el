@@ -181,6 +181,80 @@ geometry, and video.el owns independent mutable playback targets."
                    (push key retired))) cache)
       (dolist (key retired) (remhash key cache)))))
 
+(defcustom matrix-download-directory "~/Downloads/"
+  "Default directory for saving Matrix attachments."
+  :type 'directory
+  :group 'matrix)
+
+(defcustom matrix-attachment-open-function #'matrix-media-open-file
+  "Function opening a downloaded attachment, called with its file and kind.
+The kind is \"file\", \"audio\", \"video\" or \"image\"."
+  :type 'function
+  :group 'matrix)
+
+(defvar matrix-media--open-directory nil
+  "Private directory of this session's opened attachment copies.")
+
+(defun matrix-media-attachment (item)
+  "Return ITEM's downloadable attachment as (KIND SOURCE-ID FILENAME), or nil."
+  (when-let* (((equal (plist-get item :kind) "message"))
+              (event (plist-get item :event_id))
+              ((stringp event))
+              (media (or (plist-get item :attachment) (plist-get item :image)))
+              (source (plist-get media :source_id))
+              ((stringp source)))
+    (list (or (plist-get media :kind) "image") source
+          (matrix-media--safe-filename (plist-get media :filename)))))
+
+(defun matrix-media--safe-filename (name)
+  "Return sender-chosen NAME as a plain file name in one directory."
+  (let ((name (replace-regexp-in-string
+               "\\`[.[:space:]]+" ""
+               (replace-regexp-in-string
+                "[\\[:cntrl:]]" "_"
+                (file-name-nondirectory (if (stringp name) name ""))))))
+    (if (string-empty-p name) "attachment" name)))
+
+(defun matrix-media--delete-open-directory ()
+  "Delete this session's opened attachment copies."
+  (when matrix-media--open-directory
+    (ignore-errors (delete-directory matrix-media--open-directory t))
+    (setq matrix-media--open-directory nil)))
+
+(defun matrix-media--open-path (filename)
+  "Return a new private path named FILENAME for an opened attachment copy."
+  (unless (and matrix-media--open-directory
+               (file-directory-p matrix-media--open-directory))
+    (setq matrix-media--open-directory (make-temp-file "matrix-open-" t))
+    (set-file-modes matrix-media--open-directory #o700)
+    (add-hook 'kill-emacs-hook #'matrix-media--delete-open-directory))
+  (expand-file-name filename (make-temp-file
+                              (expand-file-name "a" matrix-media--open-directory) t)))
+
+(defun matrix-media-open-file (file kind)
+  "Open downloaded FILE of KIND: audio and video play in video.el."
+  (if (and (member kind '("audio" "video")) (fboundp 'video-open))
+      (video-open file)
+    (find-file file)))
+
+(defun matrix-media-save (app room subscription item path on-saved)
+  "Download APP's ROOM/SUBSCRIPTION ITEM attachment to new PATH.
+Call ON-SAVED with PATH once the decrypted file is in place."
+  (let ((source (nth 1 (or (matrix-media-attachment item)
+                           (user-error "This message has no downloadable attachment")))))
+    (unless (and (stringp subscription) (not (string-empty-p subscription)))
+      (user-error "This room's timeline is not ready"))
+    (message "Matrix: downloading %s..." (file-name-nondirectory path))
+    (matrix-runtime-resource-request
+     app "media.save"
+     (list :room_id room :subscription_id subscription
+           :event_id (plist-get item :event_id) :source_id source
+           :path (expand-file-name path))
+     (lambda (_result) (funcall on-saved path))
+     (lambda (error)
+       (message "Matrix: %s" (or (and (listp error) (plist-get error :message))
+                                 "Attachment download was not sent"))))))
+
 (defun matrix-media-clear-cache (app)
   "Discard APP's immutable posters on account shutdown."
   (remhash app matrix-media--posters))

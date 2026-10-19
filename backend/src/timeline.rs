@@ -14,6 +14,7 @@ use matrix_sdk::{
         events::{
             MessageLikeEventType,
             room::{
+                MediaSource,
                 message::{AddMentions, MessageType, RoomMessageEventContent, RoomMessageEventContentWithoutRelation, TextMessageEventContent},
                 power_levels::RoomPowerLevels,
             },
@@ -322,17 +323,19 @@ impl Subscription {
     }
 }
 
-pub struct ImageLease {
+pub struct MediaLease {
     subscription: Arc<Subscription>,
     room_id: OwnedRoomId,
     event_id: OwnedEventId,
     pub source_id: String,
     pub request: matrix_sdk::media::MediaRequestParameters,
+    /// Declared byte size, when the event states one.
+    pub size: Option<u64>,
     _operation: TaskTrackerToken,
     _subscription_operation: TaskTrackerToken,
 }
 
-impl ImageLease {
+impl MediaLease {
     pub fn cancellation(&self) -> &CancellationToken {
         &self.subscription.cancel
     }
@@ -345,9 +348,9 @@ impl ImageLease {
         let items = timeline.items().await;
         let event = items.iter().filter_map(|item| item.as_event())
             .find(|event| event.event_id() == Some(self.event_id.as_ref())).ok_or(EVENT_MISSING)?;
-        let image = event_image(event).ok_or(media::STALE_IMAGE)?;
-        if media::source_id(&image.source) != self.source_id {
-            return Err(media::STALE_IMAGE);
+        let (source, _) = event_media(event).ok_or(media::STALE_MEDIA)?;
+        if media::source_id(source) != self.source_id {
+            return Err(media::STALE_MEDIA);
         }
         if !timelines.is_current(&self.room_id, &self.subscription).await {
             return Err(STALE_SUBSCRIPTION);
@@ -793,37 +796,38 @@ impl Timelines {
         Ok((subscription.clone(), subscription.tasks.token()))
     }
 
-    pub async fn image_lease(
+    pub async fn media_lease(
         &self,
         room_id: &OwnedRoomId,
         id: &str,
         event_id: &EventId,
         source_id: String,
-    ) -> Result<ImageLease> {
+    ) -> Result<MediaLease> {
         if !valid_source_id(&source_id) {
             return Err(INVALID);
         }
         let operation = self.tasks.token();
         let (subscription, subscription_operation) = self.mutation_subscription(room_id, id).await?;
-        let request = {
+        let (request, size) = {
             let timeline = mutation_timeline(&subscription)?;
             let items = timeline.items().await;
             let event = find_event(&items, event_id)?;
-            let image = event_image(event).ok_or(media::STALE_IMAGE)?;
-            if media::source_id(&image.source) != source_id {
-                return Err(media::STALE_IMAGE);
+            let (source, size) = event_media(event).ok_or(media::STALE_MEDIA)?;
+            if media::source_id(source) != source_id {
+                return Err(media::STALE_MEDIA);
             }
-            matrix_sdk::media::MediaRequestParameters {
-                source: image.source.clone(),
+            (matrix_sdk::media::MediaRequestParameters {
+                source: source.clone(),
                 format: matrix_sdk::media::MediaFormat::File,
-            }
+            }, size.map(u64::from))
         };
-        let lease = ImageLease {
+        let lease = MediaLease {
             subscription,
             room_id: room_id.clone(),
             event_id: event_id.to_owned(),
             source_id,
             request,
+            size,
             _operation: operation,
             _subscription_operation: subscription_operation,
         };
@@ -1094,6 +1098,51 @@ fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Roo
 }
 
 
+/// The source and declared size of EVENT's image, file, audio or video.
+fn event_media(event: &EventTimelineItem) -> Option<(&MediaSource, Option<UInt>)> {
+    match event.content().as_message()?.msgtype() {
+        MessageType::Image(image) => Some((&image.source, image.info.as_ref().and_then(|i| i.size))),
+        MessageType::File(file) => Some((&file.source, file.info.as_ref().and_then(|i| i.size))),
+        MessageType::Audio(audio) => Some((&audio.source, audio.info.as_ref().and_then(|i| i.size))),
+        MessageType::Video(video) => Some((&video.source, video.info.as_ref().and_then(|i| i.size))),
+        _ => None,
+    }
+}
+
+/// Describe EVENT's file, audio or video attachment for presentation.
+fn attachment_metadata(event: &EventTimelineItem) -> Option<Value> {
+    let (kind, source, filename, mime, size, duration) =
+        match event.content().as_message()?.msgtype() {
+            MessageType::File(file) => {
+                let info = file.info.as_deref();
+                ("file", &file.source, file.filename(), info.and_then(|i| i.mimetype.as_ref()),
+                    info.and_then(|i| i.size), None)
+            }
+            MessageType::Audio(audio) => {
+                let info = audio.info.as_deref();
+                ("audio", &audio.source, audio.filename(), info.and_then(|i| i.mimetype.as_ref()),
+                    info.and_then(|i| i.size), info.and_then(|i| i.duration))
+            }
+            MessageType::Video(video) => {
+                let info = video.info.as_deref();
+                ("video", &video.source, video.filename(), info.and_then(|i| i.mimetype.as_ref()),
+                    info.and_then(|i| i.size), info.and_then(|i| i.duration))
+            }
+            _ => return None,
+        };
+    let mut value = json!({"kind":kind, "source_id":media::source_id(source), "filename":filename});
+    if let Some(mime) = mime {
+        value["mime_type"] = json!(mime);
+    }
+    if let Some(size) = size {
+        value["size"] = json!(size);
+    }
+    if let Some(duration) = duration {
+        value["duration_ms"] = json!(duration.as_millis() as u64);
+    }
+    Some(value)
+}
+
 fn event_image(event: &EventTimelineItem) -> Option<&matrix_sdk::ruma::events::room::message::ImageMessageEventContent> {
     if is_redacted(event) {
         return None;
@@ -1210,6 +1259,8 @@ fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> 
             value["body"] = json!(message.body());
             if let Some(image) = event_image(event) {
                 value["image"] = image_metadata(image);
+            } else if let Some(attachment) = attachment_metadata(event) {
+                value["attachment"] = attachment;
             }
         } else if is_redacted(event) {
             value["kind"] = json!("redacted");
@@ -1930,6 +1981,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_attachments_describe_and_save_to_new_files_only() {
+        let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$file", "@other:example.org", json!({
+                "msgtype":"m.file", "body":"notes", "filename":"notes.txt",
+                "url":"mxc://example.org/notes", "info":{"mimetype":"text/plain", "size":5}
+            })),
+            message("$voice", "@other:example.org", json!({
+                "msgtype":"m.audio", "body":"voice.ogg", "url":"mxc://example.org/voice",
+                "info":{"duration":1500}
+            })),
+        ]).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/notes$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
+            .mount(&server).await;
+        let room = owned_room_id!("!room:example.org");
+        let file = snapshot_row(&timelines, event_id!("$file")).await;
+        assert_eq!((&file["attachment"]["kind"], &file["attachment"]["filename"],
+                    &file["attachment"]["mime_type"], &file["attachment"]["size"]),
+            (&json!("file"), &json!("notes.txt"), &json!("text/plain"), &json!(5)));
+        let voice = snapshot_row(&timelines, event_id!("$voice")).await;
+        assert_eq!((&voice["attachment"]["kind"], &voice["attachment"]["duration_ms"]),
+            (&json!("audio"), &json!(1500)));
+        let store = tempfile::tempdir().unwrap();
+        let downloads = tempfile::tempdir().unwrap();
+        let destination = downloads.path().join("notes.txt");
+        let slots = tokio::sync::Semaphore::new(1);
+        let source = file["attachment"]["source_id"].as_str().unwrap().to_owned();
+        let save = async |path: std::path::PathBuf| {
+            let lease = timelines.media_lease(&room, "active", event_id!("$file"), source.clone())
+                .await.unwrap();
+            media::save(store.path().to_owned(), client.clone(), &timelines, &lease, path,
+                CancellationToken::new(), CancellationToken::new(), &slots).await
+        };
+        save(destination.clone()).await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"hello");
+        assert_eq!(save(destination.clone()).await.unwrap_err().code, "media_save_failed");
+        assert_eq!(save(store.path().join("inside")).await.unwrap_err().code, "media_save_failed");
+        assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 1);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn sdk_images_download_original_decrypted_bytes_and_reuse_only_complete_sources() {
         let mut bad_file = encrypted_image_file();
         bad_file["hashes"]["sha256"] = json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
@@ -1987,7 +2081,7 @@ mod tests {
             let event_id = EventId::parse(id).unwrap();
             let row = snapshot_row(&timelines, &event_id).await;
             let source = row["image"]["source_id"].as_str().unwrap();
-            let lease = timelines.image_lease(&room, "active", &event_id, source.into()).await.unwrap();
+            let lease = timelines.media_lease(&room, "active", &event_id, source.into()).await.unwrap();
             let first = media::image(store.clone(), client.clone(), generation.clone(),
                 &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots).await.unwrap();
             assert_eq!(std::fs::read(&first).unwrap(), IMAGE_PNG);
@@ -2000,7 +2094,7 @@ mod tests {
         let good = snapshot_row(&timelines, event_id!("$encrypted-image")).await;
         assert_ne!(bad["image"]["source_id"], good["image"]["source_id"]);
         let source = bad["image"]["source_id"].as_str().unwrap();
-        let lease = timelines.image_lease(&room, "active", event_id!("$bad-image"), source.into()).await.unwrap();
+        let lease = timelines.media_lease(&room, "active", event_id!("$bad-image"), source.into()).await.unwrap();
         assert!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
             CancellationToken::new(), CancellationToken::new(), &slots).await.is_err());
         assert_eq!(store.cached_image(&generation, source).unwrap(), None);
@@ -2009,7 +2103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_image_leases_reject_source_replacement_redaction_and_reopened_subscription() {
+    async fn sdk_media_leases_reject_source_replacement_redaction_and_reopened_subscription() {
         let (server, client, timelines, mut rx) = sdk_fixture(Some(power_levels(0)), vec![
             message("$image", "@other:example.org", json!({
                 "msgtype":"m.image", "body":"image.png", "url":"mxc://example.org/image"
@@ -2018,11 +2112,11 @@ mod tests {
         let room = owned_room_id!("!room:example.org");
         let row = snapshot_row(&timelines, event_id!("$image")).await;
         let source = row["image"]["source_id"].as_str().unwrap().to_owned();
-        assert_eq!(timelines.image_lease(&room, "old", event_id!("$image"), source.clone())
+        assert_eq!(timelines.media_lease(&room, "old", event_id!("$image"), source.clone())
             .await.err().unwrap().code, "stale_subscription");
-        assert_eq!(timelines.image_lease(&room, "active", event_id!("$image"), "0".repeat(64))
-            .await.err().unwrap().code, "stale_image");
-        let lease = timelines.image_lease(&room, "active", event_id!("$image"), source).await.unwrap();
+        assert_eq!(timelines.media_lease(&room, "active", event_id!("$image"), "0".repeat(64))
+            .await.err().unwrap().code, "stale_media");
+        let lease = timelines.media_lease(&room, "active", event_id!("$image"), source).await.unwrap();
         let new_content = json!({
             "msgtype":"m.image", "body":"replacement.png", "url":"mxc://example.org/replacement"
         });
@@ -2034,16 +2128,16 @@ mod tests {
         ]).await;
         let replacement = next_row(&mut rx, "$image", |row| row["body"] == "replacement.png").await;
         assert_ne!(replacement["image"]["source_id"], row["image"]["source_id"]);
-        assert_eq!(lease.validate(&timelines).await.unwrap_err().code, "stale_image");
+        assert_eq!(lease.validate(&timelines).await.unwrap_err().code, "stale_media");
         let source = replacement["image"]["source_id"].as_str().unwrap().to_owned();
-        let replacement_lease = timelines.image_lease(&room, "active", event_id!("$image"), source).await.unwrap();
+        let replacement_lease = timelines.media_lease(&room, "active", event_id!("$image"), source).await.unwrap();
         sdk_sync(&server, &client, None, vec![json!({
             "type":"m.room.redaction", "event_id":"$redaction", "sender":"@other:example.org",
             "origin_server_ts":2000, "redacts":"$image", "content":{"redacts":"$image"}
         })]).await;
         let redacted = next_row(&mut rx, "$image", |row| row["kind"] == "redacted").await;
         assert!(redacted.get("image").is_none());
-        assert_eq!(replacement_lease.validate(&timelines).await.unwrap_err().code, "stale_image");
+        assert_eq!(replacement_lease.validate(&timelines).await.unwrap_err().code, "stale_media");
         drop(replacement_lease);
         let (_, _, operation) = timelines.reserve(room.clone(), "replacement".into()).await.unwrap();
         drop(operation);
@@ -2075,11 +2169,11 @@ mod tests {
             let generation = uuid::Uuid::new_v4().to_string();
             let row = snapshot_row(&timelines, event_id!("$image")).await;
             let source = row["image"]["source_id"].as_str().unwrap();
-            let lease = timelines.image_lease(&owned_room_id!("!room:example.org"), "active",
+            let lease = timelines.media_lease(&owned_room_id!("!room:example.org"), "active",
                 event_id!("$image"), source.into()).await.unwrap();
             let slots = tokio::sync::Semaphore::new(1);
             assert_eq!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
-                cancel, transport, &slots).await.unwrap_err().code, "image_cancelled");
+                cancel, transport, &slots).await.unwrap_err().code, "media_cancelled");
             assert_eq!(store.cached_image(&generation, source).unwrap(), None);
             drop(lease);
             timelines.shutdown().await;

@@ -60,6 +60,12 @@ A timeout does not undo a server write; never resend it as a new message."
       (user-error "Build the Matrix backend with make -C %s backend"
                   (directory-file-name matrix-rpc--package-directory))))
 
+(defun matrix-rpc--timeout (method)
+  "Return METHOD's response timeout; attachment downloads outlast other calls."
+  (if (equal method "media.save")
+      (max matrix-request-timeout 660)
+    matrix-request-timeout))
+
 (defun matrix-rpc-uncertain-error ()
   "Return a content-free error for a request whose outcome is unknown."
   '(:code -32098
@@ -185,7 +191,7 @@ Give the SDK time to flush; terminate a stuck backend after three seconds."
                   (jsonrpc-async-request
                    connection (matrix-rpc-call-method call)
                    (or (matrix-rpc-call-params call) (make-hash-table))
-                   :timeout matrix-request-timeout
+                   :timeout (matrix-rpc--timeout (matrix-rpc-call-method call))
                    :success-fn
                    (lambda (result) (matrix-rpc--finish transport id result nil))
                    :error-fn
