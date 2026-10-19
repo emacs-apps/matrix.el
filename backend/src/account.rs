@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -158,6 +159,13 @@ struct EventParam {
     room_id: OwnedRoomId,
     subscription_id: String,
     event_id: OwnedEventId,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalEchoParam {
+    room_id: OwnedRoomId,
+    subscription_id: String,
+    transaction_id: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -573,6 +581,57 @@ impl Account {
         let tasks = TaskTracker::new();
         let verifications =
             Verifications::new(client.clone(), output.clone(), cancel.child_token());
+        // Any send failure pauses that room's whole send queue and the SDK leaves
+        // resuming to us.  A parked (unrecoverable) message stays parked, so
+        // resume at once; after a transient failure, once sync is healthy.
+        let queue_client = client.clone();
+        let queue_cancel = cancel.clone();
+        let queue_status = status.clone();
+        let queue_tasks = tasks.clone();
+        tasks.spawn(async move {
+            let mut errors = queue_client.send_queue().subscribe_errors();
+            let paused = Arc::new(Mutex::new(HashSet::new()));
+            loop {
+                let error = tokio::select! {
+                    _ = queue_cancel.cancelled() => break,
+                    error = errors.recv() => error,
+                };
+                let room_id = match error {
+                    Ok(error) if error.is_recoverable => error.room_id,
+                    Ok(error) => {
+                        if let Some(room) = queue_client.get_room(&error.room_id) {
+                            room.send_queue().set_enabled(true);
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if !paused.lock().await.insert(room_id.clone()) {
+                    continue;
+                }
+                let (client, cancel, status, paused) = (
+                    queue_client.clone(), queue_cancel.clone(), queue_status.clone(), paused.clone(),
+                );
+                queue_tasks.spawn(async move {
+                    let mut delay = Duration::from_secs(10);
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        if *status.read().await == "online" {
+                            break;
+                        }
+                        delay = Duration::from_secs(5);
+                    }
+                    paused.lock().await.remove(&room_id);
+                    if let Some(room) = client.get_room(&room_id) {
+                        room.send_queue().set_enabled(true);
+                    }
+                });
+            }
+        });
         let sync_client = client.clone();
         let sync_cancel = cancel.clone();
         let sync_status = status.clone();
@@ -750,6 +809,20 @@ impl Account {
                     .redact(&args.room_id, &args.subscription_id, &args.event_id)
                     .await?;
                 Ok(json!({}))
+            }
+            "message.retry" => {
+                let args: LocalEchoParam = params(value)?;
+                self.timelines
+                    .retry_send(&args.room_id, &args.subscription_id, &args.transaction_id)
+                    .await?;
+                Ok(json!({}))
+            }
+            "message.discard" => {
+                let args: LocalEchoParam = params(value)?;
+                let discarded = self.timelines
+                    .discard_send(&args.room_id, &args.subscription_id, &args.transaction_id)
+                    .await?;
+                Ok(json!({"discarded":discarded}))
             }
             "message.react" => {
                 let args: ReactParam = params(value)?;

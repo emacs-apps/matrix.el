@@ -969,6 +969,37 @@ impl Timelines {
         }).await
     }
 
+    /// Resend a local echo the SDK parked after an unrecoverable failure.
+    pub async fn retry_send(&self, room_id: &OwnedRoomId, id: &str, transaction_id: &str) -> Result<()> {
+        self.mutate(room_id, id, async |timeline| {
+            let items = timeline.items().await;
+            let event = local_echo(&items, transaction_id)?;
+            if !matches!(event.send_state(), Some(EventSendState::SendingFailed { .. })) {
+                return Err(RpcError::new("not_failed", "Only a failed message can be retried"));
+            }
+            let handle = event.local_echo_send_handle().ok_or(EVENT_MISSING)?;
+            drop(items);
+            handle.unwedge().await.map_err(|_| {
+                RpcError::new("retry_failed", "SDK could not requeue this message")
+            })?;
+            timeline.room().send_queue().set_enabled(true);
+            Ok(())
+        }).await
+    }
+
+    /// Withdraw a local echo that is still unsent; false if it was already sent.
+    pub async fn discard_send(&self, room_id: &OwnedRoomId, id: &str, transaction_id: &str) -> Result<bool> {
+        self.mutate(room_id, id, async |timeline| {
+            let items = timeline.items().await;
+            let handle = local_echo(&items, transaction_id)?.local_echo_send_handle()
+                .ok_or(EVENT_MISSING)?;
+            drop(items);
+            handle.abort().await.map_err(|_| {
+                RpcError::new("discard_failed", "SDK could not withdraw this message")
+            })
+        }).await
+    }
+
     pub async fn retry_decryption(&self, sessions: &[String]) {
         let timelines: Vec<_> = self
             .rooms
@@ -1006,6 +1037,37 @@ fn find_event<'a>(
 ) -> Result<&'a EventTimelineItem> {
     items.into_iter().filter_map(|item| item.as_event())
         .find(|event| event.event_id() == Some(event_id)).ok_or(EVENT_MISSING)
+}
+
+/// Explain why the SDK stopped sending a local echo.
+fn send_failure(error: &matrix_sdk::Error, recoverable: bool) -> &'static str {
+    use matrix_sdk::QueueWedgeError as Wedge;
+    if recoverable {
+        return "Not sent yet; sending resumes when the connection recovers";
+    }
+    match error {
+        matrix_sdk::Error::SendQueueWedgeError(wedge) => match wedge.as_ref() {
+            Wedge::InsecureDevices { .. } => "Not sent: some recipients have unverified devices",
+            Wedge::IdentityViolations { .. } => {
+                "Not sent: a recipient's identity changed; verify them before retrying"
+            }
+            Wedge::CrossVerificationRequired => "Not sent: verify this device before retrying",
+            Wedge::MissingMediaContent => "Not sent: the attachment data is missing",
+            Wedge::InvalidMimeType { .. } => "Not sent: the attachment type is invalid",
+            Wedge::GenericApiError { .. } => "Not sent: the server rejected this message",
+        },
+        _ => "Not sent: the server rejected this message",
+    }
+}
+
+fn local_echo<'a>(
+    items: impl IntoIterator<Item = &'a Arc<TimelineItem>>,
+    transaction_id: &str,
+) -> Result<&'a EventTimelineItem> {
+    items.into_iter().filter_map(|item| item.as_event())
+        .find(|event| event.transaction_id().is_some_and(|id| id.as_str() == transaction_id))
+        .filter(|event| event.local_echo_send_handle().is_some())
+        .ok_or(RpcError::new("unsent_missing", "The message is no longer waiting to be sent"))
 }
 
 fn mutation_timeline(subscription: &Subscription) -> Result<&Arc<Timeline>> {
@@ -1282,13 +1344,17 @@ fn item(item: &TimelineItem, permissions: MutationPermissions, own: &UserId) -> 
                     .unwrap_or_else(|| "Redacted event".into())
             );
         }
+        let local = event.local_echo_send_handle().is_some();
         match event.send_state() {
-            Some(EventSendState::NotSentYet { .. }) => value["send_state"] = json!("pending"),
-            Some(EventSendState::SendingFailed { .. }) => {
+            Some(EventSendState::NotSentYet { .. }) => {
+                value["send_state"] = json!("pending");
+                value["can_discard"] = json!(local);
+            }
+            Some(EventSendState::SendingFailed { error, is_recoverable }) => {
                 value["send_state"] = json!("failed");
-                value["error"] = json!(
-                    "SDK could not send this message; check connection and device verification"
-                );
+                value["error"] = json!(send_failure(error, *is_recoverable));
+                value["can_retry"] = json!(local && !is_recoverable);
+                value["can_discard"] = json!(local);
             }
             Some(EventSendState::Sent { .. }) => value["send_state"] = json!("sent"),
             None if event.is_own() => value["send_state"] = json!("sent"),
@@ -1873,6 +1939,76 @@ mod tests {
             "Robin changed the topic: Plans");
         let rules = snapshot_row(&timelines, event_id!("$rules")).await;
         assert_eq!((&rules["kind"], &rules["described"]), (&json!("state"), &Value::Null));
+        timelines.shutdown().await;
+    }
+
+    async fn local_row(timeline: &Timeline, predicate: impl Fn(&Value) -> bool) -> Option<Value> {
+        let own = timeline.room().own_user_id().to_owned();
+        timeline.items().await.iter()
+            .map(|row| item(row, MutationPermissions::default(), &own))
+            .find(|row| row["event_id"].is_null() && predicate(row))
+    }
+
+    async fn wait_local(timeline: &Timeline, predicate: impl Fn(&Value) -> bool) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(row) = local_row(timeline, &predicate).await {
+                    return row;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("local echo did not reach the expected state")
+    }
+
+    #[tokio::test]
+    async fn sdk_failed_sends_can_be_retried_and_unsent_ones_discarded() {
+        let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![]).await;
+        let room = owned_room_id!("!room:example.org");
+        let timeline = {
+            let (subscription, _operation) = timelines.mutation_subscription(&room, "active").await.unwrap();
+            mutation_timeline(&subscription).unwrap().clone()
+        };
+        timeline.send(RoomMessageEventContent::text_plain("withdrawn").into()).await.unwrap();
+        let queued = wait_local(&timeline, |row| row["body"] == "withdrawn").await;
+        assert_eq!((&queued["send_state"], &queued["can_discard"]), (&json!("pending"), &json!(true)));
+        let txn = queued["transaction_id"].as_str().unwrap().to_owned();
+        assert!(timelines.discard_send(&room, "active", &txn).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while local_row(&timeline, |row| row["transaction_id"] == txn.as_str()).await.is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+
+        let rejection = Mock::given(method("PUT"))
+            .and(path_regex(r"/rooms/.*/send/m\.room\.message/"))
+            .respond_with(ResponseTemplate::new(403)
+                .set_body_json(json!({"errcode":"M_FORBIDDEN", "error":"no"})))
+            .mount_as_scoped(&server).await;
+        timeline.send(RoomMessageEventContent::text_plain("parked").into()).await.unwrap();
+        client.send_queue().set_enabled(true).await;
+        let failed = wait_local(&timeline, |row| row["send_state"] == "failed").await;
+        assert_eq!((&failed["can_retry"], &failed["error"]),
+            (&json!(true), &json!("Not sent: the server rejected this message")));
+        let txn = failed["transaction_id"].as_str().unwrap().to_owned();
+        assert_eq!(timelines.discard_send(&room, "active", "unknown").await.unwrap_err().code,
+            "unsent_missing");
+        drop(rejection);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"/rooms/.*/send/m\.room\.message/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id":"$sent"})))
+            .mount(&server).await;
+        timelines.retry_send(&room, "active", &txn).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row = timeline.items().await.iter().filter_map(|row| row.as_event())
+                    .find(|event| event.transaction_id().is_some_and(|id| id.as_str() == txn))
+                    .map(|event| matches!(event.send_state(), Some(EventSendState::Sent { .. })));
+                if row == Some(true) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("retried message was not sent");
         timelines.shutdown().await;
     }
 
