@@ -444,11 +444,10 @@ impl Timelines {
                 return Err(STALE_SUBSCRIPTION);
             }
             let current = rooms.get(&room_id).cloned();
-            if let Some(current) = &current {
-                if current.id == id && !current.cancel.is_cancelled() {
+            if let Some(current) = &current
+                && current.id == id && !current.cancel.is_cancelled() {
                     return Ok((current.clone(), None, current.tasks.token()));
                 }
-            }
             let _transition = match &current {
                 Some(current) => match current.mutations.try_lock() {
                     Ok(guard) => Some(guard),
@@ -1337,11 +1336,10 @@ fn reply_metadata(reply: &InReplyToDetails) -> Value {
         TimelineDetails::Ready(event) => {
             value["status"] = json!("ready");
             value["sender"] = json!(event.sender);
-            if let TimelineDetails::Ready(profile) = &event.sender_profile {
-                if let Some(name) = &profile.display_name {
+            if let TimelineDetails::Ready(profile) = &event.sender_profile
+                && let Some(name) = &profile.display_name {
                     value["sender_name"] = json!(name);
                 }
-            }
             if let Some(message) = event.content.as_message() {
                 value["kind"] = json!("message");
                 value["body"] = json!(message.body());
@@ -1805,7 +1803,7 @@ mod tests {
 
         // An unresolved receipt and a zero notification badge do not prove read-all.
         sdk_sync_with_receipts(&server, &client, None, vec![], Some("$unloaded"), None).await;
-        let unresolved = read_state(&timeline, timeline.items().await.iter()).await;
+        let unresolved = read_state(timeline, timeline.items().await.iter()).await;
         assert!(unresolved.all_read.is_none());
         assert!(unresolved.first_unread_index.is_none());
 
@@ -1821,7 +1819,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
-        let partial = read_state(&timeline, timeline.items().await.iter()).await;
+        let partial = read_state(timeline, timeline.items().await.iter()).await;
         assert!(partial.all_read.is_none());
         assert!(partial.unread_messages.is_none());
         assert_eq!(room.num_unread_notifications(), 0);
@@ -1845,7 +1843,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let items = timeline.items().await;
-                let reading = read_state(&timeline, items.iter()).await;
+                let reading = read_state(timeline, items.iter()).await;
                 if reading.first_unread_index.and_then(|index| items.get(index))
                     .and_then(|item| item.as_event()).and_then(|event| event.event_id())
                     == Some(event_id!("$0"))
@@ -2273,8 +2271,8 @@ mod tests {
         let save = async |path: std::path::PathBuf| {
             let lease = timelines.media_lease(&room, "active", event_id!("$file"), source.clone())
                 .await.unwrap();
-            media::save(store.path().to_owned(), client.clone(), &timelines, &lease, path,
-                CancellationToken::new(), CancellationToken::new(), &slots).await
+            media::save(store.path().to_owned(), path, download(&client, &timelines, &lease,
+                CancellationToken::new(), CancellationToken::new(), &slots)).await
         };
         save(destination.clone()).await.unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"hello");
@@ -2343,12 +2341,12 @@ mod tests {
             let row = snapshot_row(&timelines, &event_id).await;
             let source = row["image"]["source_id"].as_str().unwrap();
             let lease = timelines.media_lease(&room, "active", &event_id, source.into()).await.unwrap();
-            let first = media::image(store.clone(), client.clone(), generation.clone(),
-                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots).await.unwrap();
+            let first = media::image(store.clone(), generation.clone(), download(&client,
+                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots)).await.unwrap();
             assert_eq!(std::fs::read(&first).unwrap(), IMAGE_PNG);
             assert!(first.starts_with(directory.path().join("media").join(&generation)));
-            let cached = media::image(store.clone(), client.clone(), generation.clone(),
-                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots).await.unwrap();
+            let cached = media::image(store.clone(), generation.clone(), download(&client,
+                &timelines, &lease, CancellationToken::new(), CancellationToken::new(), &slots)).await.unwrap();
             assert_eq!(first, cached);
         }
         let bad = snapshot_row(&timelines, event_id!("$bad-image")).await;
@@ -2356,8 +2354,8 @@ mod tests {
         assert_ne!(bad["image"]["source_id"], good["image"]["source_id"]);
         let source = bad["image"]["source_id"].as_str().unwrap();
         let lease = timelines.media_lease(&room, "active", event_id!("$bad-image"), source.into()).await.unwrap();
-        assert!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
-            CancellationToken::new(), CancellationToken::new(), &slots).await.is_err());
+        assert!(media::image(store.clone(), generation.clone(), download(&client, &timelines, &lease,
+            CancellationToken::new(), CancellationToken::new(), &slots)).await.is_err());
         assert_eq!(store.cached_image(&generation, source).unwrap(), None);
         drop(lease);
         timelines.shutdown().await;
@@ -2433,8 +2431,8 @@ mod tests {
             let lease = timelines.media_lease(&owned_room_id!("!room:example.org"), "active",
                 event_id!("$image"), source.into()).await.unwrap();
             let slots = tokio::sync::Semaphore::new(1);
-            assert_eq!(media::image(store.clone(), client, generation.clone(), &timelines, &lease,
-                cancel, transport, &slots).await.unwrap_err().code, "media_cancelled");
+            assert_eq!(media::image(store.clone(), generation.clone(), download(&client, &timelines,
+                &lease, cancel, transport, &slots)).await.unwrap_err().code, "media_cancelled");
             assert_eq!(store.cached_image(&generation, source).unwrap(), None);
             drop(lease);
             timelines.shutdown().await;
@@ -2658,6 +2656,17 @@ mod tests {
         assert_eq!(file["msgtype"], "m.file");
         assert!(file.get("filename").is_none());
         timelines.shutdown().await;
+    }
+
+    fn download<'a>(
+        client: &Client,
+        timelines: &'a Timelines,
+        lease: &'a MediaLease,
+        cancel: CancellationToken,
+        transport: CancellationToken,
+        slots: &'a tokio::sync::Semaphore,
+    ) -> media::Download<'a> {
+        media::Download { client: client.clone(), timelines, lease, cancel, transport, slots }
     }
 
     fn segment(text: &str, user_id: Option<&str>) -> Segment {
