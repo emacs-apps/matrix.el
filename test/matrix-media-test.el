@@ -193,7 +193,8 @@
         (appkit-app-send app (matrix-ui-test--items-state (list (matrix-media-test--item))))
         (appkit-surface-send surface '(matrix-update timeline "!room:test"))
         (should (string-match-p "Image caption" (buffer-string)))
-        (should (string-match-p "Canvas display required.*photo.png" (buffer-string)))
+        (should (string-match-p "\\[image\\] photo.png (2×1)\nPreview needs a graphical display"
+                                (buffer-string)))
         (should (equal (appkit-chat-timeline-keys) '("stable-row")))
         (should (equal (appkit-chatbuf-input-string) "Untouched draft"))
         (should (= revision (appkit-chatbuf-composer-revision)))))))
@@ -346,9 +347,12 @@
             (save-window-excursion
               (switch-to-buffer buffer)
               (appkit-surface-enable-responsive-geometry surface #'matrix--geometry)
-              (should (string-match-p "\\[Video loading" (buffer-string)))
+              (should (string-match-p "\\[video\\] 🤔 (7.8k)\nLoading preview…" (buffer-string)))
               (finish (car requests) (list :path file))
-              (should (string-match-p "\\[video\\] 🤔" (buffer-string)))
+              (should-not (string-match-p "Loading preview" (buffer-string)))
+              (should (appkit-media-card-context-at-point
+                       (save-excursion (goto-char (point-min))
+                                       (search-forward "[video]") (point))))
               (let* ((host (car appkit-media--inline-hosts))
                      (plan (appkit-media-inline-host-plan host)))
                 (should (eq 'canvas (plist-get (cdr (appkit-media--occurrence-image
