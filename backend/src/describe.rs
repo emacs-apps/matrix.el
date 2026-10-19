@@ -1,51 +1,120 @@
 //! Readable sentences for the state changes a room timeline shows.
 //!
 //! Only changes people act on are described; configuration noise (power
-//! levels, join rules, ACLs, policies) stays undescribed and hidden.
+//! levels, join rules, ACLs, policies) stays undescribed and hidden.  A
+//! sentence keeps the people it names as user parts, so clients can show
+//! their colours and avatars and open them.
 
-use matrix_sdk::ruma::events::StateEventContentChange;
+use matrix_sdk::ruma::{OwnedMxcUri, UserId, events::StateEventContentChange};
 use matrix_sdk_ui::timeline::{
     AnyOtherStateEventContentChange, EventTimelineItem, MemberProfileChange, MembershipChange,
     RoomMembershipChange, TimelineDetails, TimelineItemContent,
 };
+use serde_json::{Value, json};
 
-/// Return the state event type and a sentence describing EVENT's change.
-pub fn state(event: &EventTimelineItem) -> Option<(&'static str, String)> {
-    let actor = match event.sender_profile() {
-        TimelineDetails::Ready(profile) => profile.display_name.clone(),
-        _ => None,
+/// A described state change: its event type and its sentence's parts.
+pub struct Notice {
+    pub state_type: &'static str,
+    parts: Vec<Value>,
+}
+
+impl Notice {
+    /// The sentence as plain text.
+    pub fn body(&self) -> String {
+        self.parts.iter()
+            .filter_map(|part| part.get("text").or_else(|| part.get("name")))
+            .filter_map(Value::as_str)
+            .collect()
     }
-    .unwrap_or_else(|| event.sender().to_string());
-    match event.content() {
-        TimelineItemContent::MembershipChange(change) => {
-            Some(("m.room.member", membership(&actor, change)?))
+
+    /// Each part is {"text"} or a user {"user_id", "name", "avatar_url"?}.
+    pub fn parts(self) -> Value {
+        Value::Array(self.parts)
+    }
+}
+
+struct Person<'a> {
+    id: &'a UserId,
+    name: String,
+    avatar: Option<OwnedMxcUri>,
+}
+
+#[derive(Default)]
+struct Sentence(Vec<Value>);
+
+impl Sentence {
+    fn user(mut self, person: &Person) -> Self {
+        let mut part = json!({"user_id":person.id, "name":person.name});
+        if let Some(avatar) = &person.avatar {
+            part["avatar_url"] = json!(avatar);
         }
-        TimelineItemContent::ProfileChange(change) => Some(("m.room.member", profile(change)?)),
+        self.0.push(part);
+        self
+    }
+
+    fn text(mut self, text: impl AsRef<str>) -> Self {
+        self.0.push(json!({"text":text.as_ref()}));
+        self
+    }
+
+    fn notice(self, state_type: &'static str) -> Notice {
+        Notice { state_type, parts: self.0 }
+    }
+}
+
+/// Describe EVENT's state change, if it is one people act on.
+pub fn state(event: &EventTimelineItem) -> Option<Notice> {
+    let profile = match event.sender_profile() {
+        TimelineDetails::Ready(profile) => Some(profile),
+        _ => None,
+    };
+    let actor = Person {
+        id: event.sender(),
+        name: profile.and_then(|profile| profile.display_name.clone())
+            .unwrap_or_else(|| event.sender().to_string()),
+        avatar: profile.and_then(|profile| profile.avatar_url.clone()),
+    };
+    match event.content() {
+        TimelineItemContent::MembershipChange(change) => membership(&actor, change),
+        TimelineItemContent::ProfileChange(change) => profile_change(&actor, change),
         TimelineItemContent::OtherState(state) => other(&actor, state.content()),
         _ => None,
     }
 }
 
-fn membership(actor: &str, change: &RoomMembershipChange) -> Option<String> {
-    let target = change.display_name().unwrap_or_else(|| change.user_id().to_string());
-    let text = match change.change()? {
+fn membership(actor: &Person, change: &RoomMembershipChange) -> Option<Notice> {
+    let target = Person {
+        id: change.user_id(),
+        name: change.display_name().unwrap_or_else(|| change.user_id().to_string()),
+        avatar: change.avatar_url(),
+    };
+    let sentence = Sentence::default();
+    let sentence = match change.change()? {
         MembershipChange::Joined | MembershipChange::InvitationAccepted => {
-            format!("{target} joined")
+            sentence.user(&target).text(" joined")
         }
-        MembershipChange::Left => format!("{target} left"),
-        MembershipChange::Invited => format!("{actor} invited {target}"),
-        MembershipChange::InvitationRejected => format!("{target} declined the invitation"),
+        MembershipChange::Left => sentence.user(&target).text(" left"),
+        MembershipChange::Invited => sentence.user(actor).text(" invited ").user(&target),
+        MembershipChange::InvitationRejected => {
+            sentence.user(&target).text(" declined the invitation")
+        }
         MembershipChange::InvitationRevoked => {
-            format!("{actor} withdrew {target}'s invitation")
+            sentence.user(actor).text(" withdrew ").user(&target).text("'s invitation")
         }
-        MembershipChange::Kicked => format!("{actor} removed {target}"),
-        MembershipChange::Banned => format!("{actor} banned {target}"),
-        MembershipChange::KickedAndBanned => format!("{actor} removed and banned {target}"),
-        MembershipChange::Unbanned => format!("{actor} unbanned {target}"),
-        MembershipChange::Knocked => format!("{target} asked to join"),
-        MembershipChange::KnockAccepted => format!("{actor} let {target} in"),
-        MembershipChange::KnockRetracted => format!("{target} withdrew their request to join"),
-        MembershipChange::KnockDenied => format!("{actor} declined {target}'s request to join"),
+        MembershipChange::Kicked => sentence.user(actor).text(" removed ").user(&target),
+        MembershipChange::Banned => sentence.user(actor).text(" banned ").user(&target),
+        MembershipChange::KickedAndBanned => {
+            sentence.user(actor).text(" removed and banned ").user(&target)
+        }
+        MembershipChange::Unbanned => sentence.user(actor).text(" unbanned ").user(&target),
+        MembershipChange::Knocked => sentence.user(&target).text(" asked to join"),
+        MembershipChange::KnockAccepted => sentence.user(actor).text(" let ").user(&target).text(" in"),
+        MembershipChange::KnockRetracted => {
+            sentence.user(&target).text(" withdrew their request to join")
+        }
+        MembershipChange::KnockDenied => {
+            sentence.user(actor).text(" declined ").user(&target).text("'s request to join")
+        }
         MembershipChange::None | MembershipChange::Error | MembershipChange::NotImplemented => {
             return None;
         }
@@ -54,64 +123,71 @@ fn membership(actor: &str, change: &RoomMembershipChange) -> Option<String> {
         StateEventContentChange::Original { content, .. } => content.reason.as_deref(),
         StateEventContentChange::Redacted(_) => None,
     };
-    Some(match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
-        Some(reason) => format!("{text}: {reason}"),
-        None => text,
-    })
+    let sentence = match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        Some(reason) => sentence.text(format!(": {reason}")),
+        None => sentence,
+    };
+    Some(sentence.notice("m.room.member"))
 }
 
-fn profile(change: &MemberProfileChange) -> Option<String> {
-    let user = change.user_id().to_string();
-    if let Some(name) = change.displayname_change() {
-        let old = name.old.as_deref().unwrap_or(&user);
-        return Some(match name.new.as_deref() {
-            Some(new) if name.old.is_some() => format!("{old} changed their name to {new}"),
-            Some(new) => format!("{old} set their name to {new}"),
-            None => format!("{old} removed their name"),
-        });
-    }
-    change.avatar_url_change().map(|_| format!("{user} changed their avatar"))
+fn profile_change(actor: &Person, change: &MemberProfileChange) -> Option<Notice> {
+    let sentence = if let Some(name) = change.displayname_change() {
+        // Name them as they were known before the change.
+        let before = Person {
+            id: change.user_id(),
+            name: name.old.clone().unwrap_or_else(|| change.user_id().to_string()),
+            avatar: actor.avatar.clone(),
+        };
+        let sentence = Sentence::default().user(&before);
+        match (&name.old, &name.new) {
+            (Some(_), Some(new)) => sentence.text(format!(" changed their name to {new}")),
+            (None, Some(new)) => sentence.text(format!(" set their name to {new}")),
+            (_, None) => sentence.text(" removed their name"),
+        }
+    } else {
+        change.avatar_url_change()?;
+        Sentence::default().user(actor).text(" changed their avatar")
+    };
+    Some(sentence.notice("m.room.member"))
 }
 
-fn other(actor: &str, content: &AnyOtherStateEventContentChange) -> Option<(&'static str, String)> {
+fn other(actor: &Person, content: &AnyOtherStateEventContentChange) -> Option<Notice> {
     use AnyOtherStateEventContentChange as State;
     use StateEventContentChange::Original;
+    let by = || Sentence::default().user(actor);
     Some(match content {
-        State::RoomCreate(_) => ("m.room.create", format!("{actor} created the room")),
-        State::RoomName(Original { content, .. }) => ("m.room.name", if content.name.is_empty() {
-            format!("{actor} removed the room name")
+        State::RoomCreate(_) => by().text(" created the room").notice("m.room.create"),
+        State::RoomName(Original { content, .. }) => if content.name.is_empty() {
+            by().text(" removed the room name")
         } else {
-            format!("{actor} renamed the room to {}", content.name)
-        }),
-        State::RoomTopic(Original { content, .. }) => ("m.room.topic", if content.topic.is_empty() {
-            format!("{actor} removed the topic")
+            by().text(format!(" renamed the room to {}", content.name))
+        }.notice("m.room.name"),
+        State::RoomTopic(Original { content, .. }) => if content.topic.is_empty() {
+            by().text(" removed the topic")
         } else {
-            format!("{actor} changed the topic: {}", content.topic)
-        }),
+            by().text(format!(" changed the topic: {}", content.topic))
+        }.notice("m.room.topic"),
         State::RoomAvatar(Original { .. }) => {
-            ("m.room.avatar", format!("{actor} changed the room avatar"))
+            by().text(" changed the room avatar").notice("m.room.avatar")
         }
         State::RoomEncryption(Original { .. }) => {
-            ("m.room.encryption", format!("{actor} turned on end-to-end encryption"))
+            by().text(" turned on end-to-end encryption").notice("m.room.encryption")
         }
-        State::RoomCanonicalAlias(Original { content, .. }) => (
-            "m.room.canonical_alias",
-            match &content.alias {
-                Some(alias) => format!("{actor} set the room address to {alias}"),
-                None => format!("{actor} removed the room address"),
-            },
-        ),
+        State::RoomCanonicalAlias(Original { content, .. }) => match &content.alias {
+            Some(alias) => by().text(format!(" set the room address to {alias}")),
+            None => by().text(" removed the room address"),
+        }.notice("m.room.canonical_alias"),
         State::RoomPinnedEvents(Original { .. }) => {
-            ("m.room.pinned_events", format!("{actor} changed the pinned messages"))
+            by().text(" changed the pinned messages").notice("m.room.pinned_events")
         }
-        State::RoomTombstone(Original { content, .. }) => ("m.room.tombstone", {
+        State::RoomTombstone(Original { content, .. }) => {
             let body = content.body.trim();
-            if body.is_empty() {
+            Sentence::default().text(if body.is_empty() {
                 "This room has been replaced".to_owned()
             } else {
                 format!("This room has been replaced: {body}")
-            }
-        }),
+            }).notice("m.room.tombstone")
+        }
         _ => return None,
     })
 }

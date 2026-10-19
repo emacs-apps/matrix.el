@@ -28,6 +28,7 @@
 (require 'matrix-mention)
 (require 'matrix-reply)
 
+(declare-function matrix-user-open "matrix-user" (app user-id &optional select))
 (declare-function appkit-media-inline-host-at-point "appkit-media-inline"
                   (&optional position))
 (declare-function appkit-media-inline-host-activate "appkit-media-inline"
@@ -71,9 +72,9 @@ joins, leaves and profile changes (busy bridged rooms), nil hides them all."
 (defconst matrix-room-message-key-property 'matrix-message-id
   "Stable SDK timeline identity attached to generated rows.")
 
-(defvar matrix-room-timeline-mode-map
-  (make-sparse-keymap)
-  "Keymap active over generated Matrix timeline rows.")
+(defvar-keymap matrix-room-timeline-mode-map
+  :doc "Keymap active over generated Matrix timeline rows."
+  "i" #'matrix-room-open-user-at-point)
 
 (appkit-bindings-define 'matrix-room-timeline-mode-map 'read-only
   'return #'matrix-room-return
@@ -557,6 +558,59 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
                      (not (equal (plist-get item :state_type) "m.room.member"))))))
     (_ t)))
 
+(defun matrix-room--avatar-uris (item)
+  "Return the avatar URIs ITEM's row shows: its sender's and its people's."
+  (cons (plist-get item :avatar_url)
+        (mapcar (lambda (part) (plist-get part :avatar_url))
+                (append (plist-get item :parts) nil))))
+
+(defun matrix-room--notice-user (app part)
+  "Return notice PART's user in their colour beside their avatar, as a link."
+  (let* ((user-id (plist-get part :user_id))
+         (uri (plist-get part :avatar_url))
+         (image (when (and (matrix-avatar-resource-key app uri)
+                           (appkit-media-inline-image-rendering-available-p))
+                  (matrix-avatar-cached-image
+                   app uri (appkit-chat-avatar-line-pixel-height)))))
+    (with-temp-buffer
+      (appkit-ui-insert-action-button
+       (concat (when image (concat (appkit-chat-avatar-one-line-string image "") " "))
+               (matrix--one-line (or (plist-get part :name) user-id)))
+       (lambda () (matrix-user-open app user-id t))
+       :face (appkit-name-color-face user-id)
+       :help-echo user-id
+       :properties (list 'matrix-user-id user-id))
+      (buffer-string))))
+
+(defun matrix-room--notice-label (item width)
+  "Return state ITEM's sentence and time within WIDTH columns.
+Its people show in their colours beside their avatars; a sentence too wide
+for that is plain text, elided."
+  (let* ((app (appkit-surface-app (appkit-current-surface)))
+         (time (matrix-room--time-label item))
+         (suffix (unless (string-empty-p time) (concat " · " time)))
+         (label (concat (mapconcat
+                         (lambda (part)
+                           (if (stringp (plist-get part :user_id))
+                               (matrix-room--notice-user app part)
+                             (matrix--one-line (or (plist-get part :text) ""))))
+                         (append (plist-get item :parts) nil) "")
+                        suffix)))
+    (if (and (plist-get item :parts) (<= (string-width label) width))
+        label
+      (appkit-presentation-elide-string-for-columns
+       (concat (matrix--one-line (plist-get item :body)) suffix) width 'shadow))))
+
+(defun matrix-room-open-user-at-point ()
+  "Open the page of the user at point: a notice's person, else the sender."
+  (interactive)
+  (let* ((surface (matrix--current-surface 'room))
+         (key (get-text-property (point) matrix-room-message-key-property))
+         (user-id (or (get-text-property (point) 'matrix-user-id)
+                      (and key (plist-get (matrix-room--item surface key) :sender)))))
+    (unless (stringp user-id) (user-error "No user at point"))
+    (matrix-user-open (appkit-surface-app surface) user-id t)))
+
 (defun matrix-room--print-row (row)
   "Insert SDK ROW using shared name, avatar-prefix, timestamp and divider layout."
   (let* ((item (appkit-chat-timeline-row-payload row))
@@ -571,12 +625,7 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
       ("state"
        ;; AppKit's gray-tip row, as QQ gray tips and other clients' notices.
        (appkit-chat-ins-insert-divider-row
-        (appkit-presentation-elide-string-for-columns
-         (string-join (delq nil (list (matrix--one-line (plist-get item :body))
-                                      (let ((time (matrix-room--time-label item)))
-                                        (unless (string-empty-p time) time))))
-                      " · ")
-         (max 10 (- matrix-room--width 8)) 'shadow)
+        (matrix-room--notice-label item (max 10 (- matrix-room--width 8)))
         'shadow matrix-room--width))
       ("day"
        (appkit-chat-ins-insert-divider-row
@@ -724,9 +773,10 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
           :dependencies-function
           (lambda (item)
             (delq nil
-                  (list (matrix-avatar-resource-key app (plist-get item :avatar_url))
-                        (matrix-media-resource-key
-                         app room-id (plist-get timeline :subscription_id) item)))))
+                  (cons (matrix-media-resource-key
+                         app room-id (plist-get timeline :subscription_id) item)
+                        (mapcar (lambda (uri) (matrix-avatar-resource-key app uri))
+                                (matrix-room--avatar-uris item))))))
          :changed-resources (appkit-projection-change-resources request)
          :force-keys (when (appkit-projection-change-geometry-p request)
                        (appkit-chat-timeline-keys)))
@@ -741,8 +791,9 @@ The SDK debounces further and lets a notice lapse 4 seconds after the last."
             (push (appkit-resource-demand-key demand) media-keys)))
         (matrix-media-retain app room-id media-keys)
         (matrix--avatar-resource-result
-         surface (mapcar (lambda (item)
-                           (cons (plist-get item :id) (plist-get item :avatar_url)))
+         surface (mapcan (lambda (item)
+                           (mapcar (lambda (uri) (cons (plist-get item :id) uri))
+                                   (matrix-room--avatar-uris item)))
                          items)
          (nreverse media-rows))))))
 

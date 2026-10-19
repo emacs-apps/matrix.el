@@ -856,6 +856,66 @@
     (matrix-room-next-outgoing)
     (should (equal (get-text-property (point) matrix-room-message-key-property) "mine"))))
 
+(ert-deftest matrix-ui-notice-people-are-coloured-links-to-their-pages ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let (opened)
+      (appkit-app-send
+       app (matrix-ui-test--items-state
+            (list '(:id "kick" :kind "state" :described t :state_type "m.room.member"
+                    :sender "@mod:test" :body "Mod removed Newcomer: spam"
+                    :parts [(:user_id "@mod:test" :name "Mod") (:text " removed ")
+                            (:user_id "@new:test" :name "Newcomer") (:text ": spam")])
+                  '(:id "hi" :kind "message" :sender "@other:test" :body "Hi"))))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (should (string-match-p "( Mod removed Newcomer: spam )" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "Newcomer")
+      (should (memq (appkit-name-color-face "@new:test")
+                    (ensure-list (get-text-property (match-beginning 0) 'face))))
+      (cl-letf (((symbol-function 'matrix-user-open)
+                 (lambda (_app user-id &rest _) (push user-id opened))))
+        (goto-char (match-beginning 0))
+        (matrix-room-open-user-at-point)
+        (push-button (match-beginning 0))
+        (goto-char (appkit-chat-timeline-key-position "hi"))
+        (matrix-room-open-user-at-point))
+      (should (equal (nreverse opened) '("@new:test" "@new:test" "@other:test"))))))
+
+(ert-deftest matrix-ui-user-page-shows-the-loaded-profile ()
+  (matrix-ui-test--with-room
+    (appkit-app-send app (plist-put (matrix-ui-test--state "Hi") :backend-active t))
+    (let (user-surface)
+      ;; This fixture App would take registration messages as its model.
+      (cl-letf (((symbol-function 'matrix-runtime-register-surface) #'ignore)
+                ((symbol-function 'matrix-runtime-unregister-surface) #'ignore)
+                ((symbol-function 'matrix-runtime-request)
+                 (lambda (_app method params owned)
+                   (should (equal (list method params)
+                                  '("user.profile" (:user_id "@alice:test"))))
+                   (run-at-time 0 nil
+                                (lambda ()
+                                  (appkit-surface-send
+                                   user-surface
+                                   (list 'matrix-result 1 method
+                                         '(:user_id "@alice:test" :display_name "Alice"
+                                           :self :json-false :verified t :devices 2
+                                           :rooms [(:room_id "!room:test" :name "Encrypted room")])
+                                         nil owned))))
+                   1)))
+        (setq user-surface (matrix-user-open app "@alice:test"))
+        (unwind-protect
+            (with-current-buffer (appkit-surface-buffer user-surface)
+              (should (string-match-p "Loading user profile" (buffer-string)))
+              (accept-process-output nil 0.05)
+              (let ((text (buffer-string)))
+                (should (string-match-p "\\`.*Alice\n.*@alice:test" text))
+                (should (string-match-p "Message  .*Copy ID" text))
+                (should (string-match-p "Identity:   Verified" text))
+                (should (string-match-p "Devices:    2" text))
+                (should (string-match-p "Rooms in common (1)\n  Encrypted room" text))))
+          (kill-buffer (appkit-surface-buffer user-surface)))))))
+
 (ert-deftest matrix-ui-read-marker-projects-stable-canonical-boundary ()
   (matrix-ui-test--with-room
     (let* ((appkit-chat-show-unread-divider t)
