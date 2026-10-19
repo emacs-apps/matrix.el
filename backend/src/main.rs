@@ -2,6 +2,7 @@
 
 mod account;
 mod media;
+mod notification;
 mod protocol;
 mod storage;
 mod timeline;

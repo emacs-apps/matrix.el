@@ -33,7 +33,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
-    media,
+    media, notification,
     protocol::{INVALID, NETWORK, Output, Result, RpcError, params},
     storage::{SavedSession, Store},
     timeline::{Attachment, Timelines},
@@ -542,13 +542,16 @@ impl Account {
             output.event(json!({"type":"status", "state":"syncing"})).await;
             let mut backoff = 1u64;
             let mut previous_rooms = Value::Null;
+            // The first sync after start catches up on history that unread
+            // counts already represent; only later syncs carry new arrivals.
+            let mut baseline = true;
             loop {
                 let result = tokio::select! {
                     _ = sync_cancel.cancelled() => break,
                     result = sync_client.sync_once(SyncSettings::default()) => result,
                 };
                 match result {
-                    Ok(_) => {
+                    Ok(response) => {
                         backoff = 1;
                         let mut state = sync_status.write().await;
                         if *state != "online" {
@@ -560,6 +563,13 @@ impl Account {
                         if rooms != previous_rooms {
                             output.event(json!({"type":"rooms", "rooms":rooms})).await;
                             previous_rooms = rooms;
+                        }
+                        if baseline {
+                            baseline = false;
+                        } else if let Some(event) =
+                            notification::batch(&sync_client, &response.notifications).await
+                        {
+                            output.event(event).await;
                         }
                     }
                     Err(error) if unknown_token(error.client_api_error_kind()) => {
@@ -884,11 +894,17 @@ async fn snapshot_key_import(root: PathBuf, source: PathBuf) -> Result<tempfile:
     .map_err(|_| error)?
 }
 
-fn summary_text(text: &str) -> &str {
+pub(crate) fn summary_text(text: &str) -> &str {
     &text[..text
         .char_indices()
         .nth(512)
         .map_or(text.len(), |(index, _)| index)]
+}
+
+pub(crate) fn room_title(room: &matrix_sdk::Room) -> String {
+    room.name()
+        .or_else(|| room.cached_display_name().map(|n| n.to_string()))
+        .unwrap_or_else(|| room.room_id().to_string())
 }
 
 async fn room_summaries(client: &Client) -> Value {
@@ -902,14 +918,12 @@ async fn room_summaries(client: &Client) -> Value {
             RoomState::Left => "leave",
             _ => continue,
         };
-        let name = room
-            .name()
-            .or_else(|| room.cached_display_name().map(|n| n.to_string()))
-            .unwrap_or_else(|| room.room_id().to_string());
+        let name = room_title(&room);
         let mut summary = json!({
             "room_id":room.room_id(), "name":summary_text(&name),
             "membership":membership, "encrypted":room.encryption_state().is_encrypted(),
-            "unread":room.num_unread_notifications()
+            "unread":room.num_unread_notifications(),
+            "mentions":room.num_unread_mentions()
         });
         // The SDK room avatar wins. For a direct room with one other hero,
         // use that member's SDK profile without fetching membership or media.
