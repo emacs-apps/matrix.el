@@ -401,10 +401,7 @@ impl MediaLease {
         let items = timeline.items().await;
         let event = items.iter().filter_map(|item| item.as_event())
             .find(|event| event.event_id() == Some(self.event_id.as_ref())).ok_or(EVENT_MISSING)?;
-        let (source, _) = event_media(event).ok_or(media::STALE_MEDIA)?;
-        if media::source_id(source) != self.source_id {
-            return Err(media::STALE_MEDIA);
-        }
+        event_source(event, &self.source_id).ok_or(media::STALE_MEDIA)?;
         if !timelines.is_current(&self.room_id, &self.subscription).await {
             return Err(STALE_SUBSCRIPTION);
         }
@@ -903,10 +900,7 @@ impl Timelines {
             let timeline = mutation_timeline(&subscription)?;
             let items = timeline.items().await;
             let event = find_event(&items, event_id)?;
-            let (source, size) = event_media(event).ok_or(media::STALE_MEDIA)?;
-            if media::source_id(source) != source_id {
-                return Err(media::STALE_MEDIA);
-            }
+            let (source, size) = event_source(event, &source_id).ok_or(media::STALE_MEDIA)?;
             (matrix_sdk::media::MediaRequestParameters {
                 source: source.clone(),
                 format: matrix_sdk::media::MediaFormat::File,
@@ -1251,15 +1245,61 @@ fn joined_room(client: &Client, room_id: &OwnedRoomId) -> Result<matrix_sdk::Roo
 }
 
 
-/// The source and declared size of EVENT's image, file, audio or video.
-fn event_media(event: &EventTimelineItem) -> Option<(&MediaSource, Option<UInt>)> {
-    match event.content().as_message()?.msgtype() {
-        MessageType::Image(image) => Some((&image.source, image.info.as_ref().and_then(|i| i.size))),
-        MessageType::File(file) => Some((&file.source, file.info.as_ref().and_then(|i| i.size))),
-        MessageType::Audio(audio) => Some((&audio.source, audio.info.as_ref().and_then(|i| i.size))),
-        MessageType::Video(video) => Some((&video.source, video.info.as_ref().and_then(|i| i.size))),
-        _ => None,
+/// EVENT's downloadable sources and their declared sizes: the image, file,
+/// audio or video itself, then a video's thumbnail.
+fn event_sources(event: &EventTimelineItem) -> Vec<(&MediaSource, Option<UInt>)> {
+    let Some(message) = event.content().as_message() else {
+        return Vec::new();
+    };
+    match message.msgtype() {
+        MessageType::Image(image) => vec![(&image.source, image.info.as_ref().and_then(|i| i.size))],
+        MessageType::File(file) => vec![(&file.source, file.info.as_ref().and_then(|i| i.size))],
+        MessageType::Audio(audio) => vec![(&audio.source, audio.info.as_ref().and_then(|i| i.size))],
+        MessageType::Video(video) => {
+            let info = video.info.as_deref();
+            let mut sources = vec![(&video.source, info.and_then(|i| i.size))];
+            if let Some(thumbnail) = info.and_then(|i| i.thumbnail_source.as_ref()) {
+                let size = info.and_then(|i| i.thumbnail_info.as_ref()).and_then(|t| t.size);
+                sources.push((thumbnail, size));
+            }
+            sources
+        }
+        _ => Vec::new(),
     }
+}
+
+/// The source of EVENT whose identity is SOURCE_ID, with its declared size.
+fn event_source<'a>(
+    event: &'a EventTimelineItem,
+    source_id: &str,
+) -> Option<(&'a MediaSource, Option<UInt>)> {
+    event_sources(event).into_iter().find(|(source, _)| media::source_id(source) == source_id)
+}
+
+/// A video's inline poster: its thumbnail, or else its own first frame when
+/// the whole video is small enough to fetch as a poster.
+fn video_poster(video: &matrix_sdk::ruma::events::room::message::VideoMessageEventContent) -> Option<Value> {
+    let info = video.info.as_deref();
+    let (source, own, width, height) = match info.and_then(|i| i.thumbnail_source.as_ref()) {
+        Some(thumbnail) => {
+            let thumbnail_info = info.and_then(|i| i.thumbnail_info.as_deref());
+            (thumbnail, false, thumbnail_info.and_then(|t| t.width), thumbnail_info.and_then(|t| t.height))
+        }
+        None if info.and_then(|i| i.size)
+            .is_none_or(|size| u64::from(size) <= crate::storage::MAX_IMAGE_BYTES as u64) =>
+        {
+            (&video.source, true, info.and_then(|i| i.width), info.and_then(|i| i.height))
+        }
+        None => return None,
+    };
+    let mut value = json!({"source_id":media::source_id(source), "own":own});
+    if let Some(width) = width.filter(|width| u64::from(*width) > 0) {
+        value["width"] = json!(width);
+    }
+    if let Some(height) = height.filter(|height| u64::from(*height) > 0) {
+        value["height"] = json!(height);
+    }
+    Some(value)
 }
 
 /// Describe EVENT's file, audio or video attachment for presentation.
@@ -1284,6 +1324,11 @@ fn attachment_metadata(event: &EventTimelineItem) -> Option<Value> {
             _ => return None,
         };
     let mut value = json!({"kind":kind, "source_id":media::source_id(source), "filename":filename});
+    if let MessageType::Video(video) = event.content().as_message()?.msgtype()
+        && let Some(poster) = video_poster(video)
+    {
+        value["poster"] = poster;
+    }
     if let Some(mime) = mime {
         value["mime_type"] = json!(mime);
     }
@@ -2284,6 +2329,58 @@ mod tests {
         assert_eq!(save(destination.clone()).await.unwrap_err().code, "media_save_failed");
         assert_eq!(save(store.path().join("inside")).await.unwrap_err().code, "media_save_failed");
         assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 1);
+        timelines.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sdk_videos_get_posters_from_thumbnails_or_their_own_first_frame() {
+        let (server, client, timelines, _rx) = sdk_fixture(Some(power_levels(0)), vec![
+            message("$thumbed", "@other:example.org", json!({
+                "msgtype":"m.video", "body":"clip.mp4", "url":"mxc://example.org/clip",
+                "info":{"size":50_000_000, "thumbnail_url":"mxc://example.org/thumb",
+                        "thumbnail_info":{"w":320, "h":180}}
+            })),
+            message("$sticker", "@other:example.org", json!({
+                "msgtype":"m.video", "body":"🤔", "url":"mxc://example.org/sticker",
+                "info":{"size":168_000, "w":512, "h":512}
+            })),
+            message("$huge", "@other:example.org", json!({
+                "msgtype":"m.video", "body":"film.mkv", "url":"mxc://example.org/film",
+                "info":{"size":900_000_000}
+            })),
+        ]).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/thumb$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(IMAGE_PNG))
+            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/media/(r0|v3)/download/example\.org/sticker$"))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_bytes(b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01webm".to_vec()))
+            .mount(&server).await;
+        let room = owned_room_id!("!room:example.org");
+        let thumbed = snapshot_row(&timelines, event_id!("$thumbed")).await;
+        let poster = &thumbed["attachment"]["poster"];
+        assert_eq!((&poster["own"], &poster["width"], &poster["height"]),
+            (&json!(false), &json!(320), &json!(180)));
+        assert_ne!(poster["source_id"], thumbed["attachment"]["source_id"]);
+        let sticker = snapshot_row(&timelines, event_id!("$sticker")).await;
+        assert_eq!((&sticker["attachment"]["poster"]["own"], &sticker["attachment"]["poster"]["source_id"]),
+            (&json!(true), &sticker["attachment"]["source_id"]));
+        assert!(snapshot_row(&timelines, event_id!("$huge")).await["attachment"]
+            .get("poster").is_none());
+        let store_directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(store_directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Arc::new(crate::storage::Store::open(store_directory.path().into()).unwrap());
+        let generation = uuid::Uuid::new_v4().to_string();
+        let slots = tokio::sync::Semaphore::new(1);
+        for (event_id, row) in [(event_id!("$thumbed"), &thumbed), (event_id!("$sticker"), &sticker)] {
+            let source = row["attachment"]["poster"]["source_id"].as_str().unwrap().to_owned();
+            let lease = timelines.media_lease(&room, "active", event_id, source).await.unwrap();
+            let path = media::image(store.clone(), generation.clone(), download(&client, &timelines,
+                &lease, CancellationToken::new(), CancellationToken::new(), &slots)).await.unwrap();
+            assert!(path.exists());
+        }
         timelines.shutdown().await;
     }
 

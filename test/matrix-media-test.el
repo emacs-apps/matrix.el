@@ -315,6 +315,54 @@
                 (should (equal (appkit-chatbuf-input-string) "Never send from an image"))
                 (should (= revision (appkit-chatbuf-composer-revision)))))))))))
 
+(defun matrix-media-test--video-item (event poster-own)
+  "Return an SDK-shaped video message whose poster is POSTER-OWN or a thumbnail."
+  (list :id event :kind "message" :event_id (concat "$" event ":test")
+        :sender "@other:test" :sender_name "Other" :timestamp 1700000000000
+        :body "🤔"
+        :attachment (list :kind "video" :source_id matrix-media-test--replacement
+                          :filename "🤔" :size 8000
+                          :poster (list :source_id matrix-media-test--source
+                                        :own (if poster-own t :json-false)
+                                        :width 320 :height 240))))
+
+(ert-deftest matrix-media-native-video-posters-play-their-own-or-fetched-video ()
+  (skip-unless (and (matrix-media-rendering-available-p) (executable-find "ffmpeg")))
+  (require 'appkit-media-inline)
+  (matrix-avatar-test--with-accounts
+    (let* ((app (account "video"))
+           (store (matrix-rpc-transport-store (plist-get (appkit-app-model app) :transport)))
+           (file (matrix-media-test--file store)))
+      ;; The cached poster is a real WebM: a video posting its own first frame.
+      (call-process "ffmpeg" nil nil nil "-nostdin" "-loglevel" "error" "-y"
+                    "-f" "lavfi" "-i" "testsrc=size=320x240:rate=10" "-t" "1"
+                    "-c:v" "libvpx-vp9" "-f" "webm" file)
+      (dolist (own '(t nil))
+        (let ((item (matrix-media-test--video-item (if own "own" "thumb") own)))
+          (matrix-media-test--install app item)
+          (let* ((surface (matrix-ui-test--open app))
+                 (buffer (appkit-surface-buffer surface)))
+            (push surface surfaces)
+            (save-window-excursion
+              (switch-to-buffer buffer)
+              (appkit-surface-enable-responsive-geometry surface #'matrix--geometry)
+              (should (string-match-p "\\[Video loading" (buffer-string)))
+              (finish (car requests) (list :path file))
+              (should (string-match-p "\\[video\\] 🤔" (buffer-string)))
+              (let* ((host (car appkit-media--inline-hosts))
+                     (plan (appkit-media-inline-host-plan host)))
+                (should (eq 'canvas (plist-get (cdr (appkit-media--occurrence-image
+                                                     (appkit-media-inline-host-occurrence host)))
+                                               :type)))
+                (should (eq 'video (appkit-media--playback-kind plan)))
+                (if own
+                    (should (equal (alist-get 'file (appkit-media-inline-host-resource host))
+                                   file))
+                  (should-not (appkit-media-inline-host-resource host))
+                  (should (functionp (appkit-media--playback-resolve-function plan))))))
+            (appkit-surface-stop surface)
+            (kill-buffer buffer)))))))
+
 (ert-deftest matrix-media-native-return-and-click-open-real-viewer-never-send ()
   (skip-unless (matrix-media-rendering-available-p))
   (require 'appkit-media-inline)
