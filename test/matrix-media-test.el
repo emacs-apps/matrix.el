@@ -358,12 +358,12 @@
                 (should (eq 'canvas (plist-get (cdr (appkit-media--occurrence-image
                                                      (appkit-media-inline-host-occurrence host)))
                                                :type)))
-                (should (eq 'video (appkit-media--playback-kind plan)))
+                (should (eq 'video (appkit-media-playback-kind plan)))
                 (if own
                     (should (equal (alist-get 'file (appkit-media-inline-host-resource host))
                                    file))
                   (should-not (appkit-media-inline-host-resource host))
-                  (should (functionp (appkit-media--playback-resolve-function plan))))))
+                  (should (functionp (appkit-media-playback-resolve-function plan))))))
             (appkit-surface-stop surface)
             (kill-buffer buffer)))))))
 
