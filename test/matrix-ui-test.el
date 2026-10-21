@@ -728,7 +728,8 @@
                    (funcall resolve nil)))
                 (matrix-attachment-open-function
                  (lambda (file kind) (setq opened (list file kind)))))
-        (call-interactively (key-binding (kbd "RET"))))
+        (call-interactively (key-binding (kbd "RET")))
+        (dotimes (_ 8) (appkit-loop-run-pass (appkit-surface-loop surface))))
       (should (equal (car request) "media.save"))
       (let ((path (plist-get (cadr request) :path)))
         (should (equal (file-name-nondirectory path) "notes.txt"))

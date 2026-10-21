@@ -571,15 +571,27 @@ CAPABILITY is the backend's `:can_retry' or `:can_discard'."
      (lambda (path) (message "Matrix: saved %s" (abbreviate-file-name path))))))
 
 (defun matrix-room-open-attachment (row-key)
-  "Download a private copy of the attachment of SDK row ROW-KEY and open it."
+  "Download a private copy of the attachment of SDK row ROW-KEY and open it.
+The download and the selected Appkit media owner are separate keyed Effects,
+so closing the room or replacing the presentation revokes both."
   (let* ((surface (matrix--current-surface 'room))
-         (item (matrix-room--item surface row-key)))
+         (app (appkit-surface-app surface))
+         (room (cadr (appkit-surface-identity surface)))
+         (item (matrix-room--item surface row-key))
+         (timeline (matrix-room--timeline (matrix-runtime-state app) room))
+         (subscription (plist-get timeline :subscription_id)))
+    (unless (and (stringp subscription) (not (string-empty-p subscription)))
+      (user-error "This room's timeline is not ready"))
     (pcase-let ((`(,kind ,_source ,name)
                  (or (matrix-media-attachment item)
                      (user-error "This message has no downloadable attachment"))))
-      (matrix-room--save-attachment
-       surface item (matrix-media--open-path name)
-       (lambda (path) (funcall matrix-attachment-open-function path kind))))))
+      (appkit-surface-send
+       surface
+       (list 'matrix-media-open
+             (list :surface surface :app app :room room
+                   :subscription subscription
+                   :item item :kind kind :name name
+                   :path (matrix-media--open-path name)))))))
 
 (defun matrix-room--typing-text (names)
   "Describe who of NAMES is typing."

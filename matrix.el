@@ -311,6 +311,19 @@ Register ROOM-ID's timeline when provided; retain the reading position."
         :model (let ((next (plist-put (copy-sequence model) :operation operation)))
                  (if room-p next (plist-put next :notice nil)))
         :render (appkit-projection-change-create :frame-p t)))
+      (`(matrix-media-open ,input)
+       (appkit-next
+        :model model :render appkit-render-none
+        :commands (list (appkit-command-cancel-effect 'matrix-media-present)
+                        (matrix-media-open-command input))))
+      (`(matrix-media-downloaded ,input ,path)
+       (appkit-next
+        :model model :render appkit-render-none
+        :commands (list (matrix-media-present-command input path))))
+      ('(matrix-media-presented)
+       (appkit-next :model model :render appkit-render-none))
+      (`(matrix-media-failed ,reason)
+       (matrix--feedback-next model (format "Media: %s" reason)))
       (`(matrix-result ,_id "timeline.read" ,_result ,error ,owned)
        (if (and room-p
                 (equal (plist-get model :address) (plist-get owned :target))

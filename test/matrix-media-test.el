@@ -465,5 +465,87 @@
               (should-not (appkit-media-inline-host-live-p one))
               (should-not (appkit-media-inline-host-live-p two)))))))))
 
+(ert-deftest matrix-media-open-file-routes-media-through-appkit ()
+  (let (played opened)
+    (cl-letf (((symbol-function 'appkit-media-play-video-file)
+               (lambda (file label &rest _args)
+                 (setq played (cons file label))))
+              ((symbol-function 'appkit-media-open-file)
+               (lambda (file) (setq opened file)))
+              ((symbol-function 'video-open)
+               (lambda (&rest _) (ert-fail "Matrix bypassed Appkit"))))
+      (matrix-media-open-file "/tmp/clip.webm" "video")
+      (should (equal played '("/tmp/clip.webm" . "Matrix attachment")))
+      (matrix-media-open-file "/tmp/notes.txt" "file")
+      (should (equal opened "/tmp/notes.txt")))))
+
+(ert-deftest matrix-media-video-attachment-uses-managed-presentation ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let* ((row-key "clip")
+           (source (make-string 64 ?c))
+           (item (list :id row-key :kind "message" :event_id "$clip:test"
+                       :sender "@other:test" :body "clip"
+                       :attachment (list :kind "video" :source_id source
+                                         :filename "clip.webm" :size 8000)))
+           request presentation present-resolve)
+      (appkit-app-send app (matrix-ui-test--items-state (list item)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (cl-letf (((symbol-function 'matrix-runtime-resource-request)
+                 (lambda (_app method params resolve _reject)
+                   (setq request (list method params))
+                   (funcall resolve nil)
+                   (appkit-cancellation-create :kind 'logical :cancel #'ignore)))
+                ((symbol-function 'appkit-media-video-presentation-start)
+                 (lambda (_context input _observe resolve _reject)
+                   (setq presentation input
+                         present-resolve resolve)
+                   (appkit-cancellation-create :kind 'logical :cancel #'ignore))))
+        (matrix-room-open-attachment row-key)
+        (dotimes (_ 8) (appkit-loop-run-pass (appkit-surface-loop surface)))
+        (should (equal (car request) "media.save"))
+        (should (appkit-media-video-presentation-p presentation))
+        (should (eq 'video (appkit-media-video-presentation-kind presentation)))
+        (should (eq 'none (appkit-media-video-presentation-cache-policy presentation)))
+        (should (equal (alist-get 'file (appkit-media-video-presentation-resource presentation))
+                       (plist-get (cadr request) :path)))
+        (should (appkit-effect-runtime-current-p
+                 (appkit-surface-effect-runtime surface) 'matrix-media-present))
+        (funcall present-resolve 'closed)
+        (dotimes (_ 4) (appkit-loop-run-pass (appkit-surface-loop surface)))
+        (should-not (appkit-effect-runtime-current-p
+                     (appkit-surface-effect-runtime surface)
+                     'matrix-media-present))))))
+
+(ert-deftest matrix-media-surface-close-cancels-video-presentation ()
+  (matrix-ui-test--with-room
+    (setq-local matrix--registered-surface surface)
+    (let* ((row-key "clip-close")
+           (source (make-string 64 ?d))
+           (item (list :id row-key :kind "message" :event_id "$clip-close:test"
+                       :sender "@other:test" :body "clip"
+                       :attachment (list :kind "video" :source_id source
+                                         :filename "clip.webm" :size 8000)))
+           cancelled)
+      (appkit-app-send app (matrix-ui-test--items-state (list item)))
+      (appkit-surface-send surface '(matrix-update timeline "!room:test"))
+      (cl-letf (((symbol-function 'matrix-runtime-resource-request)
+                 (lambda (_app _method _params resolve _reject)
+                   (funcall resolve nil)
+                   (appkit-cancellation-create :kind 'logical :cancel #'ignore)))
+                ((symbol-function 'appkit-media-video-presentation-start)
+                 (lambda (&rest _)
+                   (appkit-cancellation-create
+                    :kind 'logical
+                    :cancel (lambda () (setq cancelled t))))))
+        (matrix-room-open-attachment row-key)
+        (dotimes (_ 8) (appkit-loop-run-pass (appkit-surface-loop surface)))
+        (should (appkit-effect-runtime-current-p
+                 (appkit-surface-effect-runtime surface) 'matrix-media-present))
+        (should-not cancelled)
+        (appkit-surface-stop surface)
+        (setq surface nil))
+      (should cancelled))))
+
 (provide 'matrix-media-test)
 ;;; matrix-media-test.el ends here

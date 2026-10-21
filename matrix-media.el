@@ -3,11 +3,17 @@
 ;;; Commentary:
 ;; The SDK resolves and decrypts exact event sources.  Resources own acquisition;
 ;; committed rows own immutable Canvas posters and video.el playback occurrences.
+;; Attachment opening is two keyed Appkit Effects: acquisition publishes one
+;; private local file, then presentation selects the media owner from its kind.
 
 ;;; Code:
 
 (require 'matrix-avatar)
 (require 'appkit-media-image)
+(require 'appkit-media-playback)
+(require 'appkit-media-effect)
+(require 'appkit-media-resource)
+(require 'appkit-command)
 
 (declare-function appkit-media-resource-poster "appkit-media-resource"
                   (resource width height &rest args))
@@ -222,7 +228,9 @@ geometry, and video.el owns independent mutable playback targets."
 
 (defcustom matrix-attachment-open-function #'matrix-media-open-file
   "Function opening a downloaded attachment, called with its file and kind.
-The kind is \"file\", \"audio\", \"video\" or \"image\"."
+The kind is \"file\", \"audio\", \"video\" or \"image\".
+The default routes media through Appkit; replacing it opts out of the managed
+video playback plan while retaining the keyed acquisition Effect."
   :type 'function
   :group 'matrix)
 
@@ -266,15 +274,117 @@ The kind is \"file\", \"audio\", \"video\" or \"image\"."
                               (expand-file-name "a" matrix-media--open-directory) t)))
 
 (defun matrix-media-open-file (file kind)
-  "Open downloaded FILE of KIND: audio and video play in video.el."
-  (if (and (member kind '("audio" "video")) (fboundp 'video-open))
-      (video-open file)
-    (find-file file)))
+  "Open downloaded FILE of KIND through Appkit's media owner.
+Audio and video use an Appkit-owned video.el session; everything else uses
+`appkit-media-open-file'.  Managed attachment opening uses a playback plan for
+video and never calls this function unless the user has replaced
+`matrix-attachment-open-function'."
+  (if (member kind '("audio" "video"))
+      (appkit-media-play-video-file file "Matrix attachment")
+    (appkit-media-open-file file)))
+
+(defun matrix-media--download-effect (input)
+  "Return the keyed acquisition Effect for attachment INPUT."
+  (appkit-effect-create
+   :key 'matrix-media-download
+   :input input
+   :start #'matrix-media--download-start
+   :success (lambda (input path)
+              (list 'matrix-media-downloaded input path))
+   :failure (lambda (_input reason)
+              (list 'matrix-media-failed reason))))
+
+(defun matrix-media--download-start (_context input _observe resolve reject)
+  "Download INPUT's exact attachment, then settle RESOLVE with its path."
+  (let ((cancellation
+         (matrix-media-save
+          (plist-get input :app)
+          (plist-get input :room)
+          (plist-get input :subscription)
+          (plist-get input :item)
+          (plist-get input :path)
+          (lambda (path) (funcall resolve path))
+          reject)))
+    ;; Synchronous completion legitimately leaves no cancellation; never
+    ;; forward an arbitrary mapper return value as Effect authority.
+    (and (appkit-cancellation-p cancellation) cancellation)))
+
+(defun matrix-media--present-effect (input path)
+  "Return the keyed presentation Effect for downloaded INPUT at PATH."
+  (appkit-effect-create
+   :key 'matrix-media-present
+   :input (plist-put (copy-sequence input) :path path)
+   :start #'matrix-media--present-start
+   :success (lambda (_input _value) '(matrix-media-presented))
+   :failure (lambda (_input reason)
+              (list 'matrix-media-failed reason))))
+
+(defun matrix-media--present-start (context input _observe resolve reject)
+  "Present INPUT through the selected Appkit media owner.
+A user-replaced `matrix-attachment-open-function' keeps its explicit escape
+hatch.  Otherwise video uses the common playback plan and presentation
+starter; audio uses Appkit's local-file session; images and files use
+`appkit-media-open-file'.  Video settlement follows the viewer, so closing it
+or replacing the presentation Effect owns the complete lifecycle."
+  (let* ((path (plist-get input :path))
+         (kind (plist-get input :kind))
+         (name (or (plist-get input :name)
+                   (file-name-nondirectory path)))
+         (open-function matrix-attachment-open-function))
+    (cond
+     ((not (eq open-function #'matrix-media-open-file))
+      (condition-case condition
+          (progn (funcall open-function path kind)
+                 (funcall resolve 'presented)
+                 nil)
+        ((error quit)
+         (funcall reject (error-message-string condition))
+         nil)))
+     ((equal kind "video")
+      (appkit-media-video-presentation-start
+       context
+       (appkit-media-playback-presentation-create
+        (appkit-media-playback-create
+         :resource (appkit-media-resource-create :file path :name name)
+         :kind 'video
+         :label "Matrix attachment"
+         :cache-policy 'none)
+        :start t)
+       nil resolve reject))
+     ((equal kind "audio")
+      (condition-case condition
+          (progn
+            ;; Appkit owns the session and closes it with its viewer.
+            (appkit-media-play-video-file
+             path "Matrix attachment" :owner (plist-get input :surface))
+            (funcall resolve 'presented)
+            nil)
+        ((error quit)
+         (funcall reject (error-message-string condition))
+         nil)))
+     (t
+      (condition-case condition
+          (progn (appkit-media-open-file path)
+                 (funcall resolve 'presented)
+                 nil)
+        ((error quit)
+         (funcall reject (error-message-string condition))
+         nil))))))
+
+(defun matrix-media-open-command (input)
+  "Return a post-commit command opening exact attachment INPUT."
+  (appkit-command-start-effect (matrix-media--download-effect input)))
+
+(defun matrix-media-present-command (input path)
+  "Return a post-commit command presenting downloaded INPUT at PATH."
+  (appkit-command-start-effect (matrix-media--present-effect input path)))
 
 (defun matrix-media-save (app room subscription item path on-saved &optional on-failed)
   "Download APP's ROOM/SUBSCRIPTION ITEM attachment to new PATH.
 Call ON-SAVED with PATH once the decrypted file is in place, or ON-FAILED
-with a message; without ON-FAILED, the message is shown."
+with a message; without ON-FAILED, the message is shown.  Return the private
+transport cancellation capability, or nil when the backend settles
+synchronously."
   (let ((source (nth 1 (or (matrix-media-attachment item)
                            (user-error "This message has no downloadable attachment")))))
     (unless (and (stringp subscription) (not (string-empty-p subscription)))
