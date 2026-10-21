@@ -547,5 +547,17 @@
         (setq surface nil))
       (should cancelled))))
 
+(ert-deftest matrix-media-inline-video-resolver-propagates-cancellation ()
+  (matrix-ui-test--with-room
+    (let ((cancellation (appkit-cancellation-create :kind 'logical :cancel #'ignore))
+          (item (matrix-media-test--video-item "inline" nil))
+          called)
+      (cl-letf (((symbol-function 'matrix-media-save)
+                 (lambda (&rest _) (setq called t) cancellation)))
+        (should (eq cancellation
+                    (funcall (matrix-room--video-resolver app "!room:test" item)
+                             #'ignore #'ignore))))
+      (should called))))
+
 (provide 'matrix-media-test)
 ;;; matrix-media-test.el ends here

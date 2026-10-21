@@ -321,13 +321,14 @@ CAPABILITY is the SDK's `:can_edit', `:can_react' or `:can_redact' permission."
   "Return a resolver fetching APP's ROOM ITEM video for inline playback."
   (lambda (resolve reject)
     (pcase-let ((`(,_kind ,_source ,name) (matrix-media-attachment item)))
+      ;; Return the transport cancellation to the inline host, not just the
+      ;; eventual resource; closing the host must revoke the pending download.
       (matrix-media-save
        app room (plist-get (matrix-room--timeline (matrix-runtime-state app) room)
                            :subscription_id)
        item (matrix-media--open-path name)
        (lambda (path) (funcall resolve `((file . ,path) (name . ,name))))
-       reject))
-    nil))
+       reject))))
 
 (defun matrix-room--insert-poster (item prefixes open)
   "Insert ITEM's Canvas image or video poster, sized by PREFIXES.
