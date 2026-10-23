@@ -29,6 +29,24 @@
         (setq position next)))
     (apply #'concat (nreverse fragments))))
 
+(ert-deftest matrix-directory-mark-read-uses-whole-room-rpc ()
+  (matrix-directory-test--with-root
+    (goto-char (point-min))
+    (search-forward "Encrypted room")
+    (beginning-of-line)
+    (let (request)
+      (cl-letf (((symbol-function 'matrix--request)
+                 (lambda (surface method params &rest _)
+                   (setq request (list surface method params)))))
+        (appkit-directory-mark-read))
+      (should (equal request (list root "room.mark_read" '(:room_id "!room:test"))))
+      (should (eq (lookup-key matrix-root-mode-map "r") #'appkit-directory-mark-read))
+      (setq request nil)
+      (cl-letf (((symbol-function 'matrix--request) (lambda (&rest _) (setq request t))))
+        (should-error (matrix-root--operation nil 'mark-read '((room "!absent:test")))
+                      :type 'user-error))
+      (should-not request))))
+
 (ert-deftest matrix-directory-narrow-rows-retain-destination-and-unread ()
   (matrix-directory-test--with-root
     (let* ((room '(:room_id "!narrow:test" :name "Room 界\nlong title"

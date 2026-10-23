@@ -13,6 +13,7 @@ use matrix_sdk::{
     config::{RequestConfig, SyncSettings},
     encryption::{BackupDownloadStrategy, EncryptionSettings},
     latest_events::LatestEventValue,
+    room::{MessagesOptions, Receipts},
     ruma::{
         OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId,
         UserId,
@@ -767,6 +768,31 @@ impl Account {
             "room.leave" => {
                 let args: RoomParam = params(value)?;
                 known_room(&self.client, &args.room_id)?.leave().await.map_err(room_error)?;
+                Ok(json!({}))
+            }
+            "room.mark_read" => {
+                let args: RoomParam = params(value)?;
+                let room = known_room(&self.client, &args.room_id)?;
+                if room.state() != RoomState::Joined {
+                    return Err(INVALID);
+                }
+                // Root acknowledges the whole room, independently of any open
+                // timeline. Capture the server frontier once; messages arriving
+                // after this request must remain unread.
+                let mut options = MessagesOptions::backward();
+                options.limit = 1u8.into();
+                let messages = room.messages(options).await.map_err(room_error)?;
+                if let Some(event_id) = messages.chunk.first().and_then(|event| event.event_id()) {
+                    room.send_multiple_receipts(
+                        Receipts::new()
+                            .fully_read_marker(event_id.to_owned())
+                            .private_read_receipt(event_id.to_owned()),
+                    )
+                    .await
+                    .map_err(room_error)?;
+                } else {
+                    room.set_unread_flag(false).await.map_err(room_error)?;
+                }
                 Ok(json!({}))
             }
             "room.typing" => {

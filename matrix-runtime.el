@@ -273,7 +273,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                  (matrix-state-rooms (plist-get result :rooms)))
            (setq commands (nconc commands (matrix-runtime--retire-read model))))
          (setq commands (nconc commands (matrix-runtime--broadcast model 'rooms))))
-        ((or "room.create" "room.join" "room.leave" "dm.open")
+        ((or "room.create" "room.join" "room.leave" "room.mark_read" "dm.open")
          (unless error
            (push (matrix-runtime--enqueue model "rooms.list" nil) commands)))
         ("timeline.subscribe"

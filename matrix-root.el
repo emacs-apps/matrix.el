@@ -35,7 +35,8 @@
   'app-menu #'matrix-root-transient
   'navigation matrix-root-navigation-map
   'refresh #'matrix-root-refresh
-  'search #'matrix-root-filter)
+  'search #'matrix-root-filter
+  'mark-read #'appkit-directory-mark-read)
 
 (define-derived-mode matrix-root-mode appkit-directory-mode "Matrix"
   "Matrix room directory.  RET opens a room; j joins and c creates a room.")
@@ -257,10 +258,24 @@ show their caption, or a dim kind word, and audio and video their length."
        (require 'matrix-room)
        (matrix-room-open app room-id t)))))
 
+(defun matrix-root--operation (_directory operation keys)
+  "Apply a read OPERATION to the exact joined room identified by KEYS."
+  (unless (and (eq operation 'mark-read) (= (length keys) 1))
+    (user-error "Matrix directory operation is unavailable"))
+  (let* ((surface (matrix--current-surface 'root))
+         (key (car keys))
+         (room-id (and (eq (car-safe key) 'room) (cadr key)))
+         (room (and room-id (matrix-runtime-room
+                            (appkit-surface-app surface) room-id))))
+    (unless (equal (plist-get room :membership) "join")
+      (user-error "Select a joined Matrix room to mark read"))
+    (matrix--request surface "room.mark_read" (list :room_id room-id))))
+
 (defun matrix-root--mount (_surface _app-view _model)
   "Install native account directory activation."
   (appkit-directory-configure (appkit-directory-surface)
                               :activate-function #'matrix-root--activate
+                              :operation-function #'matrix-root--operation
                               :item-inserter #'matrix-root--insert-item
                               :action-rows-p t))
 
