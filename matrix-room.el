@@ -935,15 +935,15 @@ for that is plain text, elided."
 
 (defun matrix-room--history-command (model)
   "Return the Surface Effect for MODEL's current history subscription."
-  (let ((input (list :app (appkit-surface-app (appkit-current-surface))
-                     :room-id (cadr (plist-get model :identity))
+  (let ((app (appkit-surface-app (appkit-current-surface)))
+        (input (list :room-id (cadr (plist-get model :identity))
                      :subscription (plist-get model :history-subscription))))
     (appkit-command-start-effect
      (appkit-effect-create
       :key appkit-chat-history-effect-key :input input
       :start (lambda (_context input _observe resolve reject)
                (matrix-runtime-resource-request
-                (plist-get input :app) "timeline.paginate"
+                app "timeline.paginate"
                 (list :room_id (plist-get input :room-id)
                       :subscription_id (plist-get input :subscription) :limit 50)
                 resolve reject))
