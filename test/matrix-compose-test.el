@@ -341,7 +341,6 @@
       ;; and Appkit post-commit effect, with no live UI completion target.
       (puthash 1 (list :method "message.send" :context context) pending)
       (setq state (plist-put state :pending pending)
-            state (plist-put state :watches (make-hash-table :test #'eq))
             state (plist-put state :next-id 1))
       (appkit-app-send app state)
       (setf (appkit-app-type-update (appkit-app-type app)) #'matrix-runtime--update)

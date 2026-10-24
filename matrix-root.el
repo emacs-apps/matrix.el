@@ -307,7 +307,7 @@ show their caption, or a dim kind word, and audio and video their length."
 
 (defvar matrix-root--type
   (matrix--surface-type 'matrix-root #'matrix-root-mode
-                        #'matrix-root--render #'matrix-root--mount)
+                        #'matrix-root--render '(rooms verification) #'matrix-root--mount)
   "Generated account directory Surface type.")
 
 (defun matrix-root-open (app &optional select)

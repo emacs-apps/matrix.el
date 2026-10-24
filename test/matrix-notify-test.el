@@ -9,14 +9,13 @@
 
 (defun matrix-notify-test--model ()
   (list :account "work" :rooms nil :notified nil
-        :transport (matrix-rpc-transport-create :store "/store/")
-        :watches (make-hash-table :test #'eq)))
+        :transport (matrix-rpc-transport-create :store "/store/")))
 
 (defun matrix-notify-test--operations (commands)
   (mapcar (lambda (command)
             (nth 2 (appkit-effect-spec-input
                     (appkit-command-start-effect-effect command))))
-          commands))
+          (seq-filter #'appkit-command-start-effect-p commands)))
 
 (ert-deftest matrix-notify-runtime-retires-rooms-once-read ()
   "Notified rooms close when read; invitations wait to be answered."

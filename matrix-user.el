@@ -152,7 +152,7 @@
     (matrix--avatar-resource-result surface (list (cons 'card uri)))))
 
 (defvar matrix-user--type
-  (matrix--surface-type 'matrix-user #'matrix-user-mode #'matrix-user--render)
+  (matrix--surface-type 'matrix-user #'matrix-user-mode #'matrix-user--render nil)
   "Generated Matrix user page Surface type.")
 
 (defun matrix-user-open (app user-id &optional select)

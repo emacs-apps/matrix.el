@@ -191,35 +191,23 @@ RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
         (cdr (assoc (completing-read "Matrix account: " choices nil t)
                     choices))))))
 
-(defun matrix--close-host ()
-  "Unregister this host's exact Surface without stopping its account."
-  (when matrix--registered-surface
-    (let ((surface matrix--registered-surface))
-      (setq matrix--registered-surface nil)
-      (matrix-runtime-unregister-surface (appkit-surface-app surface) surface))))
-
-(defun matrix--register (app surface &optional room-id)
-  "Register newly opened SURFACE of APP and optional ROOM-ID externally."
+(defun matrix--register (surface)
+  "Install host-local UI support for newly opened SURFACE."
   (with-current-buffer (appkit-surface-buffer surface)
-    (setq-local matrix--registered-surface surface)
-    (add-hook 'kill-buffer-hook #'matrix--close-host nil t)
-    (add-hook 'change-major-mode-hook #'matrix--close-host nil t))
-  (matrix-runtime-register-surface app surface room-id)
+    (setq-local matrix--registered-surface surface))
   (appkit-surface-enable-responsive-geometry surface #'matrix--geometry)
   surface)
 
-(defun matrix--open (app type identity name &optional select room-id)
-  "Open or select exact APP/IDENTITY using TYPE and NAME.
-Register ROOM-ID's timeline when provided; retain the reading position."
+(defun matrix--open (app type identity name &optional select)
+  "Open or select exact APP/IDENTITY using TYPE and NAME; retain position."
   (let ((existing (appkit-app-surface app identity)))
     (when (and existing (not (appkit-surface-live-p existing)))
       (user-error "Matrix view is unavailable; close its buffer before reopening"))
     (let ((surface
            (or existing
                (matrix--register
-                app (appkit-open-generated-surface
-                     type :app app :identity identity :input identity :buffer-name name)
-                room-id))))
+                (appkit-open-generated-surface
+                 type :app app :identity identity :input identity :buffer-name name)))))
       (when select
         (pop-to-buffer (appkit-surface-buffer surface))
         (appkit-surface-refresh-responsive-geometry surface))
@@ -271,18 +259,14 @@ Register ROOM-ID's timeline when provided; retain the reading position."
          (state (appkit-app-read-view-model
                  (appkit-transition-context-app-read-view context))))
     (pcase message
-      (`(matrix-update typing ,_room-id)
-       ;; Only the room header names who is typing.
-       (appkit-next :model model :render (appkit-projection-change-create :frame-p t)))
-      (`(matrix-update ,kind ,room-id)
-       (if (and room-p room-id
-                (not (equal room-id (cadr (plist-get model :identity)))))
-           (appkit-next :model model :render appkit-render-none)
-         (appkit-next
-          :model (if room-p (matrix-room--sync-history model state) model)
-          :render (appkit-projection-change-create :full-p t :frame-p t)
-          :commands (when (and room-p (eq kind 'timeline))
-                      (list (matrix-room--observe-command))))))
+      (`(matrix-update ,_kind ,room-id)
+       ;; A level notification may coalesce timeline and typing changes.
+       ;; Re-read the whole room even when typing was the latest payload.
+       (appkit-next
+        :model (if room-p (matrix-room--sync-history model state) model)
+        :render (appkit-projection-change-create :full-p t :frame-p t)
+        :commands (when (and room-p room-id)
+                    (list (matrix-room--observe-command)))))
       ('(matrix-geometry)
        (appkit-next :model model
                     :render (appkit-projection-change-create :geometry-p t :frame-p t)))
@@ -364,12 +348,27 @@ Register ROOM-ID's timeline when provided; retain the reading position."
            settled)))
       (_ (appkit-next :model model :render appkit-render-none)))))
 
-(defun matrix--surface-type (name mode render &optional mount)
-  "Create a Generated Surface NAME using MODE, RENDER and optional MOUNT.
+(defun matrix--subscriptions (topics model)
+  "Follow account TOPICS and the room identity, if any, in MODEL."
+  (let* ((identity (plist-get model :identity))
+         (room-id (and (eq (car identity) 'room) (cadr identity))))
+    (append
+     (mapcar (lambda (topic)
+               (appkit-subscription-create
+                :topic topic :notify (lambda (kind) (list 'matrix-update kind nil))))
+             (append '(session status error) topics))
+     (when room-id
+       (list (appkit-subscription-create
+              :topic (list 'room room-id)
+              :notify (lambda (kind) (list 'matrix-update kind room-id))))))))
+
+(defun matrix--surface-type (name mode render topics &optional mount)
+  "Create a Generated Surface NAME using MODE, RENDER, TOPICS and MOUNT.
 RENDER receives Surface, account read view's model, Surface model and change."
   (appkit-surface-type-create
    :name name :mode mode :init #'matrix--surface-init
    :update #'matrix--surface-update
+   :subscriptions (lambda (model) (matrix--subscriptions topics model))
    :renderer-factory
    (lambda (_surface)
      (appkit-generated-renderer-create

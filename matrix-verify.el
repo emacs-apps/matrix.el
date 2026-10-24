@@ -230,7 +230,7 @@
 
 (defvar matrix-verify--type
   (matrix--surface-type 'matrix-verify #'matrix-verify-mode
-                        #'matrix-verify--render #'matrix-verify--mount)
+                        #'matrix-verify--render '(verification) #'matrix-verify--mount)
   "Generated Matrix device and verification Surface type.")
 
 (defun matrix-verify-open (app &optional select no-refresh)

@@ -890,10 +890,7 @@
   (matrix-ui-test--with-room
     (appkit-app-send app (plist-put (matrix-ui-test--state "Hi") :backend-active t))
     (let (user-surface)
-      ;; This fixture App would take registration messages as its model.
-      (cl-letf (((symbol-function 'matrix-runtime-register-surface) #'ignore)
-                ((symbol-function 'matrix-runtime-unregister-surface) #'ignore)
-                ((symbol-function 'matrix-runtime-request)
+      (cl-letf (((symbol-function 'matrix-runtime-request)
                  (lambda (_app method params owned)
                    (should (equal (list method params)
                                   '("user.profile" (:user_id "@alice:test"))))

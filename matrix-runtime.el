@@ -6,7 +6,7 @@
 ;;; Commentary:
 
 ;; One App owns a private backend and committed presentation mirror.  Room
-;; Surfaces subscribe through exact runtime addresses, never transport handles.
+;; Surfaces subscribe to account and room topics, never transport handles.
 ;; Sending belongs to the account even after the initiating room is closed.
 
 ;;; Code:
@@ -129,16 +129,6 @@ CONTEXT is local correlation only.  CALL may supply the external return handle."
      :key 'backend :expected-identity (plist-get model :transport)
      :payload call :result-mapper #'matrix-rpc-intent-result)))
 
-(defun matrix-runtime--room-wanted-p (model room-id)
-  "Whether a live exact Surface in MODEL needs ROOM-ID."
-  (let (wanted)
-    (maphash (lambda (surface watch)
-               (when (and (appkit-surface-live-p surface)
-                          (equal room-id (plist-get watch :room-id)))
-                 (setq wanted t)))
-             (plist-get model :watches))
-    wanted))
-
 (defun matrix-runtime--subscribe (model room-id)
   "Install a new snapshot fence for ROOM-ID and return its subscription command."
   (let* ((timelines (plist-get model :timelines))
@@ -153,45 +143,14 @@ CONTEXT is local correlation only.  CALL may supply the external return handle."
      (list :room_id room-id :subscription_id subscription)
      (list :room-id room-id :subscription-id subscription))))
 
-(defun matrix-runtime--release-room (model room-id)
-  "Release unobserved ROOM-ID in MODEL, returning an optional command."
-  (when (and room-id (not (matrix-runtime--room-wanted-p model room-id)))
-    (when-let* ((timeline (gethash room-id (plist-get model :timelines))))
-      (remhash room-id (plist-get model :timelines))
-      (when (and (plist-get model :session) (plist-get model :backend-active))
-        (matrix-runtime--enqueue
-         model "timeline.unsubscribe"
-         (list :room_id room-id
-               :subscription_id (plist-get timeline :subscription_id)))))))
+(defun matrix-runtime--publish (kind &optional room-id)
+  "Return a notification of committed KIND on its account or ROOM-ID topic."
+  (list (appkit-command-publish (if room-id (list 'room room-id) kind) kind)))
 
-(defun matrix-runtime--prune-watches (model)
-  "Retire dead exact Surface registrations in MODEL; return release commands."
-  (let (dead rooms commands)
-    (maphash (lambda (surface watch)
-               (unless (appkit-surface-live-p surface)
-                 (push surface dead)
-                 (push (plist-get watch :room-id) rooms)))
-             (plist-get model :watches))
-    (dolist (surface dead) (remhash surface (plist-get model :watches)))
-    (dolist (room (delete-dups rooms))
-      (when-let* ((command (matrix-runtime--release-room model room)))
-        (push command commands)))
-    commands))
-
-(defun matrix-runtime--broadcast (model kind &optional room-id)
-  "Return exact directed notifications for committed KIND in MODEL."
-  (let (commands)
-    (maphash
-     (lambda (_surface watch)
-       (when (or (null room-id) (null (plist-get watch :room-id))
-                 (equal room-id (plist-get watch :room-id)))
-         (push (appkit-command-post-message
-                :target (plist-get watch :address)
-                :message (list 'matrix-update kind room-id)
-                :delivery 'report)
-               commands)))
-     (plist-get model :watches))
-    commands))
+(defun matrix-runtime--subscribed (topic subscribed-p)
+  "Map room TOPIC interest SUBSCRIBED-P to an account message."
+  (pcase topic
+    (`(room ,room-id) (list 'matrix-interest room-id subscribed-p))))
 
 (defun matrix-runtime--notify (model operation)
   "Return a command presenting notification OPERATION after MODEL commits."
@@ -260,19 +219,16 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                  (plist-get model :connection) 'syncing
                  (plist-get model :last-error) nil)
            (push (matrix-runtime--enqueue model "rooms.list" nil) commands)
-           (maphash
-            (lambda (_surface watch)
-              (when-let* ((room (plist-get watch :room-id))
-                          ((not (gethash room (plist-get model :timelines)))))
-                (push (matrix-runtime--subscribe model room) commands)))
-            (plist-get model :watches)))
-         (setq commands (nconc commands (matrix-runtime--broadcast model 'session))))
+           (dolist (room (plist-get model :watched))
+             (unless (gethash room (plist-get model :timelines))
+               (push (matrix-runtime--subscribe model room) commands))))
+         (setq commands (nconc commands (matrix-runtime--publish 'session))))
         ("rooms.list"
          (unless error
            (setf (plist-get model :rooms)
                  (matrix-state-rooms (plist-get result :rooms)))
            (setq commands (nconc commands (matrix-runtime--retire-read model))))
-         (setq commands (nconc commands (matrix-runtime--broadcast model 'rooms))))
+         (setq commands (nconc commands (matrix-runtime--publish 'rooms))))
         ((or "room.create" "room.join" "room.leave" "room.mark_read" "dm.open")
          (unless error
            (push (matrix-runtime--enqueue model "rooms.list" nil) commands)))
@@ -287,7 +243,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                                         :error (plist-get error :message))
                         (plist-get model :timelines))
                (setq commands
-                     (nconc commands (matrix-runtime--broadcast model 'timeline room)))))))
+                     (nconc commands (matrix-runtime--publish 'timeline room)))))))
         ("session.logout"
          (unless error
            (setf (plist-get model :session) nil
@@ -295,7 +251,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                  (plist-get model :connection) 'stopped)
            (clrhash (plist-get model :timelines))
            (setf (plist-get model :rooms) nil)
-           (setq commands (nconc commands (matrix-runtime--broadcast model 'session))))))
+           (setq commands (nconc commands (matrix-runtime--publish 'session))))))
       (when-let* ((resource (plist-get context :resource)))
         (push
          (appkit-command-start-effect
@@ -317,7 +273,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                :delivery 'report)
               commands))
       (when (and error (not terminal) (not (plist-get context :resource)))
-        (setq commands (nconc commands (matrix-runtime--broadcast model 'error))))
+        (setq commands (nconc commands (matrix-runtime--publish 'error))))
       commands)))
 
 (defun matrix-runtime--event (model event)
@@ -333,7 +289,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
        (when-let* ((message (plist-get event :message)))
          (setf (plist-get model :last-error) message))
        (when (eq state 'online) (setf (plist-get model :last-error) nil))
-       (matrix-runtime--broadcast model 'status)))
+       (matrix-runtime--publish 'status)))
     ("session"
      ;; Successful auth responses own admission of subscriptions; this event
      ;; refreshes identity without starting work before the request settles.
@@ -341,12 +297,12 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
            (list :user_id (plist-get event :user_id)
                  :device_id (plist-get event :device_id)
                  :homeserver (plist-get event :homeserver)))
-     (matrix-runtime--broadcast model 'session))
+     (matrix-runtime--publish 'session))
     ("rooms"
      (setf (plist-get model :rooms)
            (matrix-state-rooms (plist-get event :rooms)))
      (nconc (matrix-runtime--retire-read model)
-            (matrix-runtime--broadcast model 'rooms)))
+            (matrix-runtime--publish 'rooms)))
     ("notifications"
      (let ((rooms (matrix-state-notifications (plist-get event :rooms)))
            (omitted (plist-get event :omitted)))
@@ -368,10 +324,10 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
              (let ((updated (matrix-state-timeline-update timeline event)))
                (unless (eq updated 'stale)
                  (puthash room updated (plist-get model :timelines))
-                 (matrix-runtime--broadcast model 'timeline room)))
+                 (matrix-runtime--publish 'timeline room)))
            (matrix-timeline-gap
             (cons (matrix-runtime--subscribe model room)
-                  (matrix-runtime--broadcast model 'timeline room)))
+                  (matrix-runtime--publish 'timeline room)))
            (matrix-protocol-error
             ;; An invalid batch never partly changes visible rows.  Stop this
             ;; subscription rather than retrying a malformed snapshot forever.
@@ -383,7 +339,7 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                    model "timeline.unsubscribe"
                    (list :room_id room :subscription_id
                          (plist-get timeline :subscription_id)))
-                  (matrix-runtime--broadcast model 'timeline room)))))))
+                  (matrix-runtime--publish 'timeline room)))))))
     ("typing"
      (let* ((room (plist-get event :room_id))
             (timeline (gethash room (plist-get model :timelines)))
@@ -392,11 +348,11 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
                                   (plist-get event :subscription_id)))
          (puthash room (plist-put (copy-sequence timeline) :typing users)
                   (plist-get model :timelines))
-         (matrix-runtime--broadcast model 'typing room))))
+         (matrix-runtime--publish 'typing room))))
     ("verification"
      (puthash (cons (plist-get event :user_id) (plist-get event :flow_id))
               event (plist-get model :verifications))
-     (matrix-runtime--broadcast model 'verification))
+     (matrix-runtime--publish 'verification))
     (_ (signal 'matrix-protocol-error '("Unknown backend notification")))))
 
 (defun matrix-runtime--closed (model reason)
@@ -414,12 +370,12 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
       (setq commands
             (nconc commands (matrix-runtime--complete
                              model id nil (matrix-rpc-uncertain-error) t))))
-    (nconc commands (matrix-runtime--broadcast model 'error))))
+    (nconc commands (matrix-runtime--publish 'error))))
 
 (defun matrix-runtime--update (_context original message)
   "Commit one account MESSAGE against ORIGINAL and return a closed transition."
   (let* ((model (copy-sequence original))
-         (commands (matrix-runtime--prune-watches model)))
+         commands)
     (condition-case condition
         (pcase message
           (`(matrix-request ,call ,context)
@@ -430,18 +386,25 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
              (push (matrix-runtime--enqueue
                     model (matrix-rpc-call-method call) (matrix-rpc-call-params call)
                     context call) commands)))
-          (`(matrix-watch ,surface ,address ,room)
-           (puthash surface (list :address address :room-id room)
-                    (plist-get model :watches))
-           (when (and room (plist-get model :session)
-                      (not (gethash room (plist-get model :timelines))))
-             (push (matrix-runtime--subscribe model room) commands)))
-          (`(matrix-unwatch ,surface)
-           (when-let* ((watch (gethash surface (plist-get model :watches))))
-             (remhash surface (plist-get model :watches))
-             (when-let* ((command (matrix-runtime--release-room
-                                  model (plist-get watch :room-id))))
-               (push command commands))))
+          (`(matrix-interest ,room ,subscribed-p)
+           (if subscribed-p
+               (progn
+                 (unless (member room (plist-get model :watched))
+                   (setf (plist-get model :watched)
+                         (cons room (plist-get model :watched))))
+                 (when (and (plist-get model :session)
+                            (not (gethash room (plist-get model :timelines))))
+                   (push (matrix-runtime--subscribe model room) commands)))
+             (setf (plist-get model :watched)
+                   (remove room (plist-get model :watched)))
+             (when-let* ((timeline (gethash room (plist-get model :timelines))))
+               (remhash room (plist-get model :timelines))
+               (when (and (plist-get model :session) (plist-get model :backend-active))
+                 (push (matrix-runtime--enqueue
+                        model "timeline.unsubscribe"
+                        (list :room_id room
+                              :subscription_id (plist-get timeline :subscription_id)))
+                       commands)))))
           (`(matrix-source (event ,event))
            (setq commands (nconc commands (matrix-runtime--event model event))))
           (`(matrix-source (result ,id ,result ,error))
@@ -508,13 +471,13 @@ TERMINAL suppresses per-request refreshes while closing the whole account."
        (lambda (_id operation)
          (matrix-compose-release-capture (plist-get operation :context)))
        (plist-get model :pending)))
-    (clrhash (plist-get model :pending))
-    (clrhash (plist-get model :watches))))
+    (clrhash (plist-get model :pending))))
 
 (defconst matrix-runtime--type
   (appkit-app-type-create
    :name 'matrix-account :init #'matrix-runtime--init
    :update #'matrix-runtime--update :sources #'matrix-runtime--sources
+   :subscribed #'matrix-runtime--subscribed
    :shutdown #'matrix-runtime--shutdown)
   "Matrix's account-level App type.")
 
@@ -555,7 +518,7 @@ the account's presentation model.  Normal reconnect must pass nil LOGIN."
                           :rooms nil :notified nil :last-error nil :next-id 0
                           :backend-active t :transport transport
                           :pending (make-hash-table :test #'eql)
-                          :watches (make-hash-table :test #'eq)
+                          :watched nil
                           :timelines (make-hash-table :test #'equal)
                           :verifications (make-hash-table :test #'equal)))
              (call (matrix-rpc-call-create
@@ -611,22 +574,6 @@ Cancellation revokes publication, not an already accepted backend read."
                      (matrix-runtime-resource-call-timer call) nil
                      (matrix-runtime-resource-call-resolve call) nil
                      (matrix-runtime-resource-call-reject call) nil)))))
-
-(defun matrix-runtime-register-surface (app surface &optional room-id)
-  "Register exact SURFACE in APP and subscribe to ROOM-ID if supplied."
-  (unless (and (appkit-surface-live-p surface)
-               (eq app (appkit-surface-app surface)))
-    (error "Cannot register a detached Matrix Surface"))
-  (let ((address (plist-get (appkit-surface-model surface) :address)))
-    (unless (appkit-runtime-address-p address)
-      (error "Matrix Surface has no exact runtime address"))
-    (appkit-app-send app (list 'matrix-watch surface address room-id))))
-
-(defun matrix-runtime-unregister-surface (app surface)
-  "Release exact SURFACE from APP, including after its host has detached."
-  (when (and (appkit-app-live-p app)
-             (gethash surface (plist-get (matrix-runtime-state app) :watches)))
-    (appkit-app-send app (list 'matrix-unwatch surface))))
 
 (defun matrix-runtime-refresh (app)
   "Refresh APP's room summaries from the backend."

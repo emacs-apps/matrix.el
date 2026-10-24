@@ -89,7 +89,7 @@ The runtime bridge is the only substituted boundary; files and resources are rea
                              :shutdown #'matrix-avatar-clear-cache)
                             :identity (list 'matrix-account store)
                             :input (list :transport (matrix-rpc-transport-create :store store)
-                                         :rooms rooms :watches (make-hash-table :test #'eq)))))
+                                         :rooms rooms))))
                       (push app apps)
                       app)))
                 (open-avatar (app uri)

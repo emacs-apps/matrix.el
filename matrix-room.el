@@ -1127,7 +1127,7 @@ SDK complete-read evidence clears the bar."
      (list :target (plist-get model :address) :subscription subscription))))
 
 (defvar matrix-room--type
-  (matrix--surface-type 'matrix-room #'matrix-room-mode #'matrix-room--render)
+  (matrix--surface-type 'matrix-room #'matrix-room-mode #'matrix-room--render '(rooms))
   "Generated Matrix room Surface type.")
 
 (defun matrix-room-open (app room-id &optional select)
@@ -1138,7 +1138,7 @@ SDK complete-read evidence clears the bar."
           (matrix--open
            app matrix-room--type identity
            (format "*Matrix:%s:%s*" (plist-get (matrix-runtime-state app) :account) room-id)
-           select room-id)))
+           select)))
     (unless existing
       (appkit-chat-timeline-install-history-observer
        surface :start-function #'matrix-room--visible-start)
