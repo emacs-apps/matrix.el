@@ -140,10 +140,11 @@ thumbnail or, when :own, its own first frame, of declared size if any."
          (funcall reject 'invalid-or-retired-image-source)))
      reject)))
 
-(defun matrix-media--poster (source max-width &optional video)
+(defun matrix-media--poster (source max-width &optional video slot-key)
   "Draw SOURCE within a default-scale budget; display slices follow font zoom.
 VIDEO, for a video's poster, is ITEM's `matrix-media-poster' plus :resolve,
-a function acquiring the playable video when the poster is only a thumbnail."
+a function acquiring the playable video when the poster is only a thumbnail.
+SLOT-KEY identifies the event's media across geometry changes."
   (require 'appkit-media-resource)
   (let* ((file (car source))
          (size (or (appkit-media--image-file-size-pixels file)
@@ -171,12 +172,14 @@ a function acquiring the playable video when the poster is only a thumbnail."
       (plist-put (cdr poster) :appkit-media-nslices rows)
       (cond
        ((not video)
-        (appkit-media-image-with-resource poster `((file . ,file)) :interaction 'media))
+        (appkit-media-image-with-resource poster `((file . ,file))
+                                          :slot-key slot-key :interaction 'media))
        ((plist-get video :own)
         (appkit-media-image-with-resource poster `((file . ,file)) :kind 'video
-                                          :label "matrix" :interaction 'media))
+                                          :slot-key slot-key :label "matrix" :interaction 'media))
        (t
         (appkit-media-image-with-resource poster nil :kind 'video :label "matrix"
+                                          :slot-key slot-key :cache-key slot-key
                                           :interaction 'media
                                           :resolve-function (plist-get video :resolve)))))))
 
@@ -206,7 +209,7 @@ geometry, and video.el owns independent mutable playback targets."
       (unless (equal (car entry) geometry)
         (setq entry
               (list geometry
-                    (condition-case nil (matrix-media--poster source max-width video)
+                    (condition-case nil (matrix-media--poster source max-width video key)
                       (error (format "[%s unavailable: native decoder failed]"
                                      (if video "Video" "Image"))))))
         (puthash key entry cache))
