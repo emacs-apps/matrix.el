@@ -150,9 +150,9 @@
       (matrix-menu-test--publish app surface state)
       (matrix-menu-test--with-scope scope
         (should-not (matrix-menu--history-inapt-p))
-        (let ((owner (appkit-chat-history-request-start surface 'older)))
-          (should (matrix-menu--history-inapt-p))
-          (appkit-chat-history-request-end owner))
+        (appkit-chat-history-loading-set 'older)
+        (should (matrix-menu--history-inapt-p))
+        (appkit-chat-history-loading-set nil)
         (should-not (matrix-menu--history-inapt-p))
         (appkit-chat-history-older-loaded-set t)
         (should (matrix-menu--history-inapt-p))

@@ -922,38 +922,47 @@ for that is plain text, elided."
   (interactive)
   (let* ((surface (matrix--current-surface 'room))
          (model (appkit-surface-model surface))
-         (app (appkit-surface-app surface))
-         (room-id (cadr (plist-get model :identity)))
-         (timeline (matrix-room--timeline (matrix-runtime-state app) room-id)))
+         (timeline (matrix-room--timeline
+                    (matrix-runtime-state (appkit-surface-app surface))
+                    (cadr (plist-get model :identity)))))
     (when (or (plist-get timeline :loading)
               (not (appkit-chat-history-window-known-p)))
       (user-error "Wait for the timeline snapshot"))
-    (when (appkit-chat-history-older-loaded-p) (user-error "Already at the beginning"))
+    (when (appkit-chat-history-older-loaded-p)
+      (user-error "Already at the beginning"))
     (unless (appkit-chat-history-loading-p)
-      (let* ((owner (appkit-chat-history-request-start surface 'older))
-             (owned (list :target (plist-get model :address) :history-owner owner
-                          :subscription (plist-get timeline :subscription_id))))
-        (appkit-surface-send surface '(matrix-history-started))
-        (condition-case nil
-            (matrix-runtime-request
-             app "timeline.paginate"
-             (list :room_id room-id :subscription_id (plist-get owned :subscription) :limit 50)
-             owned)
-          (error
-           (appkit-surface-send
-            surface
-            (list 'matrix-result nil "timeline.paginate" nil
-                  '(:message "History request failed; use Load older to retry.") owned))))))))
+      (appkit-surface-send surface '(matrix-history-start)))))
 
-(defun matrix-room--history-complete (model state result error context)
-  "Settle only CONTEXT's exact owner and still-current SDK subscription."
+(defun matrix-room--history-command (model)
+  "Return the Surface Effect for MODEL's current history subscription."
+  (let ((input (list :app (appkit-surface-app (appkit-current-surface))
+                     :room-id (cadr (plist-get model :identity))
+                     :subscription (plist-get model :history-subscription))))
+    (appkit-command-start-effect
+     (appkit-effect-create
+      :key appkit-chat-history-effect-key :input input
+      :start (lambda (_context input _observe resolve reject)
+               (matrix-runtime-resource-request
+                (plist-get input :app) "timeline.paginate"
+                (list :room_id (plist-get input :room-id)
+                      :subscription_id (plist-get input :subscription) :limit 50)
+                resolve reject))
+      :success (lambda (input result)
+                 (list 'matrix-history-result input result nil))
+      :failure (lambda (input error)
+                 (list 'matrix-history-result input nil
+                       (if (listp error) error
+                         '(:message "History request failed; use Load older to retry."))))))))
+
+(defun matrix-room--history-complete (model state result error input)
+  "Apply a history Effect result for INPUT's still-current SDK subscription."
   (let ((subscription
-         (plist-get (matrix-room--timeline state (cadr (plist-get model :identity)))
+         (plist-get (matrix-room--timeline state
+                                          (cadr (plist-get model :identity)))
                     :subscription_id)))
-    (when (and (equal (plist-get model :address) (plist-get context :target))
-               (equal subscription (plist-get context :subscription))
-               (equal subscription (plist-get model :history-subscription))
-               (appkit-chat-history-request-end (plist-get context :history-owner)))
+    (when (and (equal subscription (plist-get input :subscription))
+               (equal subscription (plist-get model :history-subscription)))
+      (appkit-chat-history-loading-set nil)
       (unless error
         (appkit-chat-history-older-loaded-set (eq (plist-get result :hit_start) t)))
       (plist-put (copy-sequence model) :history-error

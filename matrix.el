@@ -260,13 +260,18 @@ RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
                  (appkit-transition-context-app-read-view context))))
     (pcase message
       (`(matrix-update ,_kind ,room-id)
-       ;; A level notification may coalesce timeline and typing changes.
-       ;; Re-read the whole room even when typing was the latest payload.
-       (appkit-next
-        :model (if room-p (matrix-room--sync-history model state) model)
-        :render (appkit-projection-change-create :full-p t :frame-p t)
-        :commands (when (and room-p room-id)
-                    (list (matrix-room--observe-command)))))
+       (let ((next (if room-p (matrix-room--sync-history model state) model)))
+         (appkit-next
+          :model next
+          :render (appkit-projection-change-create :full-p t :frame-p t)
+          :commands
+          (append
+           (when (and room-p
+                      (not (equal (plist-get model :history-subscription)
+                                  (plist-get next :history-subscription))))
+             (list (appkit-command-cancel-effect appkit-chat-history-effect-key)))
+           (when (and room-p room-id)
+             (list (matrix-room--observe-command)))))))
       ('(matrix-geometry)
        (appkit-next :model model
                     :render (appkit-projection-change-create :geometry-p t :frame-p t)))
@@ -276,9 +281,12 @@ RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
       (`(matrix-filter ,filter)
        (appkit-next :model (plist-put (copy-sequence model) :filter filter)
                     :render (appkit-projection-change-create :full-p t :frame-p t)))
-      ('(matrix-history-started)
-       (appkit-next :model (plist-put (copy-sequence model) :history-error nil)
-                    :render (appkit-projection-change-create :frame-p t)))
+      ('(matrix-history-start)
+       (appkit-chat-history-loading-set 'older)
+       (appkit-next
+        :model (plist-put (copy-sequence model) :history-error nil)
+        :render (appkit-projection-change-create :frame-p t)
+        :commands (list (matrix-room--history-command model))))
       ('(matrix-history-observer-failed)
        (appkit-next
         :model (plist-put (copy-sequence model) :history-error
@@ -317,7 +325,7 @@ RESOURCE-ROWS contains (ROW-KEY . DEMAND) pairs for other private media."
            (if error (matrix--feedback-next model (matrix--error-text error))
              (appkit-next :model model :render appkit-render-none))
          (appkit-next :model model :render appkit-render-none)))
-      (`(matrix-result ,_id "timeline.paginate" ,result ,error ,owned)
+      (`(matrix-history-result ,owned ,result ,error)
        (if-let* ((next (and room-p
                            (matrix-room--history-complete model state result error owned))))
            (appkit-next :model next
