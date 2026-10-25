@@ -834,7 +834,7 @@ for that is plain text, elided."
          ('t (propertize "[E2EE]" 'face 'success
                          'help-echo "Encrypted room; Matrix SDK enforces device trust."))
          (_ (propertize "[?E2EE]" 'face 'warning
-                         'help-echo "Room is not known encrypted; sending requires consent."))))
+                         'help-echo "Room is not known encrypted; messages are sent as plaintext."))))
       (when-let* ((count (appkit-chat-read-count-text
                          (plist-get (plist-get timeline :read_state) :unread_messages))))
         (setq matrix--header-line (concat matrix--header-line "  " count)))
@@ -1162,15 +1162,12 @@ Late acceptance cannot clear an intervening draft or composer context.
 An uncertain submission is never retried with a new transaction ID."
   (interactive)
   (let* ((surface (matrix--current-surface 'room))
-         (app (appkit-surface-app surface))
-         (session (copy-tree (plist-get (matrix-runtime-state app) :session)))
          (model (appkit-surface-model surface))
          (room-id (cadr (plist-get model :identity)))
          (capture (matrix-compose-capture surface))
          (body (plist-get capture :body))
          (revision (plist-get capture :revision))
          (aux (plist-get capture :aux))
-         (room (matrix-runtime-room app room-id))
          (edit (matrix-room--edit-state))
          context submitted)
     (when (and (string-empty-p (string-trim body))
@@ -1182,16 +1179,6 @@ An uncertain submission is never retried with a new transaction ID."
       (setq context (matrix-compose-retain-capture surface capture)))
     (unwind-protect
         (progn
-          (unless (or (eq (plist-get room :encrypted) t)
-                      (yes-or-no-p
-                       "Room is not known encrypted. Send potentially unencrypted text and attachments? "))
-            (user-error "Send cancelled; draft retained"))
-          (unless (and (appkit-surface-live-p surface)
-                       (eq surface (appkit-app-surface app (appkit-surface-identity surface)))
-                       (equal session (plist-get (matrix-runtime-state app) :session)))
-            (user-error "The room or account changed during confirmation; draft retained"))
-          (unless (equal aux (appkit-chatbuf-aux-state))
-            (user-error "The composer context changed during confirmation; draft retained"))
           (when (eq (plist-get aux :aux-type) 'reply)
             (matrix-reply-validate surface aux))
           (if edit
